@@ -1,9 +1,9 @@
 # Multireflection
 
 ## TODO
-- [] Apply a circle mask to generated images
-- [] Dataset class
-- [] CNN model that returns (x,y)
+- [ ] Apply a circle mask to generated images
+- [ ] Dataset class
+- [ ] CNN model that returns (x,y)
 
 ## Setup description
 ### Two concave 1-in **mirrors** facing each other at a distance of 9cm.
