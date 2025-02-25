@@ -1,8 +1,8 @@
 # Multireflection
 
 ## TODO
-- [ ] Apply a circle mask to generated images
-- [ ] Dataset class
+- [x] Apply a circle mask to generated images
+- [x] Dataset class
 - [ ] CNN model that returns (x,y)
 
 ## Setup description
