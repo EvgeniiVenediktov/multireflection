@@ -3,7 +3,7 @@
 ## TODO
 - [x] Apply a circle mask to generated images
 - [x] Dataset class
-- [ ] CNN model that returns (x,y)
+- [x] MLP model that returns (x,y)
 
 ## Setup description
 ### Two concave 1-in **mirrors** facing each other at a distance of 9cm.
