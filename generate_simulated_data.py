@@ -140,8 +140,8 @@ def turn_entrance_mirror(x, y: float) -> None:
 
 # Set coordinate matrix
 STEP = 0.1
-x_tilt = np.arange(-6, 2, STEP)  # vertical tilt. Negative - looking down
-y_tilt = np.arange(-4, 3, STEP)  # horizontal tilt. Negative - looking right
+x_tilt = np.arange(-5, 1.6, STEP)  # vertical tilt. Negative - looking down
+y_tilt = np.arange(-3.5, 3, STEP)  # horizontal tilt. Negative - looking right
 
 
 # x = 1.6, then y from 0 to 0
@@ -167,4 +167,4 @@ for x in x_tilt:
         img = get_image_from_detector(detector)
 
         # Save image
-        img.save(f"laser_x4_y6/x{x:.2f}_y{y:.2f}.jpg")
+        img.save(f"data/125x125_laser_x4_y6/x{x:.2f}_y{y:.2f}.jpg")

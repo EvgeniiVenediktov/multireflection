@@ -1,7 +1,8 @@
 import cv2
 import numpy as np
 import os
-from concurrent.futures import ProcessPoolExecutor
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from queue import Queue
 
 
@@ -21,45 +22,54 @@ def apply_circular_mask(image_array):
     return result
 
 
-def process_single_image(image_name, image_array):
+def process_single_image(image_name, image_array, target_square_size=125, use_circular_mask=True):
     """Applies the mask and saves the image."""
-    # TODO: Optionally resize image
+    # Resize image
+
+
+    # Apply circular mask
     masked_img = apply_circular_mask(image_array)
     return image_name, masked_img
 
 
-def __load_images(input_folder):
+def __load_images(input_folder, grayscale=False):
     """Loads all images into RAM."""
     images = {}
     for file in os.listdir(input_folder):
-        # print(file)
         if file.endswith((".png", ".jpg", ".jpeg")):
             path = os.path.join(input_folder, file)
-            img = cv2.imread(path, cv2.IMREAD_ANYCOLOR)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if not grayscale:
+                img = cv2.imread(path, cv2.IMREAD_ANYCOLOR)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             if img is not None:
                 images[file] = img
     return images
 
 
-def data_from_folder(folder: str) -> dict[str, np.ndarray]:
+def data_from_folder(folder: str, grayscale=True, verbose=False) -> dict[str, np.ndarray]:
+    t_start = time.time()
 
     # Load all pictures in memory
-    images = __load_images(folder)
+    images = __load_images(folder, grayscale=grayscale)
 
     # Dict for processed imgs
     processed_images = {}
 
-    # Process images in parallel
-    with ProcessPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(process_single_image, name, img): name for name, img in images.items()}
-        for future in futures:
-            name, processed_img = future.result()
-            processed_images[name] = processed_img  # Store in-memory
+    # Process sequentially
+    for name, img in images.items():
+        processed_images[name] = process_single_image(name, img)[1]
+
+    if verbose:
+        print(f"Processing completed. Loaded #{len(processed_images)} images. Elapsed time: {time.time()-t_start}")
 
     return processed_images
 
 
 if __name__ == "__main__":
-    data = data_from_folder("./data/test")
+    data = data_from_folder("./data/125x125_laser_x4_y6", grayscale=True, verbose=True)
+
+    for _, v in data.items():
+        print(v.shape)
+        break
 
