@@ -1,0 +1,5 @@
+[submodule "mf-control"]
+	path = mf-control
+	url = https://github.com/EvgeniiVenediktov/mf-control.git
+[submodule "mf_control"]
+	path = mf_control
