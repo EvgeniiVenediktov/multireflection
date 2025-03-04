@@ -1,10 +1,26 @@
 import cv2
 import numpy as np
+from numpy.typing import ArrayLike
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from queue import Queue
 
+
+def process_image_from_webcam(img: ArrayLike, target_size:tuple[int]=(125,125)) -> ArrayLike:
+    # TODO 
+    # To grayscale
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Cut off sides to turn into square image
+    h, w = img.shape
+    m = w//2
+    new_left_idx = m-h//2
+    new_right_idx = m+h//2
+    img = img[:,new_left_idx:new_right_idx]
+
+    # Shrink image
+    img = cv2.resize(img, target_size)
+
+    return img
 
 def apply_circular_mask(image_array):
     """Applies a circular mask that blackens everything outside a centered circle."""
