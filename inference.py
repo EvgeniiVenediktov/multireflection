@@ -23,18 +23,20 @@ class SimpleFC(nn.Module):
         return self.layers.forward(x)
         
 
-def load_model(model:torch.nn.Module, fname="best_model.pth", path="./saved_models/") -> nn.Module:
-    model.load_state_dict(torch.load(path+fname, weights_only=False))
-    return model
-
 
 class TiltPredictor:
+    
+    def load_model(self, model:torch.nn.Module, fname="best_model.pth", path="./saved_models/") -> nn.Module:
+        model.load_state_dict(torch.load(path+fname, weights_only=False, map_location=self.DEVICE))
+        return model
+    
     def __init__(self, model_fname):
-        self.model = SimpleFC(2)
-        self.model = load_model(self.model, fname=model_fname)
-        self.model.eval()
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.DEVICE)
+
+        self.model = SimpleFC(2)
+        self.model = self.load_model(self.model, fname=model_fname)
+        self.model.eval()
         self.model.to(self.DEVICE)
     
     def predict(self, inputs:list[ArrayLike]) -> list[tuple[float]]:
