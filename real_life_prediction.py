@@ -1,6 +1,7 @@
 from preprocess_images import process_image_from_webcam
 from inference import TiltPredictor
 from mf_control.controller import MFController
+import cv2
 
 # Connect Controller
 controller = MFController()
@@ -13,8 +14,17 @@ while command == "y":
     # Get image from webcam
     img = controller.capture_image()
 
+    # Display
+    cv2.imshow("Raw", img)
+    cv2.waitKey(0)
+    cv2.destroyWindow("Raw")
     # Preprocess image
     img = process_image_from_webcam(img)
+
+    # Display
+    cv2.imshow("Processed", img)
+    cv2.waitKey(0)
+    cv2.destroyWindow("Processed")
 
     # Make prediction
     prediction = model.predict([img])
@@ -23,4 +33,4 @@ while command == "y":
     print("prediction:",prediction)
 
     # Repeat
-    command = input("Make another prediction? (y)").lower()
+    command = input("Make another prediction? (y/n) ").lower()
