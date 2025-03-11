@@ -56,7 +56,10 @@ class TiltPredictor:
 
 
 if __name__=="__main__":
+    import time
     model = TiltPredictor("fc_4layers_1024batch_500epochs_50cosinescheduler_best_model.pth")
     x = np.zeros((125, 125))
+    start = time.time()
     y = model.predict([x])
     print(y)
+    print(f"Time elapsed: {time.time()-start:.2f}s")
