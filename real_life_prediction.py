@@ -19,7 +19,7 @@ while command == "y":
     cv2.waitKey(0)
     cv2.destroyWindow("Raw")
     # Preprocess image
-    img = process_image_from_webcam(img)
+    img = process_image_from_webcam(img, target_size=(230, 230))
 
     # Display
     cv2.imshow("Processed", img)
@@ -30,7 +30,7 @@ while command == "y":
     prediction = model.predict([img])
 
     # Output
-    print("prediction:",prediction)
+    print("prediction:", prediction)
 
     # Repeat
     command = input("Make another prediction? (y/n) ").lower()

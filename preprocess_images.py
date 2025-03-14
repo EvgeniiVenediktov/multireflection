@@ -5,6 +5,13 @@ import os
 import time
 
 
+def to_square(img, t_x, t_y, b_x, b_y):
+    h, w = img.shape[:2]
+    m_x = w // 2 + b_x
+    m_y = h // 2 + b_y
+    return img[m_y - t_y // 2 : m_y + t_y // 2, m_x - t_x // 2 : m_x + t_x // 2]
+
+
 def process_image_from_webcam(
     img: ArrayLike, target_size: tuple[int] = (125, 125)
 ) -> ArrayLike:
@@ -13,14 +20,17 @@ def process_image_from_webcam(
     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Cut off sides to turn into square image
-    h, w = img.shape
-    m = w // 2
-    new_left_idx = m - h // 2
-    new_right_idx = m + h // 2
-    img = img[:, new_left_idx:new_right_idx]
+    r = 230
+    img = to_square(img, t_x=r, t_y=r, b_x=20, b_y=40)
 
     # Shrink image
     img = cv2.resize(img, target_size)
+
+    # Apply circular mask
+    img = apply_circular_mask(img)
+
+    # Blur
+    img = cv2.GaussianBlur(img, (7, 7), 0)
 
     return img
 
