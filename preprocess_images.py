@@ -5,27 +5,30 @@ import os
 import time
 
 
-def process_image_from_webcam(img: ArrayLike, target_size:tuple[int]=(125,125)) -> ArrayLike:
-    # TODO 
+def process_image_from_webcam(
+    img: ArrayLike, target_size: tuple[int] = (125, 125)
+) -> ArrayLike:
+    # TODO
     # To grayscale
     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Cut off sides to turn into square image
     h, w = img.shape
-    m = w//2
-    new_left_idx = m-h//2
-    new_right_idx = m+h//2
-    img = img[:,new_left_idx:new_right_idx]
+    m = w // 2
+    new_left_idx = m - h // 2
+    new_right_idx = m + h // 2
+    img = img[:, new_left_idx:new_right_idx]
 
     # Shrink image
     img = cv2.resize(img, target_size)
 
     return img
 
+
 def apply_circular_mask(image_array):
     """Applies a circular mask that blackens everything outside a centered circle."""
     h, w = image_array.shape[:2]
-    radius = w // 2  # Radius is half of the width
+    radius = min(w // 2, h // 2)  # Radius is half of the short side
     center = (w // 2, h // 2)
 
     # Create a black mask with a white circle in the center
@@ -38,10 +41,11 @@ def apply_circular_mask(image_array):
     return result
 
 
-def process_single_image(image_name, image_array, target_square_size=125, use_circular_mask=True):
+def process_single_image(
+    image_name, image_array, target_square_size=125, use_circular_mask=True
+):
     """Applies the mask and saves the image."""
     # Resize image
-
 
     # Apply circular mask
     masked_img = apply_circular_mask(image_array)
@@ -63,7 +67,9 @@ def __load_images(input_folder, grayscale=False):
     return images
 
 
-def data_from_folder(folder: str, grayscale=True, verbose=False) -> dict[str, np.ndarray]:
+def data_from_folder(
+    folder: str, grayscale=True, verbose=False
+) -> dict[str, np.ndarray]:
     t_start = time.time()
 
     # Load all pictures in memory
@@ -77,7 +83,9 @@ def data_from_folder(folder: str, grayscale=True, verbose=False) -> dict[str, np
         processed_images[name] = process_single_image(name, img)[1]
 
     if verbose:
-        print(f"Processing completed. Loaded #{len(processed_images)} images. Elapsed time: {time.time()-t_start}")
+        print(
+            f"Processing completed. Loaded #{len(processed_images)} images. Elapsed time: {time.time()-t_start}"
+        )
 
     return processed_images
 
@@ -88,4 +96,3 @@ if __name__ == "__main__":
     for _, v in data.items():
         print(v.shape)
         break
-
