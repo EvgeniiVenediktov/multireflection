@@ -5,6 +5,8 @@ import cv2
 from preprocess_images import process_image_from_webcam
 import time
 
+from config import *
+
 def save_image(img: ArrayLike, x:float, y:float, folder:str="data/real") -> None:
     cv2.imwrite(folder+f"/x{x:.2f}_y{y:.2f}.jpg", img)
 
@@ -35,27 +37,26 @@ if __name__ == "__main__":
     controller = MFController(image_size=(1920, 1440))
 
     # Set coordinate matrix
-    STEP = 0.02
 
-    # X_START = -2
-    # X_STOP = 3.7
+    # X_START = X_TILT_START
+    # X_STOP = X_TILT_STOP
 
-    # Y_START = -2
-    # Y_STOP = 2
+    # Y_START = Y_TILT_START
+    # Y_STOP = Y_TILT_STOP
 
-    X_START = -0.04
-    X_STOP = 0.04
+    x_coord_start = -0.04
+    x_coord_stop = 0.04
 
-    Y_START = 0
-    Y_STOP = 0.06
+    y_coord_start = 0
+    y_coord_stop = 0.06
 
 
-    x_tilt = np.arange(X_START, X_STOP, STEP)  # horizontal tilt. Negative - looking right
-    y_tilt = np.arange(Y_START, Y_STOP, STEP)  # vertical tilt. Negative - looking up
+    x_tilt = np.arange(x_coord_start, x_coord_stop, REAL_DATA_COLLECTION_STEP)  # horizontal tilt. Negative - looking right
+    y_tilt = np.arange(y_coord_start, y_coord_stop, REAL_DATA_COLLECTION_STEP)  # vertical tilt. Negative - looking up
 
     if len(x_tilt) % 2 == 1:
-        X_STOP += STEP
-        x_tilt = np.arange(X_START, X_STOP, STEP)
+        x_coord_stop += REAL_DATA_COLLECTION_STEP
+        x_tilt = np.arange(x_coord_start, x_coord_stop, REAL_DATA_COLLECTION_STEP)
     
 
     # Go through coordinate matrix

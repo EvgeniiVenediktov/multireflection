@@ -2,12 +2,19 @@ from preprocess_images import process_image_from_webcam
 from inference import TiltPredictor
 from mf_control.controller import MFController
 import cv2
+from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME
+
+
+def clip(v, minv, maxv):
+    v = max(v, minv)
+    v = min(v, maxv)
+    return v
 
 # Connect Controller
 controller = MFController()
 
 # Load model
-model = TiltPredictor("fc_4layers_1024batch_500epochs_50cosinescheduler_best_model.pth")
+model = TiltPredictor(INFERENCE_MODEL_FILE_NAME)
 
 command = "y"
 while command == "y":
@@ -30,7 +37,22 @@ while command == "y":
     prediction = model.predict([img])
 
     # Output
-    print("prediction:", prediction)
+    print("original_prediction:", prediction)
+
+    # Clip prediction
+    x, y = prediction
+    x = clip(x, X_TILT_START, X_TILT_STOP)
+    y = clip(y, Y_TILT_START, Y_TILT_STOP)
+    print("clipped prediciton", (x, y))
+
+    if input("Turn mirror by predicted angles? (y/n) ").lower() == "y":
+        controller.set_tilt_x(x)
+        controller.set_tilt_y(y)
 
     # Repeat
     command = input("Make another prediction? (y/n) ").lower()
+
+
+# Bring frame to zero
+controller.set_tilt_x(0)
+controller.set_tilt_y(0)
