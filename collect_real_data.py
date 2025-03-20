@@ -66,14 +66,14 @@ if __name__ == "__main__":
         controller.set_tilt_x(x)
         # y: 1 -> 2 -> 3
         for y in y_tilt:
-            whole_process(controller, x, y)
+            whole_process(controller, x, y, REAL_DATA_COLLECTION_DELAY)
         i += 1
 
         x = x_tilt[i]
         controller.set_tilt_x(x)
         # y: 3 -> 2 -> 1
         for y in y_tilt[::-1]:
-            whole_process(controller, x, y)
+            whole_process(controller, x, y, REAL_DATA_COLLECTION_DELAY)
         i += 1
     
     # Return frame to (0, 0)
