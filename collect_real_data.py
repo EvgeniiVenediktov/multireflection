@@ -1,14 +1,15 @@
 from mf_control.controller import MFController
 import numpy as np
 from numpy.typing import ArrayLike
-import cv2 
+import cv2
 from preprocess_images import process_image_from_webcam
 import time
 
 from config import *
 
-def save_image(img: ArrayLike, x:float, y:float, folder:str="data/real") -> None:
-    cv2.imwrite(folder+f"/x{x:.2f}_y{y:.2f}.jpg", img)
+
+def save_image(img: ArrayLike, x: float, y: float, folder: str = "data/real") -> None:
+    cv2.imwrite(folder + f"/x{x:.2f}_y{y:.2f}.jpg", img)
 
 
 def whole_process(controller: MFController, x:float, y:float, time_delay=0.1, verbose=True) -> None:
@@ -42,6 +43,7 @@ if __name__ == "__main__":
 
     y_coord_start = Y_TILT_START
     y_coord_stop = Y_TILT_STOP
+
 
 
     x_tilt = np.arange(x_coord_start, x_coord_stop, REAL_DATA_COLLECTION_STEP)  # horizontal tilt. Negative - looking right

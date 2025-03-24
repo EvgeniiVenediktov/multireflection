@@ -54,11 +54,11 @@ def apply_circular_mask(image_array):
 
 
 def process_single_image(
-    image_name, image_array, target_square_size=125, use_circular_mask=True
+    image_name, image_array, target_size=(125, 125), use_circular_mask=True
 ):
     """Applies the mask and saves the image."""
     # Resize image
-
+    image_array = cv2.resize(image_array, target_size)
     # Apply circular mask
     masked_img = apply_circular_mask(image_array)
     return image_name, masked_img
@@ -80,7 +80,7 @@ def __load_images(input_folder, grayscale=False):
 
 
 def data_from_folder(
-    folder: str, grayscale=True, verbose=False
+    folder: str, grayscale=True, verbose=False, target_size=(125, 125)
 ) -> dict[str, np.ndarray]:
     t_start = time.time()
 
@@ -92,7 +92,7 @@ def data_from_folder(
 
     # Process sequentially
     for name, img in images.items():
-        processed_images[name] = process_single_image(name, img)[1]
+        processed_images[name] = process_single_image(name, img, target_size)[1]
 
     if verbose:
         print(
