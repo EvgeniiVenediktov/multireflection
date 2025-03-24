@@ -11,7 +11,7 @@ def save_image(img: ArrayLike, x:float, y:float, folder:str="data/real") -> None
     cv2.imwrite(folder+f"/x{x:.2f}_y{y:.2f}.jpg", img)
 
 
-def whole_process(controller: MFController, x:float, y:float, time_delay=0.3, verbose=True) -> None:
+def whole_process(controller: MFController, x:float, y:float, time_delay=0.1, verbose=True) -> None:
     # Turn frame
     controller.set_tilt_y(y)
 
@@ -37,18 +37,11 @@ if __name__ == "__main__":
     controller = MFController(image_size=(1920, 1440))
 
     # Set coordinate matrix
+    x_coord_start = X_TILT_START
+    x_coord_stop = X_TILT_STOP
 
-    # X_START = X_TILT_START
-    # X_STOP = X_TILT_STOP
-
-    # Y_START = Y_TILT_START
-    # Y_STOP = Y_TILT_STOP
-
-    x_coord_start = -0.04
-    x_coord_stop = 0.04
-
-    y_coord_start = 0
-    y_coord_stop = 0.06
+    y_coord_start = Y_TILT_START
+    y_coord_stop = Y_TILT_STOP
 
 
     x_tilt = np.arange(x_coord_start, x_coord_stop, REAL_DATA_COLLECTION_STEP)  # horizontal tilt. Negative - looking right
@@ -60,6 +53,7 @@ if __name__ == "__main__":
     
 
     # Go through coordinate matrix
+    controller.start()
     i = 0
     while i in range(len(x_tilt)):
         x = x_tilt[i]
@@ -80,3 +74,4 @@ if __name__ == "__main__":
     controller.set_tilt_x(0)
     controller.set_tilt_y(0)
     print(controller.get_frame_position())
+    controller.close()
