@@ -9,3 +9,7 @@ REAL_DATA_COLLECTION_DELAY = 0.3
 
 
 INFERENCE_MODEL_FILE_NAME = "fc_4layers_1024batch_500epochs_50cosinescheduler_best_model.pth"
+
+TRAINING_IMAGE_RESOLUTION = (125, 125)
+
+LMDB_USE_COMPRESSION = True

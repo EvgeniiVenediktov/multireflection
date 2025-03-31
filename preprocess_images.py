@@ -22,11 +22,9 @@ def process_image_from_webcam(
     # Cut off sides to turn into square image
     r = min(*img.shape)
     img = to_square(img, r, r, 0, 0)
-    
+
     # Shrink image
     img = cv2.resize(img, target_size)
-
-    
 
     # Apply circular mask
     img = apply_circular_mask(img)
@@ -37,7 +35,7 @@ def process_image_from_webcam(
     return img
 
 
-def apply_circular_mask(image_array):
+def apply_circular_mask(image_array) -> ArrayLike:
     """Applies a circular mask that blackens everything outside a centered circle."""
     h, w = image_array.shape[:2]
     radius = min(w // 2, h // 2)  # Radius is half of the short side
@@ -54,9 +52,16 @@ def apply_circular_mask(image_array):
 
 
 def process_single_image(
-    image_name, image_array, target_size=(125, 125), use_circular_mask=True
+    image_name: str,
+    image_array: ArrayLike,
+    target_size=(125, 125),
+    use_circular_mask=True,
 ):
-    """Applies the mask and saves the image."""
+    """
+    Applies the mask and saves the image.
+
+    Returns image_name:str , masked_img:ArrayLike
+    """
     # Resize image
     image_array = cv2.resize(image_array, target_size)
     # Apply circular mask
