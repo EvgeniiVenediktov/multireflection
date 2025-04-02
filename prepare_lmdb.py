@@ -9,6 +9,13 @@ import msgpack
 from tqdm import tqdm
 import lz4.frame
 
+def imname_to_target(name:str) -> tuple[float]:
+    """Parses image names of format x{x_value}_y{y_value}.jpg"""
+    name = name.split('.jpg')[0]
+    x, y = name.split("_")
+    x = float(x[1:])
+    y = float(y[1:])
+    return x, y
 
 def create_lmdb_from_images(
     image_dir, lmdb_path, start_index=0, stop_index=None, size=None, resolution=(512, 512), use_compression=True
@@ -35,8 +42,16 @@ def create_lmdb_from_images(
         try:
             pbar = tqdm(range(start_index, stop_index))
             for i in pbar:
-                pbar.set_description(txn.stat()["entries"])
+                pbar.set_description(str(txn.stat()["entries"]))
                 f = image_names[i]
+
+                # TODO: skip 0.001 step
+                x, y = imname_to_target(f)
+                if int(x*100)%2 != 0:
+                    continue
+                if int(y*100)%2 != 0:
+                    continue
+
                 path = os.path.join(image_dir, f)
 
                 # Load image
@@ -97,11 +112,13 @@ def read_image_from_lmdb(image_name: str, lmdb_path: str, decompress=True):
 
 if __name__ == "__main__":
     datasource_dir = "H:/latest_real_data/real_data/real"
-    output_path = "H:/real_512_0_001step.lmdb"
+    output_path = "H:/real_512_0_002step.lmdb"
+    # datasource_dir = "/mnt/h/latest_real_data/real_data/real"
+    # output_path = "/mnt/h/real_512_0_002step.lmdb"
     # datasource_dir = "C:/Users/EVV13/Documents/multireflection/data/125x125_laser_x4_y6"
     # output_path = "H:/125x125_laser_x4_y6.lmdb"
     # create_lmdb_from_images(
-    #     datasource_dir, output_path, stop_index=50000, size=16 * 1024 * 1024 * 1024, use_compression=True
+    #     datasource_dir, output_path, stop_index=None, size=15 * 1024 * 1024 * 1024, use_compression=False
     # )
     # img = read_image_from_lmdb("x-0.01_y-0.49.jpg", output_path)
     # print(img.shape)
