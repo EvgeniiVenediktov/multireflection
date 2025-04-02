@@ -4,11 +4,11 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 class SimpleFC(nn.Module):
-    def __init__(self, out_features):
+    def __init__(self, in_features, out_features):
         super(SimpleFC, self).__init__()
         self.relu = nn.ReLU()
         self.layers = nn.Sequential(
-            nn.Linear(125*125, 1024), # 15,625 -> 1024
+            nn.Linear(in_features, 1024), # 262,144 -> 1024
             nn.BatchNorm1d(1024),
             self.relu,
             nn.Linear(1024, 256),
@@ -34,7 +34,7 @@ class TiltPredictor:
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.DEVICE)
 
-        self.model = SimpleFC(2)
+        self.model = SimpleFC(512*512, 2)
         self.model = self.load_model(self.model, fname=model_fname)
         self.model.eval()
         self.model.to(self.DEVICE)
