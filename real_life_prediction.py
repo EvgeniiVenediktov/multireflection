@@ -40,7 +40,7 @@ while command == "y":
     print("original_prediction:", prediction)
 
     # Clip prediction
-    x, y = prediction
+    x, y = prediction[0]
     x = clip(x, X_TILT_START, X_TILT_STOP)
     y = clip(y, Y_TILT_START, Y_TILT_STOP)
     print("clipped prediciton", (x, y))
