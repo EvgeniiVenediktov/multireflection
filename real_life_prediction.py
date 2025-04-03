@@ -2,7 +2,7 @@ from preprocess_images import process_image_from_webcam
 from inference import TiltPredictor
 from mf_control.controller import MFController
 import cv2
-from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME
+from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE
 
 
 def clip(v, minv, maxv):
@@ -14,7 +14,7 @@ def clip(v, minv, maxv):
 controller = MFController()
 
 # Load model
-model = TiltPredictor(INFERENCE_MODEL_FILE_NAME)
+model = TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)
 
 command = "y"
 while command == "y":

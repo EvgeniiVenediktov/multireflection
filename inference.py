@@ -21,6 +21,31 @@ class SimpleFC(nn.Module):
         )
     def forward(self, x):
         return self.layers.forward(x)
+    
+
+class WideConv(nn.Module):
+    def __init__(self):
+        super(WideConv, self).__init__()
+        self.relu = nn.ReLU()
+        self.conv1 = nn.Conv2d(1, 16, 5, padding=2)
+        self.conv2 = nn.Conv2d(16, 32, 5, padding=2)
+        self.conv3 = nn.Conv2d(32, 32, 5, padding=2)
+        
+        # Instead of flattening, use global average pooling
+        self.global_pool = nn.AdaptiveAvgPool2d((1,1))
+        
+        self.fc = nn.Sequential(
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, 2)  # Predicts 2 values
+        )
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+        x = self.global_pool(x).view(x.size(0), -1)
+        return self.fc(x)
         
 
 
@@ -30,11 +55,18 @@ class TiltPredictor:
         model.load_state_dict(torch.load(path+fname, weights_only=False, map_location=self.DEVICE))
         return model
     
-    def __init__(self, model_fname):
+    def __init__(self, model_fname:str, model_type:str):
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.DEVICE)
 
-        self.model = SimpleFC(512*512, 2)
+        match model_type:
+            case "SimpleFC":
+                self.model = SimpleFC(512*512, 2)
+            case "WideConv":
+                self.model = WideConv()
+            case _ :
+                raise KeyError("Not supported model type")
+        self.model_type = model_type
         self.model = self.load_model(self.model, fname=model_fname)
         self.model.eval()
         self.model.to(self.DEVICE)
@@ -46,7 +78,9 @@ class TiltPredictor:
         """
         tensors = []
         for img in inputs:
-            img = torch.from_numpy(img).flatten().float()
+            img = torch.from_numpy(img).float()
+            if self.model_type == "SimpleFC":
+                img = img.flatten()
             tensors.append(img)
         x = torch.stack(tensors).to(self.DEVICE)
 
@@ -57,7 +91,7 @@ class TiltPredictor:
 
 if __name__=="__main__":
     import time
-    model = TiltPredictor("fc_4layers_1024batch_500epochs_50cosinescheduler_best_model.pth")
+    model = TiltPredictor("fc_4layers_1024batch_500epochs_50cosinescheduler_best_model.pth", model_type="SimpleFC")
     x = np.zeros((125, 125))
     start = time.time()
     y = model.predict([x])
