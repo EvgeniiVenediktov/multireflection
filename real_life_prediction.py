@@ -16,6 +16,7 @@ controller = MFController()
 
 # Load model
 model = TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)
+print(f"Loaded {INFERENCE_MODEL_FILE_NAME}")
 
 command = "y"
 while command == "y":
