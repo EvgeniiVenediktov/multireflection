@@ -2,6 +2,7 @@ from preprocess_images import process_image_from_webcam
 from inference import TiltPredictor
 from mf_control.controller import MFController
 import cv2
+import numpy as np
 from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE
 
 
@@ -34,7 +35,7 @@ while command == "y":
     cv2.destroyWindow("Processed")
 
     # Make prediction
-    prediction = model.predict([img])
+    prediction = model.predict(np.array([[img]]))
 
     # Output
     print("original_prediction:", prediction)
