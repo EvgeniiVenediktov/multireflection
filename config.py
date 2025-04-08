@@ -8,7 +8,7 @@ REAL_DATA_COLLECTION_STEP = 0.01
 REAL_DATA_COLLECTION_DELAY = 0.1
 
 
-INFERENCE_MODEL_FILE_NAME = "wideconv_48bs_001lr_15sl_noise_jitter_redused_best_model.pth"
+INFERENCE_MODEL_FILE_NAME = "002step_simplefc_512bs_0001lr_15sl_aug_best_model.pth"
 INFERENCE_MODEL_TYPE = "WideConv"
 
 TRAINING_IMAGE_RESOLUTION = (512, 512)
