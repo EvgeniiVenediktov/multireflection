@@ -88,9 +88,11 @@ class TiltPredictor:
 
         predictions:torch.Tensor = self.model.forward(x)
         predictions = predictions.detach().cpu().numpy()
+        print("DEBUG predictions:", predictions)
         if scale_predictions:
             predictions[:,0] = predictions[:,0] * (X_TILT_STOP - X_TILT_START) + X_TILT_START
             predictions[:,1] = predictions[:,1] * (Y_TILT_STOP - Y_TILT_START) + Y_TILT_START
+            print("DEBUG scaled predictions:", predictions)
         return predictions
 
 
