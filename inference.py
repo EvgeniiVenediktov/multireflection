@@ -80,7 +80,7 @@ class TiltPredictor:
         """
         tensors = []
         for img in inputs:
-            img = torch.from_numpy(img).float()
+            img = torch.from_numpy(img).float()/255
             if self.model_type == "SimpleFC":
                 img = img.flatten()
             tensors.append(img)
