@@ -8,6 +8,7 @@ import numpy as np
 import msgpack
 from tqdm import tqdm
 import lz4.frame
+from sklearn.model_selection import train_test_split
 
 def imname_to_target(name:str) -> tuple[float]:
     """Parses image names of format x{x_value}_y{y_value}.jpg"""
@@ -45,12 +46,12 @@ def create_lmdb_from_images(
                 pbar.set_description(str(txn.stat()["entries"]))
                 f = image_names[i]
 
-                # TODO: skip 0.001 step
-                x, y = imname_to_target(f)
-                if int(x*100)%2 != 0:
-                    continue
-                if int(y*100)%2 != 0:
-                    continue
+                # # TODO: skip 0.001 step
+                # x, y = imname_to_target(f)
+                # if int(x*100)%2 != 0:
+                #     continue
+                # if int(y*100)%2 != 0:
+                #     continue
 
                 path = os.path.join(image_dir, f)
 
@@ -92,6 +93,30 @@ def create_lmdb_from_images(
     #         keys_file.write(l + "\n")
     #     keys_file.close()
 
+def write_split_keys(keys:list[str], path, filter:callable = None, val_share=0.2, train_fname="train_keys.txt", val_fname="val_keys.txt") -> None:
+    # Filter keys
+    if filter is not None:
+        new_keys = []
+        for k in keys:
+            if not filter(k):
+                continue
+            new_keys.append(k)
+        keys = new_keys
+
+    # Split
+    train, val = train_test_split(keys, test_size=val_share)
+    print("train len:", len(train))
+    print("val len:", len(val))
+    # Write
+    with open(os.path.join(path, train_fname), "+w") as keys_file:
+        for l in train:
+            keys_file.write(l + "\n")
+        keys_file.close()
+    with open(os.path.join(path, val_fname), "+w") as keys_file:
+        for l in val:
+            keys_file.write(l + "\n")
+        keys_file.close()
+
 
 def read_image_from_lmdb(image_name: str, lmdb_path: str, decompress=True):
     # Open lmdb
@@ -110,15 +135,38 @@ def read_image_from_lmdb(image_name: str, lmdb_path: str, decompress=True):
     return img
 
 
+def filter_02step(s:str) -> bool:
+    """False for filter out"""
+    x, y = imname_to_target(s)
+    x = round(x*100)
+    y = round(y*100)
+    if not(x%10 == 0 and x%100//10%2 == 0):
+        return False
+    if not(y%10 == 0 and y%100//10%2 == 0):
+        return False
+    return True
+
+def filter_002step(s:str) -> bool:
+    """False for filter out"""
+    x, y = imname_to_target(s)
+    x = round(x*100)
+    y = round(y*100)
+    if not(x%2 == 0):
+        return False
+    if not(y%2 == 0):
+        return False
+    return True
+
+
 if __name__ == "__main__":
     datasource_dir = "H:/latest_real_data/real_data/real"
-    output_path = "H:/real_512_0_002step.lmdb"
+    output_path = "H:/real_512_0_001step.lmdb"
     # datasource_dir = "/mnt/h/latest_real_data/real_data/real"
     # output_path = "/mnt/h/real_512_0_002step.lmdb"
     # datasource_dir = "C:/Users/EVV13/Documents/multireflection/data/125x125_laser_x4_y6"
     # output_path = "H:/125x125_laser_x4_y6.lmdb"
     # create_lmdb_from_images(
-    #     datasource_dir, output_path, stop_index=None, size=15 * 1024 * 1024 * 1024, use_compression=False
+    #     datasource_dir, output_path, stop_index=None, size=60 * 1024 * 1024 * 1024, use_compression=False
     # )
     # img = read_image_from_lmdb("x-0.01_y-0.49.jpg", output_path)
     # print(img.shape)
@@ -129,7 +177,12 @@ if __name__ == "__main__":
     # for k in keys:
     #     read
 
-    env = lmdb.open(output_path, readonly=True)
-    with env.begin() as txn:
-        length = txn.stat()['entries']
-        print(length)
+    # env = lmdb.open(output_path, readonly=True)
+    # with env.begin() as txn:
+    #     length = txn.stat()['entries']
+    #     print(length)
+
+    # Read keys
+    keys = [s.replace("\n", "") for s in open(os.path.join(output_path, "keys.txt"), "r").readlines()]
+    write_split_keys(keys, output_path, filter=filter_002step, train_fname="keys_train_002step.txt", val_fname="keys_val_002step.txt")
+

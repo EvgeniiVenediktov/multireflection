@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 from numpy.typing import ArrayLike
+from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP
+
 
 class SimpleFC(nn.Module):
     def __init__(self, in_features, out_features):
@@ -71,7 +73,7 @@ class TiltPredictor:
         self.model.eval()
         self.model.to(self.DEVICE)
     
-    def predict(self, inputs:list[ArrayLike]) -> list[tuple[float]]:
+    def predict(self, inputs:list[ArrayLike], scale_predictions=True) -> list[tuple[float]]:
         """
         Takes a list of (125, 125) images \n
         Returns list of [x_deg, y_deg]
@@ -86,6 +88,9 @@ class TiltPredictor:
 
         predictions:torch.Tensor = self.model.forward(x)
         predictions = predictions.detach().cpu().numpy()
+        if scale_predictions:
+            predictions[:,0] = predictions[:,0] * (X_TILT_STOP - X_TILT_START) + X_TILT_START
+            predictions[:,1] = predictions[:,1] * (Y_TILT_STOP - Y_TILT_START) + Y_TILT_START
         return predictions
 
 
