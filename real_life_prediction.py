@@ -29,7 +29,7 @@ while command == "y":
     cv2.destroyWindow("Raw")
     # Preprocess image
     img = process_image_from_webcam(img, target_size=(512, 512))
-
+    
     # Display
     cv2.imshow("Processed", img)
     cv2.waitKey(0)
@@ -39,13 +39,13 @@ while command == "y":
     prediction = model.predict(np.array([[img]]))
 
     # Output
-    print("original_prediction:", prediction)
+    print("original_prediction:", prediction[0])
 
     # Clip prediction
     x, y = prediction[0]
-    x = clip(x, X_TILT_START, X_TILT_STOP)
-    y = clip(y, Y_TILT_START, Y_TILT_STOP)
-    print("clipped prediciton", (x, y))
+    x = -round(clip(x, X_TILT_START, X_TILT_STOP), 2)
+    y = -round(clip(y, Y_TILT_START, Y_TILT_STOP), 2)
+    print("proposed turn", (x, y))
 
     if input("Turn mirror by predicted angles? (y/n) ").lower() == "y":
         controller.set_tilt_x(x)
@@ -58,3 +58,4 @@ while command == "y":
 # Bring frame to zero
 controller.set_tilt_x(0)
 controller.set_tilt_y(0)
+controller.close()
