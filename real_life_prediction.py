@@ -43,11 +43,13 @@ while command == "y":
 
     # Clip prediction
     x, y = prediction[0]
-    x = -round(clip(x, X_TILT_START, X_TILT_STOP), 2)
-    y = -round(clip(y, Y_TILT_START, Y_TILT_STOP), 2)
-    cprint("Proposed turn:"+str((x, y)), GREEN)
+    x = -clip(x, X_TILT_START, X_TILT_STOP)
+    y = -clip(y, Y_TILT_START, Y_TILT_STOP)
+    x = round(controller.get_x_tilt() + x, 2)
+    y = round(controller.get_y_tilt() + y, 2)
+    cprint("Proposed position:"+str((x, y)), GREEN)
 
-    if input("Turn mirror by predicted angles? (y/n) ").lower() == "y":
+    if input("Bring system to proposed positon? (y/n) ").lower() == "y":
         controller.set_tilt_x(x)
         controller.set_tilt_y(y)
 
