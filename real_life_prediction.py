@@ -12,7 +12,7 @@ def clip(v, minv, maxv):
     return v
 
 # Connect Controller
-controller = MFController()
+controller = MFController(image_size=(1920, 1440))
 
 # Load model
 model = TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)
