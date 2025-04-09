@@ -39,7 +39,7 @@ while command == "y":
     prediction = model.predict(np.array([[img]]))
 
     # Output
-    print("prediction:", prediction[0])
+    cprint("prediction:"+str(prediction[0]), GRAY)
 
     # Clip prediction
     x, y = prediction[0]
