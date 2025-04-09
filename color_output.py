@@ -7,5 +7,5 @@ CYAN = '\033[36m'
 WHITE = '\003[37m'
 RESET = '\033[0m'
 
-print(MAGENTA + "Magenta" + RESET)
-print(CYAN + "Cyan" + RESET)
+def cprint(s, color):
+    print(color + s + RESET)

@@ -4,7 +4,7 @@ from mf_control.controller import MFController
 import cv2
 import numpy as np
 from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE
-
+from color_output import *
 
 def clip(v, minv, maxv):
     v = max(v, minv)
@@ -39,13 +39,13 @@ while command == "y":
     prediction = model.predict(np.array([[img]]))
 
     # Output
-    print("original_prediction:", prediction[0])
+    print("prediction:", prediction[0])
 
     # Clip prediction
     x, y = prediction[0]
     x = -round(clip(x, X_TILT_START, X_TILT_STOP), 2)
     y = -round(clip(y, Y_TILT_START, Y_TILT_STOP), 2)
-    print("proposed turn", (x, y))
+    cprint("Proposed turn:"+str((x, y)), GREEN)
 
     if input("Turn mirror by predicted angles? (y/n) ").lower() == "y":
         controller.set_tilt_x(x)
