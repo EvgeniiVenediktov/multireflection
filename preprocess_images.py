@@ -12,8 +12,19 @@ def to_square(img, t_x, t_y, b_x, b_y):
     return img[m_y - t_y // 2 : m_y + t_y // 2, m_x - t_x // 2 : m_x + t_x // 2]
 
 
+def process_for_stopping_criteria(
+    img: ArrayLike, 
+    ht:int = 120,    
+) -> ArrayLike:
+    
+    # High-pass filter
+    img[img<ht] = 0
+
+    return img
+
+
 def process_image_from_webcam(
-    img: ArrayLike, target_size: tuple[int] = (125, 125)
+    img: ArrayLike, target_size: tuple[int] = (512, 512)
 ) -> ArrayLike:
     # TODO
     # To grayscale
