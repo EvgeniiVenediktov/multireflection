@@ -14,3 +14,5 @@ INFERENCE_MODEL_TYPE = "SimpleFC"
 TRAINING_IMAGE_RESOLUTION = (512, 512)
 
 LMDB_USE_COMPRESSION = False
+
+OPTIMUM_IMAGE_PATH = "/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg"
