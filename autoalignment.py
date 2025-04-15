@@ -27,42 +27,54 @@ controller = MFController(image_size=(1920, 1440))
 model = TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)
 print(f"Loaded {INFERENCE_MODEL_FILE_NAME}")
 
+try:
+    while True:
+        # Get image from webcam
+        img = controller.capture_image()
 
-while True:
-    # Get image from webcam
-    img = controller.capture_image()
+        # Display
+        img = process_image_from_webcam(img, target_size=(512, 512))
+        cv2.imshow("Processed", img)
+        cv2.waitKey(2000)
+        cv2.destroyWindow("Processed")
 
-    # Display
-    img = process_image_from_webcam(img, target_size=(512, 512))
-    cv2.imshow("Processed", img)
-    cv2.waitKey(2000)
-    cv2.destroyWindow("Processed")
+        # Evaluate position
+        sim_index = round(ssim(optimum_image, img), 2)
+        cprint("Similarity index:"+str(sim_index), MAGENTA)
+        if sim_index >= SIMILARITY_INDEX_THRESHOLD:
+            cprint("Alignment finished", GREEN)
+            break
 
-    # Evaluate position
-    sim_index = ssim(optimum_image, img)
-    cprint("Similarity index:"+str(round(sim_index, 2)), MAGENTA)
-    if sim_index > SIMILARITY_INDEX_THRESHOLD:
-        cprint("Alignment finished")
-        break
+        # Make prediction
+        prediction = model.predict(np.array([[img]]))
 
-    # Make prediction
-    prediction = model.predict(np.array([[img]]))
+        # Clip prediction
+        x, y = prediction[0]
+        x = -clip(x, X_TILT_START, X_TILT_STOP)
+        y = -clip(y, Y_TILT_START, Y_TILT_STOP)
+        x = round(controller.get_x_tilt() + x, 2)
+        y = round(controller.get_y_tilt() + y, 2)
+        cprint("New position:"+str((x, y)), YELLOW)
 
-    # Clip prediction
-    x, y = prediction[0]
-    x = -clip(x, X_TILT_START, X_TILT_STOP)
-    y = -clip(y, Y_TILT_START, Y_TILT_STOP)
-    x = round(controller.get_x_tilt() + x, 2)
-    y = round(controller.get_y_tilt() + y, 2)
-    cprint("Next position:"+str((x, y)), YELLOW)
+        # Bring system to proposed positon
+        controller.set_tilt_x(x)
+        controller.set_tilt_y(y)
 
-    # Bring system to proposed positon
-    controller.set_tilt_x(x)
-    controller.set_tilt_y(y)
+        # Log position
+        logging.info(f"x: {controller.get_x_tilt()}, y: {controller.get_y_tilt()}")
 
-    # Log position
-    logging.info(f"x: {controller.get_x_tilt}, y: {controller.get_y_tilt}")
-
+        # TESTING
+        #key = input("Type x for exit: ")
+        #if key=='x':
+        #    break
+except BaseException as e:
+    logging.error(e)
+    print(e)
+    print("Returning to origin")
+    controller.set_tilt_x(0)
+    controller.set_tilt_y(0)
+    controller.close()
+    exit()
 
 input("Press enter to return system to origin and exit")
 
