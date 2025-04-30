@@ -15,7 +15,7 @@ TRAINING_IMAGE_RESOLUTION = (512, 512)
 
 LMDB_USE_COMPRESSION = False
 
-OPTIMUM_IMAGE_PATH = "/home/raspberry/projects/multireflection/data/light/x0.00_y0.00.jpg"
 
-#OPTIMUM_IMAGE_PATH = "/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg"
-SIMILARITY_INDEX_THRESHOLD = 0.8
+# OPTIMUM_IMAGE_PATH = "/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg"
+SIMILARITY_INDEX_THRESHOLD = 0.94
+OPTIMUM_IMAGE_PATH_LIST = ["/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg", "/home/raspberry/projects/multireflection/data/light/x0.00_y0.00.jpg"]

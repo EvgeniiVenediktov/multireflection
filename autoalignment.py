@@ -1,7 +1,6 @@
 from preprocess_images import process_image_from_webcam
-from inference import TiltPredictor
+from inference import TiltPredictor, evaluate_position
 from mf_control.controller import MFController
-from skimage.metrics import structural_similarity as ssim
 import cv2
 import numpy as np
 from config import *
@@ -17,9 +16,10 @@ def clip(v, minv, maxv):
     v = min(v, maxv)
     return v
 
-# Load optimal state image
-optimum_image = cv2.imread(OPTIMUM_IMAGE_PATH, cv2.IMREAD_GRAYSCALE)
-
+# Load optimal state images
+optimal_states = []
+for path in OPTIMUM_IMAGE_PATH_LIST:
+    optimal_states.append(cv2.imread(path, cv2.IMREAD_GRAYSCALE))
 # Connect Controller
 controller = MFController(image_size=(1920, 1440))
 
@@ -39,7 +39,7 @@ try:
         cv2.destroyWindow("Processed")
 
         # Evaluate position
-        sim_index = round(ssim(optimum_image, img), 2)
+        sim_index = evaluate_position(img, optimums=optimal_states)
         cprint("Similarity index:"+str(sim_index), MAGENTA)
         if sim_index >= SIMILARITY_INDEX_THRESHOLD:
             cprint("Alignment finished", GREEN)

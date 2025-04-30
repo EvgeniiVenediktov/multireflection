@@ -1,10 +1,9 @@
 from preprocess_images import process_image_from_webcam
-from inference import TiltPredictor
+from inference import TiltPredictor, evaluate_position
 from mf_control.controller import MFController
-from skimage.metrics import structural_similarity as ssim
 import cv2
 import numpy as np
-from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE, OPTIMUM_IMAGE_PATH
+from config import *
 from color_output import *
 
 def clip(v, minv, maxv):
@@ -12,8 +11,10 @@ def clip(v, minv, maxv):
     v = min(v, maxv)
     return v
 
-# Load optimal state image
-optimum_image = cv2.imread(OPTIMUM_IMAGE_PATH, cv2.IMREAD_GRAYSCALE)
+# Load optimal state images
+optimal_states = []
+for path in OPTIMUM_IMAGE_PATH_LIST:
+    optimal_states.append(cv2.imread(path, cv2.IMREAD_GRAYSCALE))
 
 # Connect Controller
 controller = MFController(image_size=(1920, 1440))
@@ -40,7 +41,7 @@ while command == "y":
     cv2.destroyWindow("Processed")
 
     # Evaluate position
-    sim_index = ssim(optimum_image, img)
+    sim_index = evaluate_position(img, optimums=optimal_states)
     cprint("Similarity index:"+str(round(sim_index, 2)), MAGENTA)
 
     # Make prediction

@@ -2,7 +2,16 @@ import torch
 import torch.nn as nn
 import numpy as np
 from numpy.typing import ArrayLike
-from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP
+from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, OPTIMUM_IMAGE_PATH_LIST
+from skimage.metrics import structural_similarity as ssim
+
+
+def evaluate_position(current_image: ArrayLike, optimums: list[ArrayLike]) -> float:
+    results = []
+    for optimum in optimums:
+        results.append(ssim(current_image, optimum))
+    return max(results)
+
 
 
 class SimpleFC(nn.Module):

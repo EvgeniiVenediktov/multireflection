@@ -15,11 +15,12 @@ def imname_to_target(name:str) -> tuple[float]:
     name = name.split('.jpg')[0]
     x, y = name.split("_")
     x = float(x[1:])
-    y = float(y[1:])
+    y = float(y[1:5])
     return x, y
 
 def create_lmdb_from_images(
-    image_dir, lmdb_path, start_index=0, stop_index=None, size=None, resolution=(512, 512), use_compression=True
+    image_dir, lmdb_path, start_index=0, stop_index=None, size=None, resolution=(512, 512), use_compression=True,
+    key_process=None, key_filter=None
 ):
     # Get filenames
     image_names = [
@@ -46,20 +47,25 @@ def create_lmdb_from_images(
                 pbar.set_description(str(txn.stat()["entries"]))
                 f = image_names[i]
 
-                # # TODO: skip 0.001 step
-                # x, y = imname_to_target(f)
-                # if int(x*100)%2 != 0:
-                #     continue
-                # if int(y*100)%2 != 0:
-                #     continue
+                if key_filter is not None:
+                    if not key_filter(f):
+                        continue
 
                 path = os.path.join(image_dir, f)
 
                 # Load image
                 img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
 
+                if key_process is not None:
+                    f = key_process(f)
+
                 # Process image
-                _, img = process_single_image(f, img, target_size=resolution)
+                try:
+                    _, img = process_single_image(f, img, target_size=resolution)
+                except Exception as e:
+                    print(e)
+                    print(f)
+                    continue
 
                 # Serialize
                 # Convert to NumPy array and serialize with msgpack
@@ -87,11 +93,6 @@ def create_lmdb_from_images(
             env.close()
             keys_file.close()
 
-    # # Save image names
-    # with open(os.path.join(lmdb_path, "keys.txt"), "+w") as keys_file:
-    #     for l in image_names:
-    #         keys_file.write(l + "\n")
-    #     keys_file.close()
 
 def write_split_keys(keys:list[str], path, filter:callable = None, val_share=0.2, train_fname="train_keys.txt", val_fname="val_keys.txt") -> None:
     # Filter keys
@@ -135,16 +136,6 @@ def read_image_from_lmdb(image_name: str, lmdb_path: str, decompress=True):
     return img
 
 
-def filter_02step(s:str) -> bool:
-    """False for filter out"""
-    x, y = imname_to_target(s)
-    x = round(x*100)
-    y = round(y*100)
-    if not(x%10 == 0 and x%100//10%2 == 0):
-        return False
-    if not(y%10 == 0 and y%100//10%2 == 0):
-        return False
-    return True
 
 def filter_002step(s:str) -> bool:
     """False for filter out"""
@@ -158,31 +149,39 @@ def filter_002step(s:str) -> bool:
     return True
 
 
+def light_postfix_keyproc(s:str) -> str:
+    return s[:-4] + "-light.jpg"
+
 if __name__ == "__main__":
-    datasource_dir = "H:/latest_real_data/real_data/real"
-    output_path = "H:/real_512_0_001step.lmdb"
-    # datasource_dir = "/mnt/h/latest_real_data/real_data/real"
-    # output_path = "/mnt/h/real_512_0_002step.lmdb"
-    # datasource_dir = "C:/Users/EVV13/Documents/multireflection/data/125x125_laser_x4_y6"
-    # output_path = "H:/125x125_laser_x4_y6.lmdb"
+    datasource_dir = "/mnt/h/latest_real_data/light"
+    output_path = "/mnt/h/real_512_0_001step.lmdb"
+
     # create_lmdb_from_images(
-    #     datasource_dir, output_path, stop_index=None, size=60 * 1024 * 1024 * 1024, use_compression=False
+    #     datasource_dir, 
+    #     output_path, 
+    #     stop_index=None, 
+    #     size=120 * 1024 * 1024 * 1024, 
+    #     use_compression=False, 
+    #     key_process=light_postfix_keyproc
     # )
-    # img = read_image_from_lmdb("x-0.01_y-0.49.jpg", output_path)
-    # print(img.shape)
-
+    
+    
     # TEST all keys
-
-    # keys = [s.replace("\n", "") for s in open(os.path.join(output_path, "keys.txt"), "r").readlines()]
-    # for k in keys:
-    #     read
 
     # env = lmdb.open(output_path, readonly=True)
     # with env.begin() as txn:
     #     length = txn.stat()['entries']
     #     print(length)
 
-    # Read keys
-    keys = [s.replace("\n", "") for s in open(os.path.join(output_path, "keys.txt"), "r").readlines()]
-    write_split_keys(keys, output_path, filter=filter_002step, train_fname="keys_train_002step.txt", val_fname="keys_val_002step.txt")
+    # Dark:       228000
+    # Dark+Light: 456000 
+
+    # Prepare keys
+    # keys = [s.replace("\n", "") for s in open(os.path.join(output_path, "keys.txt"), "r").readlines()]
+    keys_fnames = ["keys_black.txt", "keys_light.txt"]
+    keys = []
+    for fname in keys_fnames:
+        for s in open(os.path.join(output_path, fname), "r").readlines():
+            keys.append(s.replace("\n", ""))
+    write_split_keys(keys, output_path, train_fname="mixed_keys_train.txt", val_fname="mixed_keys_val.txt")
 
