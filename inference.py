@@ -10,7 +10,7 @@ def evaluate_position(current_image: ArrayLike, optimums: list[ArrayLike]) -> fl
     results = []
     for optimum in optimums:
         results.append(ssim(current_image, optimum))
-    return max(results)
+    return round(max(results), 2)
 
 
 
