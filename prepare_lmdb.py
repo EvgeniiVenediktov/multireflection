@@ -182,6 +182,8 @@ if __name__ == "__main__":
     keys = []
     for fname in keys_fnames:
         for s in open(os.path.join(output_path, fname), "r").readlines():
-            keys.append(s.replace("\n", ""))
-    write_split_keys(keys, output_path, train_fname="mixed_keys_train.txt", val_fname="mixed_keys_val.txt")
+            key = s.replace("\n", "")
+            if filter_002step(key):
+                keys.append(key)
+    write_split_keys(keys, output_path, train_fname="002_mixed_keys_train.txt", val_fname="002_mixed_keys_val.txt")
 
