@@ -16,7 +16,7 @@ logging.basicConfig(filename="data_collection_log.txt",
                     level=logging.DEBUG)
 
 
-def save_image(img: ArrayLike, x: float, y: float, folder: str = "data/light") -> None:
+def save_image(img: ArrayLike, x: float, y: float, folder: str = "data/main_light") -> None:
     cv2.imwrite(folder + f"/x{x:.2f}_y{y:.2f}.jpg", img)
 
 
