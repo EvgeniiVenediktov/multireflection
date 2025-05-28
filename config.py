@@ -1,3 +1,6 @@
+from os import wait
+
+
 X_TILT_START = -2
 X_TILT_STOP = 3.7
 
@@ -19,3 +22,7 @@ LMDB_USE_COMPRESSION = False
 # OPTIMUM_IMAGE_PATH = "/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg"
 SIMILARITY_INDEX_THRESHOLD = 0.94
 OPTIMUM_IMAGE_PATH_LIST = ["/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg", "/home/raspberry/projects/multireflection/data/light/x0.00_y0.00.jpg"]
+
+# EVAL
+EVAL_GRID_STEP = 0.5
+EVAL_MAX_ADJ_NUMBER = 10
