@@ -10,7 +10,7 @@ from tqdm import tqdm
 import lz4.frame
 from sklearn.model_selection import train_test_split
 
-def imname_to_target(name:str) -> tuple[float]:
+def imname_to_target(name:str) -> tuple[float, float]:
     """Parses image names of format x{x_value}_y{y_value}.jpg"""
     name = name.split('.jpg')[0]
     x, y = name.split("_")
@@ -20,7 +20,7 @@ def imname_to_target(name:str) -> tuple[float]:
 
 def create_lmdb_from_images(
     image_dir, lmdb_path, start_index=0, stop_index=None, size=None, resolution=(512, 512), use_compression=True,
-    key_process=None, key_filter=None
+    key_process=None, key_filter=None, keys_filename="keys.txt"
 ):
     # Get filenames
     image_names = [
@@ -37,7 +37,7 @@ def create_lmdb_from_images(
         stop_index = len(image_names)
 
     # keys_file
-    keys_file = open(os.path.join(lmdb_path, "keys.txt"), "+w")
+    keys_file = open(os.path.join(lmdb_path, keys_filename), "+w")
 
     # Store images
     with env.begin(write=True) as txn:
@@ -138,7 +138,10 @@ def read_image_from_lmdb(image_name: str, lmdb_path: str, decompress=True):
 
 
 def filter_002step(s:str) -> bool:
-    """False for filter out"""
+    """
+    Leaves only even steps 
+    False for filter out
+    """
     x, y = imname_to_target(s)
     x = round(x*100)
     y = round(y*100)
@@ -148,21 +151,42 @@ def filter_002step(s:str) -> bool:
         return False
     return True
 
+def filter_004step(s:str) -> bool:
+    """
+    Leaves only 0.04 steps 
+    False for filter out
+    """
+
+    x, y = imname_to_target(s)
+    x = round(x*100)
+    y = round(y*100)
+    if not(x%4 == 0):
+        return False
+    if not(y%4 == 0):
+        return False
+    return True
+
+
+
 
 def light_postfix_keyproc(s:str) -> str:
     return s[:-4] + "-light.jpg"
 
+def main_light_postfix_keyproc(s:str) -> str:
+    return s[:-4] + "-mainlight.jpg"
+
 if __name__ == "__main__":
-    datasource_dir = "/mnt/h/latest_real_data/light"
+    datasource_dir = "/mnt/h/newlight/main_light"
     output_path = "/mnt/h/real_512_0_001step.lmdb"
 
     # create_lmdb_from_images(
     #     datasource_dir, 
     #     output_path, 
     #     stop_index=None, 
-    #     size=120 * 1024 * 1024 * 1024, 
+    #     size=190 * 1024 * 1024 * 1024, 
     #     use_compression=False, 
-    #     key_process=light_postfix_keyproc
+    #     key_process=main_light_postfix_keyproc,
+    #     keys_filename="keys_main_light.txt"
     # )
     
     
@@ -172,18 +196,21 @@ if __name__ == "__main__":
     # with env.begin() as txn:
     #     length = txn.stat()['entries']
     #     print(length)
+    #
+    # exit()
 
     # Dark:       228000
     # Dark+Light: 456000 
+    # Dark+Light+MainLight: +57200 = 513200
+
 
     # Prepare keys
-    # keys = [s.replace("\n", "") for s in open(os.path.join(output_path, "keys.txt"), "r").readlines()]
-    keys_fnames = ["keys_black.txt", "keys_light.txt"]
+    keys_fnames = ["keys_black.txt", "keys_light.txt", "keys_main_light.txt"]
     keys = []
     for fname in keys_fnames:
         for s in open(os.path.join(output_path, fname), "r").readlines():
             key = s.replace("\n", "")
-            if filter_002step(key):
+            if filter_004step(key):
                 keys.append(key)
-    write_split_keys(keys, output_path, train_fname="002_mixed_keys_train.txt", val_fname="002_mixed_keys_val.txt")
+    write_split_keys(keys, output_path, train_fname="004_mixed_keys_train.txt", val_fname="004_mixed_keys_val.txt")
 

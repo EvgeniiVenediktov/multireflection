@@ -12,6 +12,69 @@ def evaluate_position(current_image: ArrayLike, optimums: list[ArrayLike]) -> fl
         results.append(ssim(current_image, optimum))
     return round(max(results), 2)
 
+class GradientMagnitude(nn.Module):
+    def __init__(self, kernel_size=15, sigma=5):
+        super().__init__()
+        # Sobel filters
+        sobel_x = torch.tensor([[-1., 0., 1.],
+                                [-2., 0., 2.],
+                                [-1., 0., 1.]]).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1., -2., -1.],
+                                [ 0.,  0.,  0.],
+                                [ 1.,  2.,  1.]]).view(1, 1, 3, 3)
+
+        self.register_buffer('weight_x', sobel_x)
+        self.register_buffer('weight_y', sobel_y)
+
+        self.register_buffer('gaussian_kernel', self._create_gaussian_kernel(kernel_size, sigma))
+
+    def _create_gaussian_kernel(self, kernel_size, sigma):
+        ax = torch.arange(kernel_size) - kernel_size // 2
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        kernel = kernel / kernel.sum()
+        return kernel.view(1, 1, kernel_size, kernel_size)
+
+    def forward(self, x):
+        # Apply Gaussian blur
+        x_blurred = torch.nn.functional.conv2d(x, self.gaussian_kernel, padding=self.gaussian_kernel.shape[-1] // 2)
+
+        # Apply Sobel filtering
+        grad_x = torch.nn.functional.conv2d(x_blurred, self.weight_x, padding=1)
+        grad_y = torch.nn.functional.conv2d(x_blurred, self.weight_y, padding=1)
+
+        # Gradient magnitude
+        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)
+
+        # Normalize to [0, 1] per image
+        B = grad_mag.shape[0]
+        grad_mag_flat = grad_mag.view(B, -1)
+        min_vals = grad_mag_flat.min(dim=1)[0].view(B, 1, 1, 1)
+        max_vals = grad_mag_flat.max(dim=1)[0].view(B, 1, 1, 1)
+        grad_mag = (grad_mag - min_vals) / (max_vals - min_vals + 1e-6)
+
+        return grad_mag
+    
+class GradientSimpleFC(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(GradientSimpleFC, self).__init__()
+        self.relu = nn.ReLU()
+        self.layers = nn.Sequential(
+            GradientMagnitude(),
+            nn.Flatten(),
+            nn.Linear(in_features, 1024), # 262,144 -> 1024
+            nn.BatchNorm1d(1024),
+            self.relu,
+            nn.Linear(1024, 256),
+            nn.BatchNorm1d(256),
+            self.relu,
+            nn.Linear(256, 32),
+            nn.BatchNorm1d(32),
+            self.relu,
+            nn.Linear(32, out_features),
+        )
+    def forward(self, x):
+        return self.layers.forward(x)
 
 
 class SimpleFC(nn.Module):
@@ -75,6 +138,8 @@ class TiltPredictor:
                 self.model = SimpleFC(512*512, 2)
             case "WideConv":
                 self.model = WideConv()
+            case "GradientSimpleFC":
+                self.model = GradientSimpleFC(512*512, 2)
             case _ :
                 raise KeyError("Not supported model type")
         self.model_type = model_type
@@ -84,7 +149,7 @@ class TiltPredictor:
     
     def predict(self, inputs:list[ArrayLike], scale_predictions=True) -> list[tuple[float]]:
         """
-        Takes a list of (125, 125) images \n
+        Takes a list of (512, 512) images \n
         Returns list of [x_deg, y_deg]
         """
         tensors = []

@@ -16,8 +16,8 @@ REAL_DATA_COLLECTION_STEP = 0.01
 REAL_DATA_COLLECTION_DELAY = 0.1
 
 
-INFERENCE_MODEL_FILE_NAME = "mixed_001step_simplefc_400bs_0001lr_15sl_aug+_best_model.pth"
-INFERENCE_MODEL_TYPE = "SimpleFC"
+INFERENCE_MODEL_FILE_NAME = "004step_smallgrad_fullmix_512bs_00001lr_aug+_best_model.pth"
+INFERENCE_MODEL_TYPE = "GradientSimpleFC"
 
 TRAINING_IMAGE_RESOLUTION = (512, 512)
 
