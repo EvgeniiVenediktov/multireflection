@@ -7,7 +7,7 @@ from config import *
 from color_output import *
 import logging
 from tqdm import tqdm
-
+from time import sleep
 
 logging.basicConfig(filename='eval.log', level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s - %(message)s', 
@@ -83,7 +83,8 @@ for origin_x, origin_y in tqdm(grid, leave=False):
 
 
     except BaseException as e:
-        logging.error(e)
+        sleep(3)
+        logging.error(e, "x:",str(controller.get_x_tilt()), "y:",str(controller.get_y_tilt()))
         print(e)
         print("Returning to origin")
         controller.set_tilt_x(0)
