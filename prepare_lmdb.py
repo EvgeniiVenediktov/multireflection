@@ -175,42 +175,46 @@ def light_postfix_keyproc(s:str) -> str:
 def main_light_postfix_keyproc(s:str) -> str:
     return s[:-4] + "-mainlight.jpg"
 
+def newdirty_postfix_keyproc(s:str) -> str:
+    return s[:-4] + "-newdirty.jpg"
+
 if __name__ == "__main__":
-    datasource_dir = "/mnt/h/newlight/main_light"
+    datasource_dir = "/mnt/h/new"
     output_path = "/mnt/h/real_512_0_001step.lmdb"
 
     # create_lmdb_from_images(
     #     datasource_dir, 
     #     output_path, 
     #     stop_index=None, 
-    #     size=190 * 1024 * 1024 * 1024, 
+    #     size=200 * 1024 * 1024 * 1024, 
     #     use_compression=False, 
     #     key_process=main_light_postfix_keyproc,
-    #     keys_filename="keys_main_light.txt"
+    #     keys_filename="keys_newdark.txt"
     # )
-    
-    
-    # TEST all keys
-
+    #
+    #
+    # # TEST all keys
+    #
     # env = lmdb.open(output_path, readonly=True)
     # with env.begin() as txn:
     #     length = txn.stat()['entries']
     #     print(length)
     #
     # exit()
-
+    #
     # Dark:       228000
     # Dark+Light: 456000 
     # Dark+Light+MainLight: +57200 = 513200
 
-
+    
     # Prepare keys
-    keys_fnames = ["keys_black.txt", "keys_light.txt", "keys_main_light.txt"]
+    # keys_fnames = ["keys_black.txt", "keys_light.txt", "keys_main_light.txt", "keys_newdirty.txt"]
+    keys_fnames = ["keys_light.txt", "keys_newdark.txt", "keys_newdirty.txt"]
     keys = []
     for fname in keys_fnames:
         for s in open(os.path.join(output_path, fname), "r").readlines():
             key = s.replace("\n", "")
-            if filter_004step(key):
+            if filter_002step(key):
                 keys.append(key)
-    write_split_keys(keys, output_path, train_fname="004_mixed_keys_train.txt", val_fname="004_mixed_keys_val.txt")
+    write_split_keys(keys, output_path, train_fname="002_mixed_dirty_nedark_keys_train.txt", val_fname="002_mixed_dirty_nedark_keys_val.txt")
 
