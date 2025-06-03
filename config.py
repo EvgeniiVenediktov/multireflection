@@ -1,22 +1,18 @@
 from os import wait
 
 
-# X_TILT_START = -2
-# X_TILT_STOP = 3.7
-#
-# Y_TILT_START = -2
-# Y_TILT_STOP = 2
-X_TILT_START = -1.5
-X_TILT_STOP = 1.5
+X_TILT_START = -2
+X_TILT_STOP = 3.7
 
-Y_TILT_START = -1.5
-Y_TILT_STOP = 1.5
+Y_TILT_START = -2
+Y_TILT_STOP = 2
 
 REAL_DATA_COLLECTION_STEP = 0.01
 REAL_DATA_COLLECTION_DELAY = 0.1
 
 
 INFERENCE_MODEL_FILE_NAME = "004step_smallgrad_fullmix_512bs_00001lr_aug+_best_model.pth"
+#INFERENCE_MODEL_FILE_NAME = "001step_simplefc_400bs_0001lr_15sl_aug+_best_model.pth"
 INFERENCE_MODEL_TYPE = "GradientSimpleFC"
 
 TRAINING_IMAGE_RESOLUTION = (512, 512)

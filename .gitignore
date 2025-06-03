@@ -177,3 +177,4 @@ data/
 saved_models/
 wandb/*
 *.swp
+*_log.txt
