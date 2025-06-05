@@ -4,6 +4,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, OPTIMUM_IMAGE_PATH_LIST
 from skimage.metrics import structural_similarity as ssim
+import cv2
 
 
 def evaluate_position(current_image: ArrayLike, optimums: list[ArrayLike]) -> float:
@@ -122,6 +123,35 @@ class WideConv(nn.Module):
         return self.fc(x)
         
 
+class CLAHEGradTransform:
+    def __init__(self):
+        self.gsize = (15, 15)
+        self.gsigma = 5
+        self.clahe_clip_limit = 1
+        self.clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit)
+
+    def __call__(self, img):
+        if img is torch.Tensor:
+            img = img.squeeze().cpu().numpy()
+        # img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+        
+        img = self.clahe.apply(img)
+        img = cv2.GaussianBlur(img, self.gsize, self.gsigma)
+
+        gX = cv2.Sobel(img, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=3)
+        gY = cv2.Sobel(img, ddepth=cv2.CV_32F, dx=0, dy=1, ksize=3)
+
+        gX = cv2.convertScaleAbs(gX)
+        gY = cv2.convertScaleAbs(gY)
+
+        grad = cv2.addWeighted(gX, 0.5, gY, 0.5, 0)
+
+        # Convert to [0,1] and then to torch tensor
+        # grad = grad.astype(np.float32) / 255.0
+        # grad_tensor = torch.from_numpy(grad).unsqueeze(0)  # (1, H, W) for grayscale
+
+        return grad
+
 
 class TiltPredictor:
     
@@ -140,6 +170,9 @@ class TiltPredictor:
                 self.model = WideConv()
             case "GradientSimpleFC":
                 self.model = GradientSimpleFC(512*512, 2)
+            case "CLAHEGradSimpleFC":
+                self.model = GradientSimpleFC(512*512, 2)
+                self.preprocessing = CLAHEGradTransform()
             case _ :
                 raise KeyError("Not supported model type")
         self.model_type = model_type
@@ -154,8 +187,10 @@ class TiltPredictor:
         """
         tensors = []
         for img in inputs:
+            if self.preprocessing is not None:
+                img = self.preprocessing(img)
             img = torch.from_numpy(img).float()/255
-            if self.model_type == "SimpleFC":
+            if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
                 img = img.flatten()
             tensors.append(img)
         x = torch.stack(tensors).to(self.DEVICE)
