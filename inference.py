@@ -171,7 +171,7 @@ class TiltPredictor:
             case "GradientSimpleFC":
                 self.model = GradientSimpleFC(512*512, 2)
             case "CLAHEGradSimpleFC":
-                self.model = GradientSimpleFC(512*512, 2)
+                self.model = SimpleFC(512*512, 2)
                 self.preprocessing = CLAHEGradTransform()
             case _ :
                 raise KeyError("Not supported model type")
