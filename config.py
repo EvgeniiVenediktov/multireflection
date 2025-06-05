@@ -1,6 +1,4 @@
-from os import wait
-
-
+# Frame settings
 X_TILT_START = -2
 X_TILT_STOP = 3.7
 
@@ -11,15 +9,14 @@ REAL_DATA_COLLECTION_STEP = 0.01
 REAL_DATA_COLLECTION_DELAY = 0.1
 
 
-INFERENCE_MODEL_FILE_NAME = "transfer_002step_smallgrad_fullmixdirtynewdark_512bs_00001lr_aug+_best_model.pth"
-INFERENCE_MODEL_TYPE = "GradientSimpleFC"
+# Model parameters
+INFERENCE_MODEL_FILE_NAME = "trasnfer_002step_clahegradsimple_mix_512bs_0001lr_aug+_best_model.pth"
+INFERENCE_MODEL_TYPE = "CLAHEGradSimpleFC"
 
 TRAINING_IMAGE_RESOLUTION = (512, 512)
 
 LMDB_USE_COMPRESSION = False
 
-
-# OPTIMUM_IMAGE_PATH = "/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg"
 SIMILARITY_INDEX_THRESHOLD = 0.94
 OPTIMUM_IMAGE_PATH_LIST = ["/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg", "/home/raspberry/projects/multireflection/data/light/x0.00_y0.00.jpg", "/home/raspberry/projects/multireflection/data/new/x0.00_y0.00.jpg"]
 
