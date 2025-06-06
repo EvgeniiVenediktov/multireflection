@@ -10,7 +10,7 @@ REAL_DATA_COLLECTION_DELAY = 0.1
 
 
 # Model parameters
-INFERENCE_MODEL_FILE_NAME = "trasnfer_002step_clahegradsimple_mix_512bs_0001lr_aug+_best_model.pth"
+INFERENCE_MODEL_FILE_NAME = "trasnfer_002step_clahegradsimple_mix_400bs_0001lr_aug+_best_model.pth"
 INFERENCE_MODEL_TYPE = "CLAHEGradSimpleFC"
 
 TRAINING_IMAGE_RESOLUTION = (512, 512)

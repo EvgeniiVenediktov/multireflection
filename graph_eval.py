@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt 
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D
+from scipy.interpolate import griddata
 import sys
 
 sample = "2025-06-03 15:10:24,583 - INFO - origin_x:4.0,origin_y:2.0,adj_n:6,pred_x:0.03757834434509277,pred_y:0.038370609283447266,pos_x:-0.02,pos_y:-0.12,sim_index:0.92"
@@ -38,6 +39,7 @@ x = np.array(x)
 y = np.array(y)
 adj = np.array(adj)
 
+# === 3D Plot ===
 fig = plt.figure()
 ax = fig.add_subplot(111, projection="3d")
 
@@ -58,11 +60,23 @@ ax.set_xlabel("X origin")
 ax.set_ylabel("Y origin")
 ax.set_zlabel("Adjustments #")
 
-cbar=plt.colorbar(surf)
-# cbar.ax.set_visible(False)
-fig.savefig(fname.split('.log')[0]+".png", dpi=300, transparent=True) #, labelpad=10
+cbar = plt.colorbar(surf)
+fig.savefig("./graphs/eval/"+fname.split('.log')[0] + "_3d.png", dpi=300, transparent=True)
 
 cbar.ax.set_visible(True)
 plt.show()
 
-        
+# === 2D Heatmap ===
+grid_x, grid_y = np.mgrid[min(x):max(x):100j, min(y):max(y):100j]
+grid_z = griddata((x, y), adj, (grid_x, grid_y), method='cubic')
+
+plt.figure()
+plt.imshow(grid_z.T, extent=(min(x), max(x), min(y), max(y)),
+           origin='lower', cmap='viridis', aspect='auto')
+plt.colorbar(label="Adjustments #")
+plt.xlabel("X origin")
+plt.ylabel("Y origin")
+plt.title("Heatmap of Adjustments")
+
+plt.savefig("./graphs/eval/"+fname.split('.log')[0] + "_heatmap.png", dpi=300, transparent=True)
+plt.show()
