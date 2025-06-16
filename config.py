@@ -17,7 +17,7 @@ TRAINING_IMAGE_RESOLUTION = (512, 512)
 
 LMDB_USE_COMPRESSION = False
 
-SIMILARITY_INDEX_THRESHOLD = 0.94
+SIMILARITY_INDEX_THRESHOLD = 0.95
 OPTIMUM_IMAGE_PATH_LIST = ["/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg", "/home/raspberry/projects/multireflection/data/light/x0.00_y0.00.jpg", "/home/raspberry/projects/multireflection/data/new/x0.00_y0.00.jpg"]
 
 # EVAL

@@ -134,7 +134,7 @@ class CLAHEGradTransform:
         if img is torch.Tensor:
             img = img.squeeze().cpu().numpy()
         # img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
-        
+        img = img[0]
         img = self.clahe.apply(img)
         img = cv2.GaussianBlur(img, self.gsize, self.gsigma)
 

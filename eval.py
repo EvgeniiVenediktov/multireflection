@@ -30,8 +30,8 @@ model = TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)
 print(f"Loaded {INFERENCE_MODEL_FILE_NAME}")
 
 # Generate start position grid
-x_vals = list(np.arange(X_TILT_START, X_TILT_STOP+EVAL_GRID_STEP, EVAL_GRID_STEP))
-y_vals = list(np.arange(Y_TILT_START, Y_TILT_STOP+EVAL_GRID_STEP, EVAL_GRID_STEP))
+x_vals = list(np.arange(X_TILT_START, min(X_TILT_STOP+EVAL_GRID_STEP, 4.0), EVAL_GRID_STEP))
+y_vals = list(np.arange(Y_TILT_START, min(Y_TILT_STOP+EVAL_GRID_STEP, 2.4), EVAL_GRID_STEP))
 print("x_vals:", x_vals)
 print("y_vals:", y_vals)
 grid = []
