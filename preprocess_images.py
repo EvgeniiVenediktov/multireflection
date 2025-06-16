@@ -24,34 +24,15 @@ def process_for_stopping_criteria(
 
 
 def process_image_from_webcam(
-    img: ArrayLike, target_size: tuple[int] = (512, 512)
+    img: ArrayLike, target_size: tuple[int] = (512, 512), grayscale = True
 ) -> ArrayLike:
-    # TODO
+    
     # To grayscale
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if grayscale:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Cut off sides to turn into square image
     r = min(*img.shape)
-    img = to_square(img, r, r, 0, 0)
-
-    # Shrink image
-    img = cv2.resize(img, target_size)
-
-    # Apply circular mask
-    img = apply_circular_mask(img)
-
-    # Blur
-    img = cv2.GaussianBlur(img, (7, 7), 0)
-
-    return img
-
-def process_image_from_webcam_color(
-        img: ArrayLike, target_size: tuple[int] = (256, 256)
-) -> ArrayLike:
-    assert(len(img.shape) == 3)
-    
-    # Cut off sides to turn into square image
-    r = min(*img.shape[:2])
     img = to_square(img, r, r, 0, 0)
 
     # Shrink image

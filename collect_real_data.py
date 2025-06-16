@@ -2,16 +2,15 @@ from mf_control.controller import MFController
 import numpy as np
 from numpy.typing import ArrayLike
 import cv2
-from preprocess_images import process_image_from_webcam, process_image_from_webcam_color
+from preprocess_images import process_image_from_webcam
 import time
 from datetime import datetime
 from config import *
 import logging
 from tqdm import tqdm
+from os.path import isdir
 
-image_processing_func = process_image_from_webcam
-if DATA_COLLECTION_COLOR:
-    image_processing_func = process_image_from_webcam_color
+assert(isdir(DATA_COLLECTION_FOLDER))
 
 logging.basicConfig(filename="data_collection_log.txt",
                     filemode='a',
@@ -35,10 +34,10 @@ def whole_process(controller: MFController, x:float, y:float, pbar:tqdm, i, i_m,
     img = controller.capture_image()
 
     # Process
-    img = image_processing_func(img, target_size=DATA_COLLECTION_FINAL_RESOLUTION)
+    img = process_image_from_webcam(img, target_size=DATA_COLLECTION_FINAL_RESOLUTION, grayscale=DATA_COLLECTION_CVT_TO_GRAYSCALE)
 
     # Save
-    save_image(img, x, y)
+    save_image(img, x, y, folder=DATA_COLLECTION_FOLDER)
 
     # Pbar
     pbar.set_description(f"X:{i}/{i_m}, Y:{y}")
