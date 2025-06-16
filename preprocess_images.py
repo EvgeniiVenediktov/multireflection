@@ -32,7 +32,7 @@ def process_image_from_webcam(
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Cut off sides to turn into square image
-    r = min(*img.shape)
+    r = min(*img.shape[:2])
     img = to_square(img, r, r, 0, 0)
 
     # Shrink image
