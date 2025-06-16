@@ -8,6 +8,10 @@ Y_TILT_STOP = 2
 REAL_DATA_COLLECTION_STEP = 0.01
 REAL_DATA_COLLECTION_DELAY = 0.1
 
+DATA_COLLECTION_COLOR = True
+DATA_COLLECTION_FINAL_RESOLUTION = (256, 256)
+
+
 
 # Model parameters
 INFERENCE_MODEL_FILE_NAME = "trasnfer_002step_clahegradsimple_mix_400bs_0001lr_aug+_best_model.pth"

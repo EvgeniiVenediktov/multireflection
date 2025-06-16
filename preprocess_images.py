@@ -45,6 +45,25 @@ def process_image_from_webcam(
 
     return img
 
+def process_image_from_webcam_color(
+        img: ArrayLike, target_size: tuple[int] = (256, 256)
+) -> ArrayLike:
+    assert(len(img.shape) == 3)
+    
+    # Cut off sides to turn into square image
+    r = min(*img.shape[:2])
+    img = to_square(img, r, r, 0, 0)
+
+    # Shrink image
+    img = cv2.resize(img, target_size)
+
+    # Apply circular mask
+    img = apply_circular_mask(img)
+
+    # Blur
+    img = cv2.GaussianBlur(img, (7, 7), 0)
+
+    return img
 
 def apply_circular_mask(image_array) -> ArrayLike:
     """Applies a circular mask that blackens everything outside a centered circle."""
