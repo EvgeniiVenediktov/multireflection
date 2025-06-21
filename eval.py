@@ -52,7 +52,7 @@ for origin_x, origin_y in tqdm(grid, leave=False):
 
             # Get image from webcam
             img = controller.capture_image()
-            img = process_image_from_webcam(img, target_size=(512, 512))
+            img = process_image_from_webcam(img, target_size=(512, 512), grayscale=DATA_COLLECTION_CVT_TO_GRAYSCALE)
 
             # Evaluate position
             sim_index = evaluate_position(img, optimums=optimal_states)

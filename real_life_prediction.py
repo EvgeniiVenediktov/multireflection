@@ -33,7 +33,7 @@ while command == "y":
     # cv2.waitKey(0)
     # cv2.destroyWindow("Raw")
     # Preprocess image
-    img = process_image_from_webcam(img, target_size=(512, 512))
+    img = process_image_from_webcam(img, target_size=(512, 512), grayscale=DATA_COLLECTION_CVT_TO_GRAYSCALE)
     
     # Display
     cv2.imshow("Processed", img)
