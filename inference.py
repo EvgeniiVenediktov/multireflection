@@ -236,7 +236,7 @@ class TiltPredictor:
             img = img.flatten()
         if self.model_type in ["CnnExtractor"]:
             img = img.permute(2, 0, 1)
-        x = x.to(self.DEVICE)
+        x = img.to(self.DEVICE)
 
         predictions:torch.Tensor = self.model.forward(x)
         predictions = predictions.detach().cpu().numpy()
