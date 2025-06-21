@@ -1,7 +1,7 @@
 import lmdb
 import os
 from preprocess_images import process_single_image
-from config import TRAINING_IMAGE_RESOLUTION
+from config import DATA_COLLECTION_CVT_TO_GRAYSCALE, DATA_COLLECTION_FINAL_RESOLUTION, TRAINING_IMAGE_RESOLUTION
 import pickle
 import cv2
 import numpy as np
@@ -20,7 +20,7 @@ def imname_to_target(name:str) -> tuple[float, float]:
 
 def create_lmdb_from_images(
     image_dir, lmdb_path, start_index=0, stop_index=None, size=None, resolution=(512, 512), use_compression=True,
-    key_process=None, key_filter=None, keys_filename="keys.txt"
+    key_process=None, key_filter=None, keys_filename="keys.txt", imread_mode = cv2.IMREAD_GRAYSCALE
 ):
     # Get filenames
     image_names = [
@@ -54,7 +54,7 @@ def create_lmdb_from_images(
                 path = os.path.join(image_dir, f)
 
                 # Load image
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                img = cv2.imread(path, imread_mode)
 
                 if key_process is not None:
                     f = key_process(f)
@@ -88,10 +88,10 @@ def create_lmdb_from_images(
         finally:
             try:
                 txn.commit()
+                env.close()
+                keys_file.close()
             except Exception as e:
                 print(e)
-            env.close()
-            keys_file.close()
 
 
 def write_split_keys(keys:list[str], path, filter:callable = None, val_share=0.2, train_fname="train_keys.txt", val_fname="val_keys.txt") -> None:
@@ -179,27 +179,36 @@ def newdirty_postfix_keyproc(s:str) -> str:
     return s[:-4] + "-newdirty.jpg"
 
 if __name__ == "__main__":
-    datasource_dir = "/mnt/h/newdark"
-    output_path = "/mnt/h/real_512_0_001step.lmdb"
+    # datasource_dir = "/mnt/h/newdark"
+    # output_path = "/mnt/h/real_512_0_001step.lmdb"
 
+    datasource_dir = "/mnt/h/color_mainlight_004"
+    output_path = "/mnt/h/color.lmdb"
+
+    # imread_mode = cv2.IMREAD_COLOR_RGB
+    # if DATA_COLLECTION_CVT_TO_GRAYSCALE:
+    #     imread_mode = cv2.IMREAD_GRAYSCALE
+    
     # create_lmdb_from_images(
     #     datasource_dir, 
     #     output_path, 
     #     stop_index=None, 
-    #     size=200 * 1024 * 1024 * 1024, 
-    #     use_compression=False, 
-    #     # key_process=main_light_postfix_keyproc,
-    #     keys_filename="keys_main.txt"
+    #     size=20 * 1024 * 1024 * 1024, 
+    #     use_compression=False,
+    #     resolution=DATA_COLLECTION_FINAL_RESOLUTION,
+    #     key_process=main_light_postfix_keyproc,
+    #     keys_filename="color_mainlight_004.txt",
+    #     imread_mode=imread_mode
     # )
-    #
-    #
-    # # TEST all keys
-    #
+    # #
+    # #
+    # # # TEST all keys
+    # #
     # env = lmdb.open(output_path, readonly=True)
     # with env.begin() as txn:
     #     length = txn.stat()['entries']
     #     print(length)
-    #
+    # #
     # exit()
     #
     # Dark:       228000
@@ -209,12 +218,12 @@ if __name__ == "__main__":
     
     # Prepare keys
     # keys_fnames = ["keys_black.txt", "keys_light.txt", "keys_main_light.txt", "keys_newdirty.txt"]
-    keys_fnames = ["keys_main_light.txt", "keys_main.txt", "keys_newdirty.txt"]
+    keys_fnames = ["color_dark_004.txt", "color_mainlight_004.txt"]
     keys = []
     for fname in keys_fnames:
         for s in open(os.path.join(output_path, fname), "r").readlines():
             key = s.replace("\n", "")
-            if filter_002step(key):
-                keys.append(key)
-    write_split_keys(keys, output_path, train_fname="002_mixed_dirty_newdark_keys_train.txt", val_fname="002_mixed_dirty_newdark_keys_val.txt")
+            # if filter_002step(key):
+            keys.append(key)
+    write_split_keys(keys, output_path, train_fname="004_color_2mix_train.txt", val_fname="004_color_2mix_val.txt")
 
