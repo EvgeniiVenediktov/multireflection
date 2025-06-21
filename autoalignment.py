@@ -50,7 +50,7 @@ try:
             break
 
         # Make prediction
-        prediction = model.predict(np.array([[img]]))
+        prediction = model.predict(np.array([img]))
 
         # Clip prediction
         x, y = prediction[0]

@@ -66,7 +66,7 @@ for origin_x, origin_y in tqdm(grid, leave=False):
                 break
 
             # Make prediction
-            prediction = model.predict(np.array([[img]]))
+            prediction = model.predict(np.array([img]))
 
             # Clip prediction
             x, y = prediction[0]
