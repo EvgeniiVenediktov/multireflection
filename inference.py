@@ -155,10 +155,15 @@ class CnnExtractor(nn.Module):
         )
 
     def forward(self, x:torch.Tensor):
+        print(f"DEBUG: x.shape: {x.shape}")
         x = self.sec1(x)
+        print(f"DEBUG: x.shape: {x.shape}")
         x = torch.squeeze(x)
+        print(f"DEBUG: x.shape: {x.shape}")
         x = torch.flatten(x, 1)
+        print(f"DEBUG: x.shape: {x.shape}")
         x = self.sec2(x)
+        print(f"DEBUG: x.shape: {x.shape}")
 
         return x
         
