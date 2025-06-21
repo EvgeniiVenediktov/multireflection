@@ -160,7 +160,7 @@ class CnnExtractor(nn.Module):
         print(f"DEBUG: x.shape: {x.shape}")
         x = torch.squeeze(x)
         print(f"DEBUG: x.shape: {x.shape}")
-        x = torch.flatten(x, 1)
+        x = torch.flatten(x)
         print(f"DEBUG: x.shape: {x.shape}")
         x = self.sec2(x)
         print(f"DEBUG: x.shape: {x.shape}")
