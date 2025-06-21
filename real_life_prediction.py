@@ -48,7 +48,7 @@ while command == "y":
     cprint("Similarity index:"+str(round(sim_index, 2)), MAGENTA)
 
     # Make prediction
-    prediction = model.predict(np.array([img]))
+    prediction = model.predict(img)
 
     # Output
     cprint("prediction:"+str(prediction[0]), GRAY)

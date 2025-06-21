@@ -223,22 +223,20 @@ class TiltPredictor:
         self.model.eval()
         self.model.to(self.DEVICE)
     
-    def predict(self, inputs:list[ArrayLike], scale_predictions=True) -> list[tuple[float]]:
+    def predict(self, img:ArrayLike, scale_predictions=True) -> list[tuple[float]]:
         """
-        Takes a list of (512, 512) images \n
+        Takes image \n
         Returns list of [x_deg, y_deg]
         """
-        tensors = []
-        for img in inputs:
-            if self.preprocessing is not None:
-                img = self.preprocessing(img)
-            img = torch.from_numpy(img).float()/255
-            if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
-                img = img.flatten()
-            if self.model_type in ["CnnExtractor"]:
-                img = img.permute(2, 0, 1)
-            tensors.append(img)
-        x = torch.stack(tensors).to(self.DEVICE)
+
+        if self.preprocessing is not None:
+            img = self.preprocessing(img)
+        img = torch.from_numpy(img).float()/255
+        if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
+            img = img.flatten()
+        if self.model_type in ["CnnExtractor"]:
+            img = img.permute(2, 0, 1)
+        x = x.to(self.DEVICE)
 
         predictions:torch.Tensor = self.model.forward(x)
         predictions = predictions.detach().cpu().numpy()
