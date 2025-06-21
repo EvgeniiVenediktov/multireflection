@@ -18,8 +18,12 @@ def clip(v, minv, maxv):
 
 # Load optimal state images
 optimal_states = []
+mode = cv2.IMREAD_COLOR_RGB
+if DATA_COLLECTION_CVT_TO_GRAYSCALE:
+    mode = cv2.IMREAD_GRAYSCALE
 for path in OPTIMUM_IMAGE_PATH_LIST:
-    optimal_states.append(cv2.imread(path, cv2.IMREAD_GRAYSCALE))
+    optimal_states.append(cv2.imread(path, mode))
+
 # Connect Controller
 controller = MFController(image_size=(1920, 1440))
 
