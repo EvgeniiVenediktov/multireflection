@@ -121,6 +121,42 @@ class WideConv(nn.Module):
         x = self.relu(self.conv3(x))
         x = self.global_pool(x).view(x.size(0), -1)
         return self.fc(x)
+    
+class CnnExtractor(nn.Module):
+    """Input.shape = (3, 256, 256)"""
+    def __init__(self, output_size):
+        super(CnnExtractor, self).__init__()
+        ksize = 15
+        pad = ksize // 2
+        self.sec1 = nn.Sequential(
+            nn.Conv2d(3, 1, ksize, 1, pad), # (3, 256, 256) -> (1, 256, 256)
+            nn.BatchNorm2d(1),
+            nn.LeakyReLU(),
+        )
+
+        self.sec2 = nn.Sequential(
+            nn.Linear(256*256, 1024),
+            nn.BatchNorm1d(1024),
+            nn.LeakyReLU(),
+            nn.Linear(1024, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(),
+            nn.Linear(256, 64),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(),
+            nn.Linear(32, output_size),
+        )
+
+    def forward(self, x:torch.Tensor):
+        x = self.sec1(x)
+        x = torch.squeeze(x)
+        x = torch.flatten(x, 1)
+        x = self.sec2(x)
+
+        return x
         
 
 class CLAHEGradTransform:
@@ -173,6 +209,8 @@ class TiltPredictor:
             case "CLAHEGradSimpleFC":
                 self.model = SimpleFC(512*512, 2)
                 self.preprocessing = CLAHEGradTransform()
+            case "CnnExtractor":
+                self.model = CnnExtractor(2)
             case _ :
                 raise KeyError("Not supported model type")
         self.model_type = model_type

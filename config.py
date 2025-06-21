@@ -14,15 +14,22 @@ DATA_COLLECTION_FINAL_RESOLUTION = (256, 256)
 
 
 # Model parameters
-INFERENCE_MODEL_FILE_NAME = "trasnfer_002step_clahegradsimple_mix_400bs_0001lr_aug+_best_model.pth"
-INFERENCE_MODEL_TYPE = "CLAHEGradSimpleFC"
+INFERENCE_MODEL_FILE_NAME = "004step_CnnExtractor_color2mixRedFilter_768bs_0001lr_aug+_best_model.pth"
+INFERENCE_MODEL_TYPE = "CnnExtractor"
 
 TRAINING_IMAGE_RESOLUTION = (512, 512)
 
 LMDB_USE_COMPRESSION = False
 
 SIMILARITY_INDEX_THRESHOLD = 0.95
-OPTIMUM_IMAGE_PATH_LIST = ["/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg", "/home/raspberry/projects/multireflection/data/light/x0.00_y0.00.jpg", "/home/raspberry/projects/multireflection/data/new/x0.00_y0.00.jpg"]
+OPTIMUM_IMAGE_PATH_LIST = ["/home/raspberry/projects/multireflection/data/color_dark_004/x0.00_y0.00.jpg", 
+                           "/home/raspberry/projects/multireflection/data/color_mainlight_004/x0.00_y0.00.jpg", 
+                           "/home/raspberry/projects/multireflection/data/color/x0.00_y0.00.jpg", 
+
+                        #    "/home/raspberry/projects/multireflection/data/real/x0.00_y0.00.jpg", 
+                        #    "/home/raspberry/projects/multireflection/data/light/x0.00_y0.00.jpg", 
+                        #    "/home/raspberry/projects/multireflection/data/new/x0.00_y0.00.jpg"
+                           ]
 
 # EVAL
 EVAL_GRID_STEP = 0.5
