@@ -202,7 +202,8 @@ class TiltPredictor:
     def __init__(self, model_fname:str, model_type:str):
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.DEVICE)
-
+        self.preprocessing = None
+        
         match model_type:
             case "SimpleFC":
                 self.model = SimpleFC(512*512, 2)
