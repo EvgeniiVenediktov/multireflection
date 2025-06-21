@@ -235,7 +235,7 @@ class TiltPredictor:
         if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
             img = img.flatten()
         if self.model_type in ["CnnExtractor"]:
-            img = img.permute(2, 0, 1)
+            img = img.permute(2, 0, 1).unsqueeze(0)
         x = img.to(self.DEVICE)
 
         predictions:torch.Tensor = self.model.forward(x)
