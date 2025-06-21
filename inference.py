@@ -203,7 +203,7 @@ class TiltPredictor:
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.DEVICE)
         self.preprocessing = None
-        
+
         match model_type:
             case "SimpleFC":
                 self.model = SimpleFC(512*512, 2)
@@ -235,6 +235,8 @@ class TiltPredictor:
             img = torch.from_numpy(img).float()/255
             if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
                 img = img.flatten()
+            if self.model_type in ["CnnExtractor"]:
+                img = img.permute(2, 0, 1)
             tensors.append(img)
         x = torch.stack(tensors).to(self.DEVICE)
 
