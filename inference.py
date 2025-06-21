@@ -10,7 +10,11 @@ import cv2
 def evaluate_position(current_image: ArrayLike, optimums: list[ArrayLike]) -> float:
     results = []
     for optimum in optimums:
-        results.append(ssim(current_image, optimum))
+        try:
+            results.append(ssim(current_image, optimum))
+        except ValueError as e:
+            print(f"ERROR: current image shape {current_image.shape}, optimum shape {optimum.shape}")
+            raise e
     return round(max(results), 2)
 
 class GradientMagnitude(nn.Module):
