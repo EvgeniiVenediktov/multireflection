@@ -240,8 +240,7 @@ class TiltPredictor:
         if self.preprocessing is not None:
             img = self.preprocessing(img)
         img = torch.from_numpy(img).float()/255
-        # DEBUG
-        print("img.shape: ", img.shape)
+
         if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
             img = img.unsqueeze(0).flatten(start_dim=-2, end_dim=-1)
 
