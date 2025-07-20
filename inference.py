@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from numpy.typing import ArrayLike
-from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, OPTIMUM_IMAGE_PATH_LIST
+from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE
 from skimage.metrics import structural_similarity as ssim
 import cv2
 
@@ -240,8 +240,11 @@ class TiltPredictor:
         if self.preprocessing is not None:
             img = self.preprocessing(img)
         img = torch.from_numpy(img).float()/255
+        # DEBUG
+        print("img.shape: ", img.shape)
         if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
-            img = img.flatten()
+            img = img.flatten(start_dim=-2, end_dim=-1)
+
         if self.model_type in ["CnnExtractor"]:
             img = img.permute(2, 0, 1).unsqueeze(0)
         x = img.to(self.DEVICE)
@@ -256,10 +259,11 @@ class TiltPredictor:
 
 if __name__=="__main__":
     import time
-    model = TiltPredictor("fc_4layers_1024batch_500epochs_50cosinescheduler_best_model.pth", model_type="SimpleFC")
-    x = np.zeros((125, 125))
+    model = TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)
+    x = np.zeros((1,512,512))
+
     start = time.time()
-    y = model.predict([x])
+    y = model.predict(x)
     print(y)
     print(f"Time elapsed: {time.time()-start:.2f}s")
 
