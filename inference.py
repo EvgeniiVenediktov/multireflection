@@ -11,7 +11,10 @@ def evaluate_position(current_image: ArrayLike, optimums: list[ArrayLike]) -> fl
     results = []
     for optimum in optimums:
         try:
-            results.append(ssim(current_image, optimum, channel_axis=2))
+            channel_axis = None
+            if (current_image.shape) == 3:
+                channel_axis = 2
+            results.append(ssim(current_image, optimum, channel_axis=channel_axis))
         except ValueError as e:
             print(f"ERROR: current image shape {current_image.shape}, optimum shape {optimum.shape}")
             raise e

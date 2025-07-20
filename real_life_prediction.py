@@ -31,10 +31,6 @@ while command == "y":
     # Get image from webcam
     img = controller.capture_image()
 
-    # Display
-    # cv2.imshow("Raw", img)
-    # cv2.waitKey(0)
-    # cv2.destroyWindow("Raw")
     # Preprocess image
     img = process_image_from_webcam(img, target_size=DATA_COLLECTION_FINAL_RESOLUTION, grayscale=DATA_COLLECTION_CVT_TO_GRAYSCALE)
     
