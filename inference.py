@@ -243,7 +243,7 @@ class TiltPredictor:
         # DEBUG
         print("img.shape: ", img.shape)
         if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
-            img = img.flatten(start_dim=-2, end_dim=-1)
+            img = img.unsqueeze(0).flatten(start_dim=-2, end_dim=-1)
 
         if self.model_type in ["CnnExtractor"]:
             img = img.permute(2, 0, 1).unsqueeze(0)
