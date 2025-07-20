@@ -15,7 +15,10 @@ def imname_to_target(name:str) -> tuple[float, float]:
     name = name.split('.jpg')[0]
     x, y = name.split("_")
     x = float(x[1:])
-    y = float(y[1:5])
+    if y[1] == '-':
+        y = float(y[1:6])
+    else:
+        y = float(y[1:5])
     return x, y
 
 def create_lmdb_from_images(
@@ -166,6 +169,21 @@ def filter_004step(s:str) -> bool:
         return False
     return True
 
+def filter_016step(s:str) -> bool:
+    """
+    Leaves only 0.04 steps 
+    False for filter out
+    """
+
+    x, y = imname_to_target(s)
+    x = round(x*100)
+    y = round(y*100)
+    if not(x%16 == 0):
+        return False
+    if not(y%16 == 0):
+        return False
+    return True
+
 
 
 
@@ -179,11 +197,11 @@ def newdirty_postfix_keyproc(s:str) -> str:
     return s[:-4] + "-newdirty.jpg"
 
 if __name__ == "__main__":
-    # datasource_dir = "/mnt/h/newdark"
-    # output_path = "/mnt/h/real_512_0_001step.lmdb"
+    datasource_dir = "/mnt/h/dark512"
+    output_path = "/mnt/h/real_512_0_001step.lmdb"
 
-    datasource_dir = "/mnt/h/color_mainlight_004"
-    output_path = "/mnt/h/color.lmdb"
+    # # datasource_dir = "/mnt/h/color_dark"
+    # # output_path = "/mnt/e/color.lmdb"
 
     # imread_mode = cv2.IMREAD_COLOR_RGB
     # if DATA_COLLECTION_CVT_TO_GRAYSCALE:
@@ -192,18 +210,19 @@ if __name__ == "__main__":
     # create_lmdb_from_images(
     #     datasource_dir, 
     #     output_path, 
+    #     start_index=0,
     #     stop_index=None, 
-    #     size=20 * 1024 * 1024 * 1024, 
+    #     size=180 * 1024 * 1024 * 1024, 
     #     use_compression=False,
     #     resolution=DATA_COLLECTION_FINAL_RESOLUTION,
-    #     key_process=main_light_postfix_keyproc,
-    #     keys_filename="color_mainlight_004.txt",
+    #     # key_process=light_postfix_keyproc,
+    #     keys_filename="dark512.txt",
     #     imread_mode=imread_mode
     # )
-    # #
-    # #
-    # # # TEST all keys
-    # #
+    
+    
+    # # TEST all keys
+    
     # env = lmdb.open(output_path, readonly=True)
     # with env.begin() as txn:
     #     length = txn.stat()['entries']
@@ -218,12 +237,14 @@ if __name__ == "__main__":
     
     # Prepare keys
     # keys_fnames = ["keys_black.txt", "keys_light.txt", "keys_main_light.txt", "keys_newdirty.txt"]
-    keys_fnames = ["color_dark_004.txt", "color_mainlight_004.txt"]
+    # keys_fnames = ["color_dark.txt", "color_mainlight_004.txt", "color_light.txt"]
+    keys_fnames = ["dark512.txt"]
+    # keys_fnames = ["color_mainlight_004.txt"]
     keys = []
     for fname in keys_fnames:
         for s in open(os.path.join(output_path, fname), "r").readlines():
             key = s.replace("\n", "")
-            # if filter_002step(key):
+            # if filter_004step(key):
             keys.append(key)
-    write_split_keys(keys, output_path, train_fname="004_color_2mix_train.txt", val_fname="004_color_2mix_val.txt")
+    write_split_keys(keys, output_path, train_fname="001_dark_train.txt", val_fname="001_dark_val.txt")
 
