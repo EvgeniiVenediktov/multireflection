@@ -9,6 +9,47 @@ import msgpack
 from tqdm import tqdm
 import lz4.frame
 from sklearn.model_selection import train_test_split
+import torch
+import io
+from typing import Callable
+
+
+def lmdb_bytes_to_torch_tensor(img_bytes: bytes) -> torch.Tensor:
+    if img_bytes is None:
+        raise ValueError("img_bytes is None")
+
+    buf = io.BytesIO(img_bytes)
+    buf.seek(0)
+    obj = torch.load(buf, map_location='cpu')
+    if isinstance(obj, torch.Tensor):
+        t = obj
+    elif isinstance(obj, dict) and 'tensor' in obj and isinstance(obj['tensor'], torch.Tensor):
+        t = obj['tensor']
+    return t.contiguous()
+
+
+def read_image_from_lmdb_tensor(image_name: str | list[str], lmdb_path: str, decompress: bool = True, dtype: torch.dtype | None = None, normalize: bool = True, device: str | torch.device = 'cpu') -> torch.Tensor | dict:
+    """Simpler reader: fetch bytes from LMDB and convert with lmdb_bytes_to_torch_tensor.
+
+    - If `image_name` is a string, returns a single `torch.Tensor` or None if missing.
+    - If `image_name` is a list, returns a dict mapping key -> tensor or None.
+    """
+    env = lmdb.open(lmdb_path, readonly=True)
+    with env.begin() as txn:
+        def _get_tensor(key: str):
+            raw = txn.get(key.encode())
+            if raw is None:
+                return None
+            return lmdb_bytes_to_torch_tensor(raw, decompress=decompress, dtype=dtype, normalize=normalize, device=device)
+
+        if isinstance(image_name, str):
+            res = _get_tensor(image_name)
+            env.close()
+            return res
+
+        results = {k: _get_tensor(k) for k in image_name}
+    env.close()
+    return results
 
 def imname_to_target(name:str) -> tuple[float, float]:
     """Parses image names of format x{x_value}_y{y_value}.jpg"""
@@ -122,21 +163,87 @@ def write_split_keys(keys:list[str], path, filter:callable = None, val_share=0.2
         keys_file.close()
 
 
-def read_image_from_lmdb(image_name: str, lmdb_path: str, decompress=True):
-    # Open lmdb
-    env = lmdb.open(lmdb_path, readonly=True)
-    txn = env.begin()
-    img_bytes = txn.get(image_name.encode())
-    env.close()
-    if img_bytes is None:
-        raise KeyError(f"Image {image_name} not found in LMDB!")
 
-    if decompress:
-        img_bytes = lz4.frame.decompress(img_bytes)
+def copy_selected_entries(
+    src_lmdb_path: str,
+    dst_lmdb_path: str,
+    keys: list[str] | None = None,
+    key_filter: Callable | None = None,
+    map_size: int | None = None,
+    use_compression: bool = True,
+    to_tensor: bool = False,
+    tensor_dtype: torch.dtype = torch.float32,
+    normalize: bool = False,
+):
+    """Copy selected entries from one LMDB to another.
 
-    img = np.array(msgpack.unpackb(img_bytes, raw=False), dtype=np.uint8)
+    - If `keys` is provided, only those keys will be copied.
+    - If `key_filter` is provided, it's used to filter keys (callable receiving key str).
+    - If `to_tensor` is True, the data will be converted to a PyTorch tensor and stored
+      using `torch.save` before optional compression.
+    """
+    src_env = lmdb.open(src_lmdb_path, readonly=True)
+    src_txn = src_env.begin()
 
-    return img
+    # Determine keys to copy
+    if keys is None:
+        with src_env.begin() as tx:
+            cursor = tx.cursor()
+            all_keys = [k.decode() for k, _ in cursor]
+    else:
+        all_keys = list(keys)
+
+    # Apply filter if present
+    if key_filter is not None:
+        all_keys = [k for k in all_keys if key_filter(k)]
+
+    # Open destination env
+    if map_size is None:
+        map_size = 64 * 1024 * 1024 * 1024
+    dst_env = lmdb.open(dst_lmdb_path, map_size=map_size)
+
+    with dst_env.begin(write=True) as dst_txn:
+        pbar = tqdm(all_keys)
+        for k in pbar:
+            pbar.set_description(k)
+            raw = src_txn.get(k.encode())
+            if raw is None:
+                continue
+
+            data = raw
+            # If converting to tensor, unpack msgpack then convert
+            if to_tensor:
+                # Decompress if needed
+                try:
+                    decompressed = lz4.frame.decompress(raw)
+                except Exception:
+                    decompressed = raw
+
+                arr = np.array(msgpack.unpackb(decompressed, raw=False), dtype=np.uint8)
+                tensor = torch.from_numpy(arr)
+                if tensor.ndim == 2:
+                    tensor = tensor.unsqueeze(0)
+                else:
+                    tensor = tensor.permute(2, 0, 1)
+                tensor = tensor.to(dtype=tensor_dtype)
+                if normalize:
+                    tensor = tensor / 255.0
+
+                buf = io.BytesIO()
+                torch.save(tensor, buf)
+                data = buf.getvalue()
+
+            # Optionally compress
+            if use_compression:
+                try:
+                    data = lz4.frame.compress(data, compression_level=6)
+                except Exception:
+                    pass
+
+            dst_txn.put(k.encode(), data)
+
+    src_env.close()
+    dst_env.close()
 
 
 
@@ -197,8 +304,9 @@ def newdirty_postfix_keyproc(s:str) -> str:
     return s[:-4] + "-newdirty.jpg"
 
 if __name__ == "__main__":
-    datasource_dir = "/mnt/h/dark512"
-    output_path = "/mnt/h/real_512_0_001step.lmdb"
+    # datasource_dir = "/mnt/h/dark512"
+    # output_path = "/mnt/h/real_512_0_001step.lmdb"
+    
 
     # # datasource_dir = "/mnt/h/color_dark"
     # # output_path = "/mnt/e/color.lmdb"
@@ -238,13 +346,34 @@ if __name__ == "__main__":
     # Prepare keys
     # keys_fnames = ["keys_black.txt", "keys_light.txt", "keys_main_light.txt", "keys_newdirty.txt"]
     # keys_fnames = ["color_dark.txt", "color_mainlight_004.txt", "color_light.txt"]
-    keys_fnames = ["dark512.txt"]
-    # keys_fnames = ["color_mainlight_004.txt"]
+    # keys_fnames = ["dark512.txt"]
+    # # keys_fnames = ["color_mainlight_004.txt"]
+    # keys = []
+    # for fname in keys_fnames:
+    #     for s in open(os.path.join(output_path, fname), "r").readlines():
+    #         key = s.replace("\n", "")
+    #         if filter_004step(key):
+    #             keys.append(key)
+    # write_split_keys(keys, output_path, train_fname="004_dark_train.txt", val_fname="004_dark_val.txt")
+
+    src_path = "/mnt/h/real_512_0_001step.lmdb"
+    dst_path = "/mnt/h/real_512_0_004step_tensor.lmdb"
+
+    keys_file = "keys_black.txt"
     keys = []
-    for fname in keys_fnames:
-        for s in open(os.path.join(output_path, fname), "r").readlines():
-            key = s.replace("\n", "")
-            # if filter_004step(key):
+    for s in open(os.path.join(src_path, keys_file), "r").readlines():
+        key = s.replace("\n", "")
+        if filter_004step(key):
             keys.append(key)
-    write_split_keys(keys, output_path, train_fname="001_dark_train.txt", val_fname="001_dark_val.txt")
+    print("1")
+    copy_selected_entries(
+        src_path,
+        dst_path,
+        keys=keys,
+        map_size= 16 * 1024 * 1024 * 1024,
+        use_compression=False,
+        to_tensor=True,
+        tensor_dtype=torch.float32,
+        normalize=True,
+    )
 

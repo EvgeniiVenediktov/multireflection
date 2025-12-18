@@ -95,11 +95,11 @@ cbar = plt.colorbar(label="Number of Adjustments")
 ticks = np.arange(np.min(adj), np.max(adj)+1, 1, dtype=np.int32)
 cbar.set_ticks(ticks)
 
-plt.xlabel("X origin")
-plt.ylabel("Y origin")
+plt.xlabel("X origin (°)")
+plt.ylabel("Y origin (°)")
 # plt.title("Heatmap of Adjustments")
 
-plt.savefig("./graphs/eval/"+fname.split('.log')[0] + "_heatmap.png", dpi=300, transparent=True)
+plt.savefig("./graphs/eval/kkk"+fname.split('.log')[0] + "_heatmap.png", dpi=300, transparent=True)
 plt.show()
 
 # # === 2D Heatmap Without Interpolation ===

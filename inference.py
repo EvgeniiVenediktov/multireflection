@@ -242,13 +242,15 @@ class TiltPredictor:
         img = torch.from_numpy(img).float()/255
 
         if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
-            img = img.flatten().unsqueeze(0)
+            img = img.flatten()
 
         if self.model_type in ["CnnExtractor"]:
             img = img.permute(2, 0, 1).unsqueeze(0)
         x = img.to(self.DEVICE)
+        print(x.shape)
 
-        predictions:torch.Tensor = self.model.forward(x)
+        with torch.no_grad():
+            predictions:torch.Tensor = self.model.forward(x)
         predictions = predictions.detach().cpu().numpy()
         if scale_predictions:
             predictions[:,0] = predictions[:,0] * (X_TILT_STOP - X_TILT_START) + X_TILT_START
@@ -259,7 +261,11 @@ class TiltPredictor:
 if __name__=="__main__":
     import time
     model = TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)
-    x = np.zeros((1,512,512))
+    # img = cv2.imread('/mnt/h/dark512/x0.00_y0.00.jpg', cv2.IMREAD_GRAYSCALE)
+    # x = img
+    x = np.ones((512,512))*255
+    x = np.array(x, dtype=np.uint8)
+
 
     start = time.time()
     y = model.predict(x)
