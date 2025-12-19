@@ -34,6 +34,89 @@ def lmdb_bytes_to_torch_tensor(img_bytes: bytes) -> torch.Tensor:
     return t.contiguous()
 
 
+class LMDBImageDataset(Dataset):
+    def __init__(self, lmdb_path, transforms=None, keys_fname="keys.txt", flatten_data=True):
+        self.keys = None
+
+        # Data augmentation
+        self.transforms = transforms
+
+        # Read text keys from file
+        with open(os.path.join(lmdb_path, keys_fname)) as f:
+            self.keys = f.readlines()
+            if self.keys[-1] == '':
+                self.keys = self.keys[:-1]
+        for i in range(len(self.keys)):
+            self.keys[i] = self.keys[i].replace("\n", "")
+
+        # Get labels from text keys
+        self.labels = []
+        # self.labels = [imname_to_target(key) for key in self.keys]
+        for i, key in enumerate(self.keys):
+            try:
+                self.labels.append(imname_to_target(key))
+            except Exception as e:
+                print("i:", i)
+                print("name:", key)
+                raise e
+
+        # Encode keys
+        for i in range(len(self.keys)):
+            self.keys[i] = self.keys[i].encode()
+
+        self.lmdb_path = lmdb_path
+        self.flatten_data = flatten_data
+
+    def open_lmdb(self):
+        self.env = lmdb.open(self.lmdb_path, readonly=True, create=False, lock=False, readahead=False, meminit=False)
+        self.txn = self.env.begin()
+
+    def close(self):
+        self.env.close()
+
+    def __len__(self):
+        return len(self.keys)
+
+    def get_index(self, key):
+        for i, k in enumerate(self.keys):
+            if k == key:
+                return i
+        
+        return None
+    
+    def __getitem__(self, index):
+        if not hasattr(self, 'txn'):
+            print("Opening lmdb txn")
+            self.open_lmdb()
+        key = self.keys[index]  # Get corresponding tuple
+        label = self.labels[index]
+        
+        img_bytes = self.txn.get(key)
+        
+        if img_bytes is None:
+            raise KeyError(f"Image {key} not found in LMDB!")
+
+
+        image = torch.asarray(lmdb_bytes_to_torch_tensor(img_bytes), dtype=torch.float32)
+        
+        # Augmenation
+        if self.transforms is not None:
+            image = self.transforms(image)
+            # print(f"image shaep after transforms: {image.shape}")
+        if self.flatten_data:
+            image = image.flatten().float()
+            self.debug_msg = f"image shape {image.shape}"
+
+
+        # Convert label tuple to Tensor
+        x, y = label
+        x = (x + 2) / 5.7
+        y = (y + 2) / 4
+        label = (x, y)
+        label = torch.tensor(label, dtype=torch.float32)
+
+        return image, label
+
 class InMemoryLMDBImageDataset(Dataset):
     """LMDB-backed dataset that caches loaded tensors in memory.
 
@@ -59,7 +142,11 @@ class InMemoryLMDBImageDataset(Dataset):
         self.encoded_keys = [k.encode() for k in self.keys]
 
         self.env = lmdb.open(data_folder_path, readonly=True, create=False, lock=False, readahead=False, meminit=False)
+        if not self.env:
+            raise ValueError(f"Cannot open LMDB folder at {data_folder_path}")
         self.txn = self.env.begin()
+        if self.txn is None:
+            raise ValueError(f"Cannot begin LMDB transaction at {data_folder_path}")
 
         self.images = [None] * len(self.keys)
         self.loaded_indexes = set()
@@ -203,19 +290,26 @@ def run_training(config=None):
     # config is a wandb.config-like dict
     cfg = config if config is not None else {}
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print(f"Using device: {device}")
     # Data
     data_folder = cfg.get('data_folder')
     if data_folder is None:
         raise ValueError('data_folder must be set in config and point to lmdb folder containing keys.txt')
 
     transforms_obj = build_transforms(cfg)
-    ds_train = InMemoryLMDBImageDataset(data_folder, transforms=transforms_obj, keys_fname=cfg.get('dataset_train_keys_fname','keys.txt'), flatten_data=False)
-    ds_val = InMemoryLMDBImageDataset(data_folder, transforms=transforms_obj, keys_fname=cfg.get('dataset_val_keys_fname','keys_val.txt'), flatten_data=False)
+    ds_train = LMDBImageDataset(data_folder, transforms=transforms_obj, keys_fname=cfg.get('dataset_train_keys_fname','keys.txt'), flatten_data=False)
+    print(f"Training dataset size: {len(ds_train)}")
+    ds_val = LMDBImageDataset(data_folder, transforms=transforms_obj, keys_fname=cfg.get('dataset_val_keys_fname','keys_val.txt'), flatten_data=False)
+    print(f"Validation dataset size: {len(ds_val)}")
 
-
-    train_loader = DataLoader(ds_train, batch_size=cfg.get('batch_size', 32), shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(ds_val, batch_size=cfg.get('batch_size', 32), shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(ds_train, 
+                              batch_size=cfg.get('batch_size', 32), 
+                              shuffle=True, 
+                              num_workers=4, 
+                              pin_memory=True, 
+                              persistent_workers=True)
+    val_loader = DataLoader(ds_val, batch_size=cfg.get('batch_size', 32), shuffle=False, num_workers=2, pin_memory=True, 
+                              persistent_workers=True)
 
     # parse conv_config from sweep config (can be provided as JSON string)
 
@@ -331,9 +425,9 @@ if __name__ == '__main__':
             'jitter_saturation': {'value': 0.1},
             'jitter_hue': {'value': 0.2},
 
-            'data_folder': {'value': os.environ.get('LMDB_PATH', './data/real_512_0_004step_tensor.lmdb')},
-            'dataset_train_keys_fname': {'value': os.environ.get('TRAIN_KEYS', '004_dark_train.txt')},
-            'dataset_val_keys_fname': {'value': os.environ.get('VAL_KEYS', '004_dark_val.txt')},
+            'data_folder': {'value': './data/real_512_0_004step_tensor.lmdb'},
+            'dataset_train_keys_fname': {'value': '004_dark_train.txt'},
+            'dataset_val_keys_fname': {'value': '004_dark_val.txt'},
             'use_weight_initialization': {'value': True},
         }
     }
