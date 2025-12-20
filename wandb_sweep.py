@@ -6,8 +6,6 @@ import lmdb
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
 
 import wandb
 
@@ -32,43 +30,44 @@ def lmdb_bytes_to_torch_tensor(img_bytes: bytes) -> torch.Tensor:
     raise ValueError("Unsupported LMDB format")
 
 
-class InMemoryLMDBImageDataset(Dataset):
-    def __init__(self, data_folder: str, keys_fname: str = "keys.txt", transform=None):
-        self.transform = transform
-        
-        with open(os.path.join(data_folder, keys_fname), 'r') as f:
-            self.keys = [k.strip() for k in f.readlines() if k.strip()]
-        
-        self.labels = [imname_to_target(k) for k in self.keys]
-        self.images = self._load_all(data_folder)
-        print(f"Loaded {len(self.images)} images from {keys_fname}")
+def load_dataset_to_gpu(data_folder: str, keys_fname: str, device: torch.device):
+    """Load entire dataset as GPU tensors."""
+    with open(os.path.join(data_folder, keys_fname), 'r') as f:
+        keys = [k.strip() for k in f.readlines() if k.strip()]
+    
+    labels = torch.tensor([(imname_to_target(k)) for k in keys], dtype=torch.float32)
+    labels[:, 0] = (labels[:, 0] + 2) / 5.7
+    labels[:, 1] = (labels[:, 1] + 2) / 4
+    
+    images = []
+    env = lmdb.open(data_folder, readonly=True, create=False, lock=False, readahead=True, meminit=False)
+    with env.begin() as txn:
+        for key in keys:
+            img_bytes = txn.get(key.encode())
+            if img_bytes is None:
+                raise KeyError(f"Image {key} not found")
+            img = lmdb_bytes_to_torch_tensor(img_bytes).float()
+            if img.ndim == 2:
+                img = img.unsqueeze(0)
+            images.append(img)
+    env.close()
+    
+    images = torch.stack(images).to(device)
+    labels = labels.to(device)
+    print(f"Loaded {len(keys)} images to GPU from {keys_fname}, shape: {images.shape}")
+    return images, labels
 
-    def _load_all(self, data_folder):
-        images = []
-        env = lmdb.open(data_folder, readonly=True, create=False, lock=False, readahead=True, meminit=False)
-        with env.begin() as txn:
-            for key in self.keys:
-                img_bytes = txn.get(key.encode())
-                if img_bytes is None:
-                    raise KeyError(f"Image {key} not found")
-                images.append(lmdb_bytes_to_torch_tensor(img_bytes).float())
-        env.close()
-        return images
 
-    def __len__(self):
-        return len(self.keys)
-
-    def __getitem__(self, idx):
-        img = self.images[idx]
-        if img.ndim == 2:
-            img = img.unsqueeze(0)
-        
-        if self.transform:
-            img = self.transform(img)
-        
-        x, y = self.labels[idx]
-        label = torch.tensor([(x + 2) / 5.7, (y + 2) / 4], dtype=torch.float32)
-        return img, label
+def get_gpu_data(cfg, device):
+    """Get or load cached GPU tensors."""
+    cache_key = (cfg['data_folder'], cfg['dataset_train_keys_fname'], cfg['dataset_val_keys_fname'])
+    
+    if cache_key not in _DATA_CACHE:
+        train_imgs, train_labels = load_dataset_to_gpu(cfg['data_folder'], cfg['dataset_train_keys_fname'], device)
+        val_imgs, val_labels = load_dataset_to_gpu(cfg['data_folder'], cfg['dataset_val_keys_fname'], device)
+        _DATA_CACHE[cache_key] = (train_imgs, train_labels, val_imgs, val_labels)
+    
+    return _DATA_CACHE[cache_key]
 
 
 def size_after_conv(size, kernel, stride, padding):
@@ -106,44 +105,6 @@ class ConfigCNN(nn.Module):
         return self.fc(x.view(x.size(0), -1))
 
 
-class GaussianNoise:
-    def __init__(self, sigma=0.1):
-        self.sigma = sigma
-    def __call__(self, x):
-        return x + self.sigma * torch.randn_like(x)
-
-
-def build_transform(cfg):
-    t = [transforms.ConvertImageDtype(torch.float)]
-    if cfg.get('use_noise_transform'):
-        t.append(GaussianNoise(cfg.get('noise_level', 0.1)))
-    if cfg.get('use_jitter_transform'):
-        t.append(transforms.ColorJitter(
-            brightness=cfg.get('jitter_brightness', 0.4),
-            contrast=cfg.get('jitter_contrast', 0.1),
-            saturation=cfg.get('jitter_saturation', 0.1),
-            hue=cfg.get('jitter_hue', 0.2)
-        ))
-    return transforms.Compose(t)
-
-
-def get_dataloaders(cfg):
-    cache_key = (cfg['data_folder'], cfg['dataset_train_keys_fname'], cfg['dataset_val_keys_fname'])
-    
-    if cache_key not in _DATA_CACHE:
-        transform = build_transform(cfg)
-        train_ds = InMemoryLMDBImageDataset(cfg['data_folder'], cfg['dataset_train_keys_fname'], transform)
-        val_ds = InMemoryLMDBImageDataset(cfg['data_folder'], cfg['dataset_val_keys_fname'], transform)
-        _DATA_CACHE[cache_key] = (train_ds, val_ds)
-    
-    train_ds, val_ds = _DATA_CACHE[cache_key]
-    train_loader = DataLoader(train_ds, batch_size=cfg['batch_size'], shuffle=True, 
-                              num_workers=cfg.get('num_workers', 4), pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg['batch_size'], shuffle=False,
-                            num_workers=cfg.get('num_workers', 4), pin_memory=True)
-    return train_loader, val_loader
-
-
 def build_model(cfg, device):
     conv_cfg = [
         {'out_channels': cfg['l1_out_channels'], 'kernel_size': cfg['l1_kernel_size'], 'stride': cfg['l1_stride']},
@@ -160,32 +121,51 @@ def build_model(cfg, device):
     return model
 
 
-def train_epoch(model, loader, optimizer, criterion, device):
+def train_epoch(model, images, labels, batch_size, optimizer, criterion, cfg):
     model.train()
-    total = 0.0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
+    n = images.size(0)
+    perm = torch.randperm(n, device=images.device)
+    total_loss = 0.0
+    n_batches = 0
+    
+    noise_sigma = cfg.get('noise_level', 0.1) if cfg.get('use_noise_transform') else 0
+    
+    for i in range(0, n, batch_size):
+        idx = perm[i:i+batch_size]
+        x, y = images[idx], labels[idx]
+        
+        if noise_sigma > 0:
+            x = x + noise_sigma * torch.randn_like(x)
+        
         optimizer.zero_grad(set_to_none=True)
         loss = criterion(model(x), y)
         loss.backward()
         optimizer.step()
-        total += loss.item()
-    return total / len(loader)
+        total_loss += loss.item()
+        n_batches += 1
+    
+    return total_loss / n_batches
 
 
 @torch.inference_mode()
-def validate(model, loader, criterion, device):
+def validate(model, images, labels, batch_size, criterion):
     model.eval()
-    total = 0.0
-    for x, y in loader:
-        total += criterion(model(x.to(device)), y.to(device)).item()
-    return total / len(loader)
+    n = images.size(0)
+    total_loss = 0.0
+    n_batches = 0
+    
+    for i in range(0, n, batch_size):
+        x, y = images[i:i+batch_size], labels[i:i+batch_size]
+        total_loss += criterion(model(x), y).item()
+        n_batches += 1
+    
+    return total_loss / n_batches
 
 
 def run_training(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    train_loader, val_loader = get_dataloaders(cfg)
+    train_imgs, train_labels, val_imgs, val_labels = get_gpu_data(cfg, device)
     model = build_model(cfg, device)
     
     optimizer = optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
@@ -193,11 +173,12 @@ def run_training(cfg):
         optimizer, cfg['lr_scheduler_loop'], eta_min=cfg.get('eta_min', 1e-5)
     )
     criterion = nn.MSELoss()
+    batch_size = cfg['batch_size']
     
     best_val = float('inf')
     for epoch in range(cfg['epochs']):
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss = validate(model, val_loader, criterion, device)
+        train_loss = train_epoch(model, train_imgs, train_labels, batch_size, optimizer, criterion, cfg)
+        val_loss = validate(model, val_imgs, val_labels, batch_size, criterion)
         scheduler.step()
         
         wandb.log({'epoch': epoch, 'train_loss': train_loss, 'val_loss': val_loss, 'lr': scheduler.get_last_lr()[0]})
@@ -234,15 +215,9 @@ SWEEP_CONFIG = {
         'epochs': {'value': 3},
         'use_noise_transform': {'value': True},
         'noise_level': {'value': 0.1},
-        'use_jitter_transform': {'value': True},
-        'jitter_brightness': {'value': 0.4},
-        'jitter_contrast': {'value': 0.1},
-        'jitter_saturation': {'value': 0.1},
-        'jitter_hue': {'value': 0.2},
         'data_folder': {'value': './data/real_512_0_004step_tensor.lmdb'},
         'dataset_train_keys_fname': {'value': '004_dark_train.txt'},
         'dataset_val_keys_fname': {'value': '004_dark_val.txt'},
-        'num_workers': {'value': 4},
     }
 }
 
