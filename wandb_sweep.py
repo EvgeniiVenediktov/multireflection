@@ -196,7 +196,7 @@ def sweep_train():
 
 
 SWEEP_CONFIG = {
-    'method': 'grid',
+    'method': 'bayes',
     'metric': {'name': 'val_loss', 'goal': 'minimize'},
     'parameters': {
         'l1_out_channels': {'values': [1, 3, 5]},
