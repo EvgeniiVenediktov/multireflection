@@ -1,5 +1,5 @@
 program: wandb_sweep.py
-method: grid
+method: bayes
 metric:
   name: val_loss
   goal: minimize
