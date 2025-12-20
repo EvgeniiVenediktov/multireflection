@@ -1,5 +1,6 @@
 import os
 import io
+import argparse
 import lmdb
 
 import torch
@@ -10,427 +11,252 @@ import torchvision.transforms as transforms
 
 import wandb
 
+_DATA_CACHE = {}
+
 
 def imname_to_target(name: str) -> tuple[float, float]:
     name = name.split('.jpg')[0]
     x, y = name.split("_")
-    x = float(x[1:])
-    y = float(y[1:5])
-    return x, y
+    return float(x[1:]), float(y[1:5])
 
 
 def lmdb_bytes_to_torch_tensor(img_bytes: bytes) -> torch.Tensor:
     if img_bytes is None:
         raise ValueError("img_bytes is None")
     buf = io.BytesIO(img_bytes)
-    buf.seek(0)
-    obj = torch.load(buf, map_location='cpu')
+    obj = torch.load(buf, map_location='cpu', weights_only=False)
     if isinstance(obj, torch.Tensor):
-        t = obj
-    elif isinstance(obj, dict) and 'tensor' in obj and isinstance(obj['tensor'], torch.Tensor):
-        t = obj['tensor']
-    else:
-        raise ValueError("Unsupported LMDB object format: expected Tensor or dict with 'tensor'")
-    return t.contiguous()
+        return obj.contiguous()
+    if isinstance(obj, dict) and 'tensor' in obj:
+        return obj['tensor'].contiguous()
+    raise ValueError("Unsupported LMDB format")
 
-
-class LMDBImageDataset(Dataset):
-    def __init__(self, lmdb_path, transforms=None, keys_fname="keys.txt", flatten_data=True):
-        self.keys = None
-
-        # Data augmentation
-        self.transforms = transforms
-
-        # Read text keys from file
-        with open(os.path.join(lmdb_path, keys_fname)) as f:
-            self.keys = f.readlines()
-            if self.keys[-1] == '':
-                self.keys = self.keys[:-1]
-        for i in range(len(self.keys)):
-            self.keys[i] = self.keys[i].replace("\n", "")
-
-        # Get labels from text keys
-        self.labels = []
-        # self.labels = [imname_to_target(key) for key in self.keys]
-        for i, key in enumerate(self.keys):
-            try:
-                self.labels.append(imname_to_target(key))
-            except Exception as e:
-                print("i:", i)
-                print("name:", key)
-                raise e
-
-        # Encode keys
-        for i in range(len(self.keys)):
-            self.keys[i] = self.keys[i].encode()
-
-        self.lmdb_path = lmdb_path
-        self.flatten_data = flatten_data
-
-    def open_lmdb(self):
-        self.env = lmdb.open(self.lmdb_path, readonly=True, create=False, lock=False, readahead=False, meminit=False)
-        self.txn = self.env.begin()
-
-    def close(self):
-        self.env.close()
-
-    def __len__(self):
-        return len(self.keys)
-
-    def get_index(self, key):
-        for i, k in enumerate(self.keys):
-            if k == key:
-                return i
-        
-        return None
-    
-    def __getitem__(self, index):
-        if not hasattr(self, 'txn'):
-            print("Opening lmdb txn")
-            self.open_lmdb()
-        key = self.keys[index]  # Get corresponding tuple
-        label = self.labels[index]
-        
-        img_bytes = self.txn.get(key)
-        
-        if img_bytes is None:
-            raise KeyError(f"Image {key} not found in LMDB!")
-
-
-        image = torch.asarray(lmdb_bytes_to_torch_tensor(img_bytes), dtype=torch.float32)
-        
-        # Augmenation
-        if self.transforms is not None:
-            image = self.transforms(image)
-            # print(f"image shaep after transforms: {image.shape}")
-        if self.flatten_data:
-            image = image.flatten().float()
-            self.debug_msg = f"image shape {image.shape}"
-
-
-        # Convert label tuple to Tensor
-        x, y = label
-        x = (x + 2) / 5.7
-        y = (y + 2) / 4
-        label = (x, y)
-        label = torch.tensor(label, dtype=torch.float32)
-
-        return image, label
 
 class InMemoryLMDBImageDataset(Dataset):
-    """LMDB-backed dataset that caches loaded tensors in memory.
+    def __init__(self, data_folder: str, keys_fname: str = "keys.txt", transform=None):
+        self.transform = transform
+        
+        with open(os.path.join(data_folder, keys_fname), 'r') as f:
+            self.keys = [k.strip() for k in f.readlines() if k.strip()]
+        
+        self.labels = [imname_to_target(k) for k in self.keys]
+        self.images = self._load_all(data_folder)
+        print(f"Loaded {len(self.images)} images from {keys_fname}")
 
-    Keys are read from a text file inside the LMDB folder (defaults to `keys.txt`).
-    Each key corresponds to an entry saved with `torch.save(tensor, buf)` in the LMDB.
-    """
-    def __init__(self, data_folder_path: str, transforms=None, keys_fname: str = "keys.txt", flatten_data: bool = True):
-        self.transforms = transforms
-        self.flatten_data = flatten_data
-        self.data_folder_path = data_folder_path
-
-        with open(os.path.join(data_folder_path, keys_fname), 'r') as f:
-            keys = f.readlines()
-        if len(keys) > 0 and keys[-1] == '':
-            keys = keys[:-1]
-        self.keys = [k.strip() for k in keys]
-
-        self.labels = []
-        for key in self.keys:
-            self.labels.append(imname_to_target(key))
-
-        # encoded keys used for lmdb lookup
-        self.encoded_keys = [k.encode() for k in self.keys]
-
-        self.env = lmdb.open(data_folder_path, readonly=True, create=False, lock=False, readahead=False, meminit=False)
-        if not self.env:
-            raise ValueError(f"Cannot open LMDB folder at {data_folder_path}")
-        self.txn = self.env.begin()
-        if self.txn is None:
-            raise ValueError(f"Cannot begin LMDB transaction at {data_folder_path}")
-
-        self.images = [None] * len(self.keys)
-        self.loaded_indexes = set()
+    def _load_all(self, data_folder):
+        images = []
+        env = lmdb.open(data_folder, readonly=True, create=False, lock=False, readahead=True, meminit=False)
+        with env.begin() as txn:
+            for key in self.keys:
+                img_bytes = txn.get(key.encode())
+                if img_bytes is None:
+                    raise KeyError(f"Image {key} not found")
+                images.append(lmdb_bytes_to_torch_tensor(img_bytes).float())
+        env.close()
+        return images
 
     def __len__(self):
         return len(self.keys)
 
-    def __getitem__(self, index: int):
-        label = self.labels[index]
-
-        if index in self.loaded_indexes:
-            img = self.images[index]
-        else:
-            key = self.encoded_keys[index]
-            img_bytes = self.txn.get(key)
-            if img_bytes is None:
-                raise KeyError(f"Image {key} not found in LMDB!")
-            img = torch.asarray(lmdb_bytes_to_torch_tensor(img_bytes), dtype=torch.float32)
-            self.images[index] = img
-            self.loaded_indexes.add(index)
-
-        if self.transforms is not None:
-            img = self.transforms(img)
-
-        if self.flatten_data:
-            img = img.flatten().float()
-        elif isinstance(img, torch.Tensor) and img.ndim == 2:
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        if img.ndim == 2:
             img = img.unsqueeze(0)
+        
+        if self.transform:
+            img = self.transform(img)
+        
+        x, y = self.labels[idx]
+        label = torch.tensor([(x + 2) / 5.7, (y + 2) / 4], dtype=torch.float32)
+        return img, label
 
-        # normalize label to same scheme used in notebook
-        x, y = label
-        x = (x + 2) / 5.7
-        y = (y + 2) / 4
-        label_t = torch.tensor((x, y), dtype=torch.float32)
 
-        return img, label_t
-
-
-def size_after_conv(input_size, kernel_size, stride, padding):
-    return (input_size - kernel_size + 2 * padding) // stride + 1
-
+def size_after_conv(size, kernel, stride, padding):
+    return (size - kernel + 2 * padding) // stride + 1
 
 
 class ConfigCNN(nn.Module):
-    def __init__(self, conv_configuration, output_size=2, input_size=(1, 512, 512)):
-        super(ConfigCNN, self).__init__()
-        # conv_configuration: list of dicts with keys 'out_channels','kernel_size','stride' (padding optional)
+    def __init__(self, conv_config, output_size=2, input_size=(1, 512, 512)):
+        super().__init__()
         c, h, w = input_size
         layers = []
-        prev_channels = c
-        size = c * h * w
-        # ensure padding present
-        cfg = []
-        for layer in conv_configuration:
-            layer = dict(layer)
-            if 'padding' not in layer:
-                layer['padding'] = layer['kernel_size'] // 2
-            cfg.append(layer)
-
-        for layer_config in cfg:
-            layers.append(
-                nn.Conv2d(prev_channels,
-                          layer_config['out_channels'],
-                          layer_config['kernel_size'],
-                          layer_config['stride'],
-                          padding=layer_config['padding']
-                          )
-            )
-            prev_channels = layer_config['out_channels']
-            layers.append(nn.ReLU())
-            layers.append(nn.BatchNorm2d(layer_config['out_channels']))
-
-            h = size_after_conv(h, layer_config['kernel_size'], layer_config['stride'], layer_config['padding'])
+        
+        for cfg in conv_config:
+            padding = cfg.get('padding', cfg['kernel_size'] // 2)
+            layers.extend([
+                nn.Conv2d(c, cfg['out_channels'], cfg['kernel_size'], cfg['stride'], padding),
+                nn.ReLU(),
+                nn.BatchNorm2d(cfg['out_channels'])
+            ])
+            h = size_after_conv(h, cfg['kernel_size'], cfg['stride'], padding)
             w = h
-            c = layer_config['out_channels']
-            size = c * h * w
-
-        self.sec1 = nn.Sequential(
-            *layers
-        )
-
-        self.sec2 = nn.Sequential(
-            nn.Linear(size, size // 2),
+            c = cfg['out_channels']
+        
+        flat_size = c * h * w
+        self.conv = nn.Sequential(*layers)
+        self.fc = nn.Sequential(
+            nn.Linear(flat_size, flat_size // 2),
             nn.ReLU(),
-            nn.BatchNorm1d(size // 2),
-            nn.Linear(size//2, output_size),
+            nn.BatchNorm1d(flat_size // 2),
+            nn.Linear(flat_size // 2, output_size),
         )
 
     def forward(self, x):
-        x = self.sec1(x)
-        x = x.view(x.size(0), -1)  # Flatten
-        x = self.sec2(x)
-
-        return x
+        x = self.conv(x)
+        return self.fc(x.view(x.size(0), -1))
 
 
-def make_config_cnn(conv_configuration, output_dim=2, input_size=(1, 512, 512)):
-    return ConfigCNN(conv_configuration, output_size=output_dim, input_size=input_size)
+class GaussianNoise:
+    def __init__(self, sigma=0.1):
+        self.sigma = sigma
+    def __call__(self, x):
+        return x + self.sigma * torch.randn_like(x)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def build_transform(cfg):
+    t = [transforms.ConvertImageDtype(torch.float)]
+    if cfg.get('use_noise_transform'):
+        t.append(GaussianNoise(cfg.get('noise_level', 0.1)))
+    if cfg.get('use_jitter_transform'):
+        t.append(transforms.ColorJitter(
+            brightness=cfg.get('jitter_brightness', 0.4),
+            contrast=cfg.get('jitter_contrast', 0.1),
+            saturation=cfg.get('jitter_saturation', 0.1),
+            hue=cfg.get('jitter_hue', 0.2)
+        ))
+    return transforms.Compose(t)
+
+
+def get_dataloaders(cfg):
+    cache_key = (cfg['data_folder'], cfg['dataset_train_keys_fname'], cfg['dataset_val_keys_fname'])
+    
+    if cache_key not in _DATA_CACHE:
+        transform = build_transform(cfg)
+        train_ds = InMemoryLMDBImageDataset(cfg['data_folder'], cfg['dataset_train_keys_fname'], transform)
+        val_ds = InMemoryLMDBImageDataset(cfg['data_folder'], cfg['dataset_val_keys_fname'], transform)
+        _DATA_CACHE[cache_key] = (train_ds, val_ds)
+    
+    train_ds, val_ds = _DATA_CACHE[cache_key]
+    train_loader = DataLoader(train_ds, batch_size=cfg['batch_size'], shuffle=True, 
+                              num_workers=cfg.get('num_workers', 4), pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=cfg['batch_size'], shuffle=False,
+                            num_workers=cfg.get('num_workers', 4), pin_memory=True)
+    return train_loader, val_loader
+
+
+def build_model(cfg, device):
+    conv_cfg = [
+        {'out_channels': cfg['l1_out_channels'], 'kernel_size': cfg['l1_kernel_size'], 'stride': cfg['l1_stride']},
+        {'out_channels': cfg['l2_out_channels'], 'kernel_size': cfg['l2_kernel_size'], 'stride': cfg['l2_stride']},
+        {'out_channels': cfg['l3_out_channels'], 'kernel_size': cfg['l3_kernel_size'], 'stride': cfg['l3_stride']},
+    ]
+    model = ConfigCNN(conv_cfg).to(device)
+    
+    for m in model.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+    return model
+
+
+def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
-    running = 0.0
-    for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
-
+    total = 0.0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        loss = criterion(model(x), y)
         loss.backward()
         optimizer.step()
-        running += loss.item()
-    return running / len(loader)
+        total += loss.item()
+    return total / len(loader)
 
 
+@torch.inference_mode()
 def validate(model, loader, criterion, device):
     model.eval()
-    running = 0.0
-    with torch.inference_mode():
-        for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            running += loss.item()
-    return running / len(loader)
+    total = 0.0
+    for x, y in loader:
+        total += criterion(model(x.to(device)), y.to(device)).item()
+    return total / len(loader)
 
 
-def build_transforms(cfg):
-    tarr = []
-    # Data stored as tensors (C,H,W) or (H,W). Convert to proper dtype
-    tarr.append(transforms.ConvertImageDtype(torch.float))
-    if cfg.get('use_noise_transform', False):
-        sigma = cfg.get('noise_level', 0.1)
-        tarr.append(lambda x: x + sigma * torch.randn_like(x))
-    return transforms.Compose(tarr)
-
-
-def run_training(config=None):
-    # config is a wandb.config-like dict
-    cfg = config if config is not None else {}
+def run_training(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    # Data
-    data_folder = cfg.get('data_folder')
-    if data_folder is None:
-        raise ValueError('data_folder must be set in config and point to lmdb folder containing keys.txt')
-
-    transforms_obj = build_transforms(cfg)
-    ds_train = LMDBImageDataset(data_folder, transforms=transforms_obj, keys_fname=cfg.get('dataset_train_keys_fname','keys.txt'), flatten_data=False)
-    print(f"Training dataset size: {len(ds_train)}")
-    ds_val = LMDBImageDataset(data_folder, transforms=transforms_obj, keys_fname=cfg.get('dataset_val_keys_fname','keys_val.txt'), flatten_data=False)
-    print(f"Validation dataset size: {len(ds_val)}")
-
-    train_loader = DataLoader(ds_train, 
-                              batch_size=cfg.get('batch_size', 32), 
-                              shuffle=True, 
-                              num_workers=4, 
-                              pin_memory=True, 
-                              persistent_workers=True)
-    val_loader = DataLoader(ds_val, batch_size=cfg.get('batch_size', 32), shuffle=False, num_workers=2, pin_memory=True, 
-                              persistent_workers=True)
-
-    # parse conv_config from sweep config (can be provided as JSON string)
-
-    cfg['l1_padding'] = cfg['l1_kernel_size'] // 2
-    cfg['l2_padding'] = cfg['l2_kernel_size'] // 2
-    cfg['l3_padding'] = cfg['l3_kernel_size'] // 2
-
-    conv_cfg = [
-        {
-            'out_channels': cfg['l1_out_channels'],
-            'kernel_size': cfg['l1_kernel_size'],
-            'stride': cfg['l1_stride'],
-            'padding': cfg['l1_padding'],
-        },
-        {
-            'out_channels': cfg['l2_out_channels'],
-            'kernel_size': cfg['l2_kernel_size'],
-            'stride': cfg['l2_stride'],
-            'padding': cfg['l2_padding'],
-        },
-        {
-            'out_channels': cfg['l3_out_channels'],
-            'kernel_size': cfg['l3_kernel_size'],
-            'stride': cfg['l3_stride'],
-            'padding': cfg['l3_padding'],
-        },
-    ]
-
-    model = make_config_cnn(conv_cfg, output_dim=2).to(device)
-    if cfg.get('use_weight_initialization', True):
-        for m in model.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight)
-                if getattr(m, 'bias', None) is not None:
-                    nn.init.zeros_(m.bias)
-
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.get('lr', 1e-3), weight_decay=cfg.get('weight_decay', 0.0))
+    
+    train_loader, val_loader = get_dataloaders(cfg)
+    model = build_model(cfg, device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, cfg['lr_scheduler_loop'], eta_min=cfg.get('eta_min', 1e-5)
+    )
     criterion = nn.MSELoss()
-
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, cfg.get('lr_scheduler_loop', 7), eta_min=cfg.get('eta_min', 1e-5))
-
+    
     best_val = float('inf')
-    for epoch in range(cfg.get('epochs', 5)):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+    for epoch in range(cfg['epochs']):
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         val_loss = validate(model, val_loader, criterion, device)
-
-        # step scheduler (mirror notebook behavior)
-        if scheduler is not None:
-            scheduler.step()
-
-        # get lr for logging
-        if scheduler is not None:
-            try:
-                last_lr = scheduler.get_last_lr()[0]
-            except Exception:
-                last_lr = optimizer.param_groups[0]['lr']
-        else:
-            last_lr = optimizer.param_groups[0]['lr']
-
-        # log to wandb
-        wandb.log({
-            'epoch': epoch,
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'lr': last_lr
-        })
-
+        scheduler.step()
+        
+        wandb.log({'epoch': epoch, 'train_loss': train_loss, 'val_loss': val_loss, 'lr': scheduler.get_last_lr()[0]})
+        
         if val_loss < best_val:
             best_val = val_loss
             torch.save(model.state_dict(), 'best_model.pth')
-            wandb.save('best_model.pth')
-
+    
     return best_val
 
 
 def sweep_train():
-    # This function is called by wandb.agent for each trial.
-    with wandb.init() as run:
-        cfg = wandb.config
-        plain_cfg = dict(cfg)
-        run_training(plain_cfg)
+    with wandb.init():
+        run_training(dict(wandb.config))
+
+
+SWEEP_CONFIG = {
+    'method': 'grid',
+    'metric': {'name': 'val_loss', 'goal': 'minimize'},
+    'parameters': {
+        'l1_out_channels': {'values': [1, 3, 5]},
+        'l1_kernel_size': {'values': [9, 31, 75, 149]},
+        'l1_stride': {'values': [5, 15, 25]},
+        'l2_out_channels': {'values': [1, 8, 16]},
+        'l2_kernel_size': {'values': [7, 15, 31]},
+        'l2_stride': {'values': [2, 5, 10]},
+        'l3_out_channels': {'values': [1, 16, 32]},
+        'l3_kernel_size': {'values': [3, 5, 7]},
+        'l3_stride': {'values': [2]},
+        'lr': {'value': 0.001},
+        'batch_size': {'value': 100},
+        'weight_decay': {'value': 0.001},
+        'lr_scheduler_loop': {'value': 7},
+        'epochs': {'value': 3},
+        'use_noise_transform': {'value': True},
+        'noise_level': {'value': 0.1},
+        'use_jitter_transform': {'value': True},
+        'jitter_brightness': {'value': 0.4},
+        'jitter_contrast': {'value': 0.1},
+        'jitter_saturation': {'value': 0.1},
+        'jitter_hue': {'value': 0.2},
+        'data_folder': {'value': './data/real_512_0_004step_tensor.lmdb'},
+        'dataset_train_keys_fname': {'value': '004_dark_train.txt'},
+        'dataset_val_keys_fname': {'value': '004_dark_val.txt'},
+        'num_workers': {'value': 4},
+    }
+}
 
 
 if __name__ == '__main__':
-    # Sweep configuration: search over `conv_config` (JSON strings). Other training parameters mirror cnn_comparison defaults.
-    sweep_config = {
-        'method': 'grid',
-        'metric': {'name': 'val_loss', 'goal': 'minimize'},
-        'parameters': {
-            
-            'l1_out_channels': {'values': [1, 3, 5]},
-            'l1_kernel_size': {'values': [9, 31, 75, 149]},
-            'l1_stride': {'values': [5, 15, 25]},
-            
-            'l2_out_channels': {'values': [1, 8, 16]},
-            'l2_kernel_size': {'values': [7, 15, 31]},
-            'l2_stride': {'values': [2, 5, 10]},
-            
-            'l3_out_channels': {'values': [1, 16, 32]},
-            'l3_kernel_size': {'values': [3, 5, 7]},
-            'l3_stride': {'values': [2]},
-            
-            'lr': {'value': 0.001},
-            'batch_size': {'value': 100},
-            'weight_decay': {'value': 0.001},
-            'lr_scheduler_loop': {'value': 7},
-            'epochs': {'value': 3},
-            'use_noise_transform': {'value': True},
-            'noise_level': {'values': [0.1]},
-            'use_jitter_transform': {'value': True},
-            'jitter_brightness': {'value': 0.4},
-            'jitter_contrast': {'value': 0.1},
-            'jitter_saturation': {'value': 0.1},
-            'jitter_hue': {'value': 0.2},
-
-            'data_folder': {'value': './data/real_512_0_004step_tensor.lmdb'},
-            'dataset_train_keys_fname': {'value': '004_dark_train.txt'},
-            'dataset_val_keys_fname': {'value': '004_dark_val.txt'},
-            'use_weight_initialization': {'value': True},
-        }
-    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--sweep_id', type=str, help='Resume existing sweep')
+    parser.add_argument('--count', type=int, help='Max runs for this agent')
+    parser.add_argument('--project', type=str, default='multireflection')
+    args = parser.parse_args()
+    
     torch.manual_seed(0)
-    sweep_id = wandb.sweep(sweep_config, project='multireflection')
-    wandb.agent(sweep_id, function=sweep_train, count=None)
+    
+    sweep_id = args.sweep_id or wandb.sweep(SWEEP_CONFIG, project=args.project)
+    print(f"Sweep ID: {sweep_id}")
+    
+    wandb.agent(sweep_id, function=sweep_train, count=args.count, project=args.project)
