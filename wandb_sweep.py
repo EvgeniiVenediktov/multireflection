@@ -1,5 +1,6 @@
 import os
 import io
+import argparse
 import lmdb
 
 import torch
@@ -7,6 +8,8 @@ import torch.nn as nn
 import torch.optim as optim
 
 import wandb
+
+_DATA_CACHE = {}
 
 
 def imname_to_target(name: str) -> tuple[float, float]:
@@ -28,10 +31,11 @@ def lmdb_bytes_to_torch_tensor(img_bytes: bytes) -> torch.Tensor:
 
 
 def load_dataset_to_gpu(data_folder: str, keys_fname: str, device: torch.device):
+    """Load entire dataset as GPU tensors."""
     with open(os.path.join(data_folder, keys_fname), 'r') as f:
         keys = [k.strip() for k in f.readlines() if k.strip()]
     
-    labels = torch.tensor([imname_to_target(k) for k in keys], dtype=torch.float32)
+    labels = torch.tensor([(imname_to_target(k)) for k in keys], dtype=torch.float32)
     labels[:, 0] = (labels[:, 0] + 2) / 5.7
     labels[:, 1] = (labels[:, 1] + 2) / 4
     
@@ -52,6 +56,18 @@ def load_dataset_to_gpu(data_folder: str, keys_fname: str, device: torch.device)
     labels = labels.to(device)
     print(f"Loaded {len(keys)} images to GPU from {keys_fname}, shape: {images.shape}")
     return images, labels
+
+
+def get_gpu_data(cfg, device):
+    """Get or load cached GPU tensors."""
+    cache_key = (cfg['data_folder'], cfg['dataset_train_keys_fname'], cfg['dataset_val_keys_fname'])
+    
+    if cache_key not in _DATA_CACHE:
+        train_imgs, train_labels = load_dataset_to_gpu(cfg['data_folder'], cfg['dataset_train_keys_fname'], device)
+        val_imgs, val_labels = load_dataset_to_gpu(cfg['data_folder'], cfg['dataset_val_keys_fname'], device)
+        _DATA_CACHE[cache_key] = (train_imgs, train_labels, val_imgs, val_labels)
+    
+    return _DATA_CACHE[cache_key]
 
 
 def size_after_conv(size, kernel, stride, padding):
@@ -105,12 +121,14 @@ def build_model(cfg, device):
     return model
 
 
-def train_epoch(model, images, labels, batch_size, optimizer, criterion, noise_sigma):
+def train_epoch(model, images, labels, batch_size, optimizer, criterion, cfg):
     model.train()
     n = images.size(0)
     perm = torch.randperm(n, device=images.device)
     total_loss = 0.0
     n_batches = 0
+    
+    noise_sigma = cfg.get('noise_level', 0.1) if cfg.get('use_noise_transform') else 0
     
     for i in range(0, n, batch_size):
         idx = perm[i:i+batch_size]
@@ -144,29 +162,22 @@ def validate(model, images, labels, batch_size, criterion):
     return total_loss / n_batches
 
 
-def main():
-    wandb.init()
-    cfg = dict(wandb.config)
-    
-    torch.manual_seed(0)
+def run_training(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    train_imgs, train_labels = load_dataset_to_gpu(cfg['data_folder'], cfg['dataset_train_keys_fname'], device)
-    val_imgs, val_labels = load_dataset_to_gpu(cfg['data_folder'], cfg['dataset_val_keys_fname'], device)
-    
+    train_imgs, train_labels, val_imgs, val_labels = get_gpu_data(cfg, device)
     model = build_model(cfg, device)
+    
     optimizer = optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, cfg['lr_scheduler_loop'], eta_min=cfg.get('eta_min', 1e-5)
     )
     criterion = nn.MSELoss()
-    
-    noise_sigma = cfg.get('noise_level', 0.1) if cfg.get('use_noise_transform') else 0
     batch_size = cfg['batch_size']
     
     best_val = float('inf')
     for epoch in range(cfg['epochs']):
-        train_loss = train_epoch(model, train_imgs, train_labels, batch_size, optimizer, criterion, noise_sigma)
+        train_loss = train_epoch(model, train_imgs, train_labels, batch_size, optimizer, criterion, cfg)
         val_loss = validate(model, val_imgs, val_labels, batch_size, criterion)
         scheduler.step()
         
@@ -176,8 +187,51 @@ def main():
             best_val = val_loss
             torch.save(model.state_dict(), 'best_model.pth')
     
-    wandb.finish()
+    return best_val
+
+
+def sweep_train():
+    with wandb.init():
+        run_training(dict(wandb.config))
+
+
+SWEEP_CONFIG = {
+    'method': 'grid',
+    'metric': {'name': 'val_loss', 'goal': 'minimize'},
+    'parameters': {
+        'l1_out_channels': {'values': [1, 3, 5]},
+        'l1_kernel_size': {'values': [9, 31, 75, 149]},
+        'l1_stride': {'values': [5, 15, 25]},
+        'l2_out_channels': {'values': [1, 8, 16]},
+        'l2_kernel_size': {'values': [7, 15, 31]},
+        'l2_stride': {'values': [2, 5, 10]},
+        'l3_out_channels': {'values': [1, 16, 32]},
+        'l3_kernel_size': {'values': [3, 5, 7]},
+        'l3_stride': {'values': [2]},
+        'lr': {'value': 0.001},
+        'batch_size': {'value': 100},
+        'weight_decay': {'value': 0.001},
+        'lr_scheduler_loop': {'value': 7},
+        'epochs': {'value': 3},
+        'use_noise_transform': {'value': True},
+        'noise_level': {'value': 0.1},
+        'data_folder': {'value': './data/real_512_0_004step_tensor.lmdb'},
+        'dataset_train_keys_fname': {'value': '004_dark_train.txt'},
+        'dataset_val_keys_fname': {'value': '004_dark_val.txt'},
+    }
+}
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--sweep_id', type=str, help='Resume existing sweep')
+    parser.add_argument('--count', type=int, help='Max runs for this agent')
+    parser.add_argument('--project', type=str, default='multireflection')
+    args = parser.parse_args()
+    
+    torch.manual_seed(0)
+    
+    sweep_id = args.sweep_id or wandb.sweep(SWEEP_CONFIG, project=args.project)
+    print(f"Sweep ID: {sweep_id}")
+    
+    wandb.agent(sweep_id, function=sweep_train, count=args.count, project=args.project)
