@@ -180,3 +180,4 @@ wandb/*
 *_log.txt
 *eval.png 
 graphs/*
+cnn_comparison.ipynb

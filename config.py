@@ -17,7 +17,8 @@ DATA_COLLECTION_FINAL_RESOLUTION = (512, 512)
 
 
 # Model parameters
-INFERENCE_MODEL_FILE_NAME = "real/001step_SimpleFC_DarkOnly512_lmdb_360bs_0001lr_aug+_best_model.pth"
+# INFERENCE_MODEL_FILE_NAME = "real/001step_SimpleFC_DarkOnly512_lmdb_360bs_0001lr_aug+_best_model.pth"
+INFERENCE_MODEL_FILE_NAME = "real/resnet18_001step_BS_avid-sweep-4406_DarkOnly512_lmdb_50bs_0001lr_aug+_best_model.pth"
 INFERENCE_MODEL_TYPE = "SimpleFC"
 
 TRAINING_IMAGE_RESOLUTION = (512, 512)

@@ -63,13 +63,27 @@ def imname_to_target(name:str) -> tuple[float, float]:
     return x, y
 
 def create_lmdb_from_images(
-    image_dir, lmdb_path, start_index=0, stop_index=None, size=None, resolution=(512, 512), use_compression=True,
-    key_process=None, key_filter=None, keys_filename="keys.txt", imread_mode = cv2.IMREAD_GRAYSCALE
+    image_dir, 
+    lmdb_path, 
+    start_index=0, 
+    stop_index=None, 
+    image_names: list[str] | None = None,
+    size=None, 
+    resolution=(512, 512), 
+    use_compression=False,
+    key_process=None, 
+    key_filter=None, 
+    keys_filename="keys.txt", 
+    imread_mode = cv2.IMREAD_GRAYSCALE, 
+    to_tensor: bool = True, 
+    tensor_dtype: torch.dtype = torch.float32, 
+    normalize: bool = True
 ):
     # Get filenames
-    image_names = [
-        str(f) for f in os.listdir(image_dir) if f.endswith((".jpg", ".png"))
-    ]
+    if image_names is None:
+        image_names = [
+            str(f) for f in os.listdir(image_dir) if f.endswith((".jpg", ".png"))
+        ]
 
     # Open lmdb
     if size is None:
@@ -81,7 +95,7 @@ def create_lmdb_from_images(
         stop_index = len(image_names)
 
     # keys_file
-    keys_file = open(os.path.join(lmdb_path, keys_filename), "+w")
+    keys_file = open(keys_filename, "+w")
 
     # Store images
     with env.begin(write=True) as txn:
@@ -113,9 +127,25 @@ def create_lmdb_from_images(
 
                 # Serialize
                 # Convert to NumPy array and serialize with msgpack
+                
                 img_array = np.array(img, dtype=np.uint8)
-                img_bytes = msgpack.packb(img_array.tolist(), use_bin_type=True)
-                # img_bytes = pickle.dumps(np.array(img))
+                img_bytes = None
+                if to_tensor:
+                    tensor = torch.from_numpy(img_array)
+                    if tensor.ndim == 2:
+                        tensor = tensor.unsqueeze(0)
+                    else:
+                        tensor = tensor.permute(2, 0, 1)
+                    tensor = tensor.to(dtype=tensor_dtype)
+                    if normalize:
+                        tensor = tensor / 255.0
+
+                    buf = io.BytesIO()
+                    torch.save(tensor, buf)
+                    img_bytes = buf.getvalue()
+
+                else:
+                    img_bytes = msgpack.packb(img_array.tolist(), use_bin_type=True)
 
                 if use_compression:
                     # Compress
@@ -134,7 +164,7 @@ def create_lmdb_from_images(
                 txn.commit()
                 env.close()
                 keys_file.close()
-            except Exception as e:
+            except e:
                 print(e)
 
 
@@ -170,7 +200,8 @@ def copy_selected_entries(
     keys: list[str] | None = None,
     key_filter: Callable | None = None,
     map_size: int | None = None,
-    use_compression: bool = True,
+    start_index: int = 0,
+    stop_index: int | None = None,
     to_tensor: bool = False,
     tensor_dtype: torch.dtype = torch.float32,
     normalize: bool = False,
@@ -200,11 +231,16 @@ def copy_selected_entries(
     # Open destination env
     if map_size is None:
         map_size = 64 * 1024 * 1024 * 1024
-    dst_env = lmdb.open(dst_lmdb_path, map_size=map_size)
 
+    if stop_index is None:
+        stop_index = len(all_keys)
+
+    dst_env = lmdb.open(dst_lmdb_path, map_size=map_size)
+    i = 0
     with dst_env.begin(write=True) as dst_txn:
-        pbar = tqdm(all_keys)
-        for k in pbar:
+        pbar = tqdm(range(start_index, stop_index))
+        for i in pbar:
+            k = all_keys[i]
             pbar.set_description(k)
             raw = src_txn.get(k.encode())
             if raw is None:
@@ -233,14 +269,13 @@ def copy_selected_entries(
                 torch.save(tensor, buf)
                 data = buf.getvalue()
 
-            # Optionally compress
-            if use_compression:
-                try:
-                    data = lz4.frame.compress(data, compression_level=6)
-                except Exception:
-                    pass
 
             dst_txn.put(k.encode(), data)
+
+            if i%10000 == 0:
+                dst_txn.commit()
+                print(f"Copied {i} entries")
+                dst_txn = dst_env.begin(write=True)
 
     src_env.close()
     dst_env.close()
@@ -314,27 +349,38 @@ if __name__ == "__main__":
     # imread_mode = cv2.IMREAD_COLOR_RGB
     # if DATA_COLLECTION_CVT_TO_GRAYSCALE:
     #     imread_mode = cv2.IMREAD_GRAYSCALE
+
+    datasource_dir = "/mnt/h/dark512"
+    output_path = "/mnt/h/black_512_0_001step_tensor.lmdb"
+
+    # os.path.join(lmdb_path, keys_filename)
     
+    image_names = []
+    for s in open("./missing_keys.txt", "r").readlines():
+            name = s.replace("\n", "")
+            if len(name) == 0:
+                continue
+            image_names.append(name)
+
     # create_lmdb_from_images(
     #     datasource_dir, 
     #     output_path, 
+    #     image_names=image_names,
     #     start_index=0,
     #     stop_index=None, 
     #     size=180 * 1024 * 1024 * 1024, 
     #     use_compression=False,
     #     resolution=DATA_COLLECTION_FINAL_RESOLUTION,
     #     # key_process=light_postfix_keyproc,
-    #     keys_filename="dark512.txt",
-    #     imread_mode=imread_mode
     # )
     
     
     # # TEST all keys
     
-    # env = lmdb.open(output_path, readonly=True)
-    # with env.begin() as txn:
-    #     length = txn.stat()['entries']
-    #     print(length)
+    env = lmdb.open(output_path, readonly=True)
+    with env.begin() as txn:
+        length = txn.stat()['entries']
+        print(length)
     # #
     # exit()
     #
@@ -356,24 +402,62 @@ if __name__ == "__main__":
     #             keys.append(key)
     # write_split_keys(keys, output_path, train_fname="004_dark_train.txt", val_fname="004_dark_val.txt")
 
-    src_path = "/mnt/h/real_512_0_001step.lmdb"
-    dst_path = "/mnt/h/real_512_0_004step_tensor.lmdb"
+    src_path = "/mnt/e/real_512_0_001step.lmdb"
+    dst_path = "/mnt/h/black_512_0_001step_tensor.lmdb"
 
-    keys_file = "keys_black.txt"
-    keys = []
-    for s in open(os.path.join(src_path, keys_file), "r").readlines():
-        key = s.replace("\n", "")
-        if filter_004step(key):
-            keys.append(key)
-    print("1")
-    copy_selected_entries(
-        src_path,
-        dst_path,
-        keys=keys,
-        map_size= 16 * 1024 * 1024 * 1024,
-        use_compression=False,
-        to_tensor=True,
-        tensor_dtype=torch.float32,
-        normalize=True,
-    )
+    
+    def get_all_fnames(image_dir:str) -> list[str]:
+        return [
+            str(f) for f in os.listdir(image_dir) if f.endswith((".jpg", ".png"))
+        ]
+
+    def get_all_keys(lmdb_path:str) -> list[str]:
+        env = lmdb.open(lmdb_path, readonly=True, lock=False)
+        with env.begin(buffers=True) as txn:
+            cursor = txn.cursor()
+            keys = [bytes(k).decode() for k in cursor.iternext(keys=True, values=False)]
+        env.close()
+        return keys
+    
+    def missing_keys(src_keys:list[str], dst_keys:list[str]) -> list[str]:
+        missing = []
+        dst_key_set = set(dst_keys)
+        for k in src_keys:
+            if k not in dst_key_set:
+                missing.append(k)
+        return missing
+    
+    keys = get_all_fnames('/mnt/h/dark512')
+    # keys_fname = "keys_black.txt"
+    # for s in open(os.path.join(src_path, keys_fname), "r").readlines():
+    #     key = s.replace("\n", "")
+    #     keys.append(key)
+
+    dst_keys = get_all_keys(dst_path)
+    print("dst keys:", len(dst_keys))
+    missing = missing_keys(keys, dst_keys)
+    print("missing keys:", len(missing))
+    with open("missing_keys.txt", "+w") as f:
+        for k in missing:
+            f.write(k + "\n")
+
+    
+    exit()
+
+    # copy_selected_entries(
+    #     src_path,
+    #     dst_path,
+    #     keys=keys,
+    #     map_size= 264 * 1024 * 1024 * 1024,
+    #     start_index=0,
+    #     stop_index=10001,
+    #     to_tensor=True,
+    #     tensor_dtype=torch.float32,
+    #     normalize=True,
+    # )
+
+    # env = lmdb.open(dst_path, readonly=True)
+    # with env.begin() as txn:
+    #     length = txn.stat()['entries']
+    #     print(length)
 
