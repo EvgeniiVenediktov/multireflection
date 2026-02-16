@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.interpolate import griddata
 import sys
+from datetime import datetime
 
 fname = "eval.log"
 threshold = 0.97
@@ -16,45 +17,80 @@ assert fname[-4:] == ".log"
 print(f"Reading {fname}, threshold={threshold}")
 
 # Collect all data points, grouped by origin
-origins = {}  # (origin_x, origin_y) -> [(adj_n, sim_index), ...]
+origins = {}  # (origin_x, origin_y) -> [(timestamp, adj_n, sim_index, pos_x, pos_y), ...]
 
 with open(fname, "r") as f:
     for s in f.readlines():
+        timestamp_str = s.split(" - INFO - ")[0]
+        timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S,%f")
         s = s.split(" - INFO - ")[1]
         vals = s.split(",")
         assert len(vals) == 8
         origin_x  = float(vals[0].split(':')[1]) 
         origin_y  = float(vals[1].split(':')[1]) 
         adj_n     = int(float(vals[2].split(':')[1]))
+        pos_x     = float(vals[5].split(':')[1])
+        pos_y     = float(vals[6].split(':')[1])
         sim_index = float(vals[7].split(':')[1])
         
         key = (origin_x, origin_y)
         if key not in origins:
             origins[key] = []
-        origins[key].append((adj_n, sim_index))
+        origins[key].append((timestamp, adj_n, sim_index, pos_x, pos_y))
 
 # Build arrays
 x = []
 y = []
 adj = []
+pos_errors = []  # Position error (distance from zero) at last adjustment
+adj_times = []   # Time from first to last adjustment
+end_ssims = []   # SSIM at last adjustment
+end_angular_errors = []  # Angular error at last adjustment
 
 for (origin_x, origin_y), history in origins.items():
     x.append(origin_x)
     y.append(origin_y)
+    
     # Find first adj_n where sim_index >= threshold
-    final_adj = history[-1][0]  # default to last if threshold never met
-    for adj_n, sim_index in history:
+    final_idx = len(history) - 1
+    for i, (timestamp, adj_n, sim_index, pos_x, pos_y) in enumerate(history):
         if sim_index >= threshold:
-            final_adj = adj_n
+            final_idx = i
             break
+    
+    final_adj = history[final_idx][1]
+    final_pos_x = history[final_idx][3]
+    final_pos_y = history[final_idx][4]
+    final_ssim = history[final_idx][2]
+    
+    # Adjustment time (seconds)
+    adj_time = (history[final_idx][0] - history[0][0]).total_seconds()
+    adj_times.append(adj_time)
+    
     adj.append(final_adj)
+    end_ssims.append(final_ssim)
+    
+    # Calculate position error as Euclidean distance from (0, 0)
+    pos_error = np.sqrt(final_pos_x**2 + final_pos_y**2)
+    pos_errors.append(pos_error)
+    
+    # Angular error (assuming pos_x, pos_y are in degrees)
+    angular_error = np.sqrt(final_pos_x**2 + final_pos_y**2)
+    end_angular_errors.append(angular_error)
 
 x = np.array(x)
 y = np.array(y)
 adj = np.array(adj, dtype=np.int32)
+pos_errors = np.array(pos_errors)
+adj_times = np.array(adj_times)
+end_ssims = np.array(end_ssims)
+end_angular_errors = np.array(end_angular_errors)
 
-print(f"Adjustments: min={np.min(adj)}, max={np.max(adj)}, mean={np.mean(adj):.2f}")
-
+print(f"Adjustments: min={np.min(adj)}, max={np.max(adj)}, mean={np.mean(adj):.2f}, std={np.std(adj):.2f}, median={np.median(adj)}")
+print(f"Position error from zero: min={np.min(pos_errors)}, max={np.max(pos_errors)}, mean={np.mean(pos_errors):.4f}, std={np.std(pos_errors):.4f}")
+print(f"Adjustment time (s): min={np.min(adj_times)}, max={np.max(adj_times)}, mean={np.mean(adj_times):.2f}, std={np.std(adj_times):.2f}, median={np.median(adj_times):.2f}")
+print(f"End SSIM: min={np.min(end_ssims)}, max={np.max(end_ssims)}, mean={np.mean(end_ssims):.4f}, std={np.std(end_ssims):.4f}, median={np.median(end_ssims):.4f}")
+print(f"End angular error: min={np.min(end_angular_errors)}, max={np.max(end_angular_errors)}, mean={np.mean(end_angular_errors):.4f}, std={np.std(end_angular_errors):.4f}, median={np.median(end_angular_errors):.4f}")
 # === 2D Heatmap ===
 grid_x, grid_y = np.mgrid[min(x):max(x):100j, min(y):max(y):100j]
 grid_z = griddata((x, y), adj, (grid_x, grid_y), method='nearest')

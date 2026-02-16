@@ -1,10 +1,11 @@
+# eval.py
 from preprocess_images import process_image_from_webcam
 from inference import TiltPredictor, evaluate_position
 from mf_control.controller import MFController
 import cv2
 import numpy as np
 from config import *
-from color_output import *
+from utils.color_output import *
 import logging
 from tqdm import tqdm
 from time import sleep
