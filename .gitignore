@@ -178,6 +178,4 @@ saved_models/
 wandb/*
 *.swp
 *_log.txt
-*eval.png 
-graphs/*
 cnn_comparison.ipynb
