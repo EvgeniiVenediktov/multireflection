@@ -179,3 +179,4 @@ wandb/*
 *.swp
 *_log.txt
 cnn_comparison.ipynb
+runs/

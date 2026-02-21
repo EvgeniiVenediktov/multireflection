@@ -25,6 +25,7 @@ from simulation.herriott_sim import HerriottSim, SimConfig, MirrorConfig, DEVICE
 
 class ObsMirror(IntEnum):
     """Which mirror surface to use as the visual observation source."""
+
     M1 = 0  # Has hole/window - beam enters and exits here
     M2 = 1  # Solid mirror - no hole
 
@@ -39,12 +40,12 @@ class EnvConfig:
     # Observation
     obs_mirror: ObsMirror = ObsMirror.M2
     img_res: int = 64
-    img_extent: float = 14.0           # Half-width of rendered view (mm)
-    spot_sigma: float = 0.5            # Gaussian spot sigma (mm)
+    img_extent: float = 14.0  # Half-width of rendered view (mm)
+    spot_sigma: float = 0.5  # Gaussian spot sigma (mm)
     include_state_obs: bool = True
 
     # Action — agent controls m2 only
-    m2_angle_limit: float = 5.0        # Max m2 tilt (degrees)
+    m2_angle_limit: float = 5.0  # Max m2 tilt (degrees)
     action_scale: Tuple[float, float] = (0.5, 0.5)  # m2_pitch, m2_yaw delta per step
 
     # Episode
@@ -52,12 +53,12 @@ class EnvConfig:
 
     # Sim
     sim: SimConfig = field(default_factory=SimConfig)
-    m1: MirrorConfig = field(default_factory=lambda: MirrorConfig(
-        hole_radius=1.5, hole_offset_y=7.0
-    ))
-    m2: MirrorConfig = field(default_factory=lambda: MirrorConfig(
-        hole_radius=0.0, hole_offset_y=0.0
-    ))
+    m1: MirrorConfig = field(
+        default_factory=lambda: MirrorConfig(hole_radius=1.5, hole_offset_y=7.0)
+    )
+    m2: MirrorConfig = field(
+        default_factory=lambda: MirrorConfig(hole_radius=0.0, hole_offset_y=0.0)
+    )
 
     device: torch.device = DEVICE
     dtype: torch.dtype = DTYPE
@@ -90,12 +91,12 @@ class GaussianRenderer:
         self.gy = gy.reshape(-1)
 
         # Mirror aperture mask
-        r2 = self.gx ** 2 + self.gy ** 2
+        r2 = self.gx**2 + self.gy**2
         self.mirror_mask = (r2 <= (cfg.m1.diameter / 2.0) ** 2).float()
 
         # Hole mask (only for M1)
-        hole_r2 = self.gx ** 2 + (self.gy - cfg.m1.hole_offset_y) ** 2
-        self.hole_mask_m1 = (hole_r2 <= cfg.m1.hole_radius ** 2).float()
+        hole_r2 = self.gx**2 + (self.gy - cfg.m1.hole_offset_y) ** 2
+        self.hole_mask_m1 = (hole_r2 <= cfg.m1.hole_radius**2).float()
 
     def render(
         self,
@@ -122,7 +123,7 @@ class GaussianRenderer:
         dx = self.gx.unsqueeze(0).unsqueeze(0) - cx.unsqueeze(-1)
         dy = self.gy.unsqueeze(0).unsqueeze(0) - cy.unsqueeze(-1)
         r2 = dx * dx + dy * dy
-        gauss = torch.exp(-r2 / (2.0 * self.sigma ** 2))
+        gauss = torch.exp(-r2 / (2.0 * self.sigma**2))
 
         # Weighted sum over spots
         img = (gauss * I.unsqueeze(-1)).sum(dim=1)  # (B, HW)
@@ -182,9 +183,7 @@ class HerriottEnv:
         self.step_count = torch.zeros(self.B, dtype=torch.long, device=self.dev)
 
         # Action scaling
-        self.action_scale = torch.tensor(
-            c.action_scale, device=self.dev, dtype=self.dt
-        )
+        self.action_scale = torch.tensor(c.action_scale, device=self.dev, dtype=self.dt)
 
         # Pre-compute bounce metadata for sim output conversion
         N = c.sim.max_bounces
@@ -202,11 +201,14 @@ class HerriottEnv:
 
     def _build_sim_state(self) -> torch.Tensor:
         """Assemble (B, 5) state tensor for the sim."""
-        return torch.cat([
-            self.env_params[:, :2],   # m1_pitch, m1_yaw
-            self.m2_state,            # m2_pitch, m2_yaw
-            self.env_params[:, 2:],   # separation
-        ], dim=-1)
+        return torch.cat(
+            [
+                self.env_params[:, :2],  # m1_pitch, m1_yaw
+                self.m2_state,  # m2_pitch, m2_yaw
+                self.env_params[:, 2:],  # separation
+            ],
+            dim=-1,
+        )
 
     def _full_state(self) -> torch.Tensor:
         """Full 5D state for observation: [m1p, m1y, m2p, m2y, sep]."""
@@ -249,9 +251,7 @@ class HerriottEnv:
 
         return self._observe()
 
-    def reset(
-        self, env_ids: Optional[torch.Tensor] = None
-    ) -> Dict[str, torch.Tensor]:
+    def reset(self, env_ids: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """Random reset (for testing / standalone use)."""
         if env_ids is None:
             env_ids = torch.arange(self.B, device=self.dev)
@@ -262,9 +262,7 @@ class HerriottEnv:
         self.env_params[env_ids, 2] = torch.empty(
             n, device=self.dev, dtype=self.dt
         ).uniform_(100.0, 400.0)
-        self.m2_state[env_ids] = torch.randn(
-            n, 2, device=self.dev, dtype=self.dt
-        ) * 1.0
+        self.m2_state[env_ids] = torch.randn(n, 2, device=self.dev, dtype=self.dt) * 1.0
         self.step_count[env_ids] = 0
 
         return self._observe()
@@ -344,9 +342,7 @@ class HerriottEnv:
         # ── exited: beam reached hole (stopped early, not from decay) ─
         # If bounce count < max AND final intensity > threshold,
         # the ray likely hit the hole rather than missing the mirror
-        final_intensity = self._intensity_template[
-            raw["hit_counts"].clamp(min=1) - 1
-        ]
+        final_intensity = self._intensity_template[raw["hit_counts"].clamp(min=1) - 1]
         exited = (
             (raw["hit_counts"] > 0)
             & (raw["hit_counts"] < N)
@@ -396,7 +392,7 @@ class HerriottEnv:
         exited = result["exited"].float()
 
         r_bounces = bounces / self.cfg.sim.max_bounces
-        r_exit = exited * 1.0
+        r_exit = 0  # exited * 1.0
         r_penalty = (bounces < 4).float() * -0.5
 
         return r_bounces + r_exit + r_penalty

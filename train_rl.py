@@ -97,19 +97,21 @@ class CheckpointManager:
         path = self.ckpt_dir / f"ckpt_{iteration:07d}.pt"
         torch.save(state, path)
 
-        # Symlink to latest
-        latest = self.ckpt_dir / "latest.pt"
-        if latest.is_symlink() or latest.exists():
-            latest.unlink()
-        latest.symlink_to(path.name)
+        # Write latest pointer (Windows-compatible, no symlink)
+        pointer = self.ckpt_dir / "latest.txt"
+        pointer.write_text(path.name)
 
         return path
 
     def load_latest(self) -> Optional[dict]:
-        latest = self.ckpt_dir / "latest.pt"
-        if not latest.exists():
+        pointer = self.ckpt_dir / "latest.txt"
+        if not pointer.exists():
             return None
-        return torch.load(latest, map_location="cpu", weights_only=False)
+        ckpt_name = pointer.read_text().strip()
+        ckpt_path = self.ckpt_dir / ckpt_name
+        if not ckpt_path.exists():
+            return None
+        return torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     def list_checkpoints(self) -> list:
         return sorted(self.ckpt_dir.glob("ckpt_*.pt"))
@@ -488,9 +490,11 @@ if __name__ == "__main__":
     train(
         sampler_cfg=SimpleSamplerConfig(
             ranges=ConfigRange(
-                sep=(85.0, 85.1), 
-                m1_pitch=(-0.1, 0.1), 
-                m1_yaw=(-0.1, 0.1)
-                )
+                sep=(80.0, 100.1),
+                m1_pitch=(-0.1, 0.1),
+                m1_yaw=(-0.1, 0.1),
+                m2_pitch=(-5, 5),
+                m2_yaw=(-5, 5),
             )
         )
+    )

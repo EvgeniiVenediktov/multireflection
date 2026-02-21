@@ -1,7 +1,7 @@
 # Frame settings
-#X_TILT_START = -2
-X_TILT_START = 2.8
-X_TILT_STOP = 3.7
+X_TILT_START = -2
+# X_TILT_STOP = 3.7
+X_TILT_STOP = 2
 
 Y_TILT_START = -2
 Y_TILT_STOP = 2

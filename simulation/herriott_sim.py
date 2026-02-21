@@ -48,14 +48,14 @@ class HerriottSim:
 
     def __init__(
         self,
-        m1_config: MirrorConfig = None,
-        m2_config: MirrorConfig = None,
-        sim_config: SimConfig = None,
+        m1_cfg: MirrorConfig = None,
+        m2_cfg: MirrorConfig = None,
+        sim_cfg: SimConfig = None,
         mounted_laser: bool = True,
     ):
-        self.m1_cfg = m1_config or MirrorConfig(hole_radius=1.5)  # With hole
-        self.m2_cfg = m2_config or MirrorConfig(hole_radius=0)  # Solid
-        self.sim_cfg = sim_config or SimConfig()
+        self.m1_cfg = m1_cfg or MirrorConfig(hole_radius=1.5)  # With hole
+        self.m2_cfg = m2_cfg or MirrorConfig(hole_radius=0)  # Solid
+        self.sim_cfg = sim_cfg or SimConfig()
         self.mounted_laser = mounted_laser
         self.device = self.sim_cfg.device
         self.dtype = self.sim_cfg.dtype
@@ -378,9 +378,9 @@ def create_sim(mounted_laser: bool = True, device: str = None) -> HerriottSim:
     """Create simulator with default configs."""
     dev = torch.device(device) if device else DEVICE
     return HerriottSim(
-        m1_config=MirrorConfig(hole_radius=1.5, hole_offset_y=7.0),
-        m2_config=MirrorConfig(hole_radius=0),
-        sim_config=SimConfig(device=dev),
+        m1_cfg=MirrorConfig(hole_radius=1.5, hole_offset_y=7.0),
+        m2_cfg=MirrorConfig(hole_radius=0),
+        sim_cfg=SimConfig(device=dev),
         mounted_laser=mounted_laser,
     )
 
