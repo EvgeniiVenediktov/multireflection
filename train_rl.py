@@ -488,6 +488,12 @@ def train(
 
 if __name__ == "__main__":
     train(
+        cfg=TrainConfig(
+            num_envs=512,
+            max_steps=64,
+            total_iterations=25_000,
+            ent_coef=0.05,
+        ),
         sampler_cfg=SimpleSamplerConfig(
             ranges=ConfigRange(
                 sep=(80.0, 100.1),
@@ -496,5 +502,5 @@ if __name__ == "__main__":
                 m2_pitch=(-5, 5),
                 m2_yaw=(-5, 5),
             )
-        )
+        ),
     )
