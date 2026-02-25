@@ -56,7 +56,8 @@ class TrainConfig:
 
     # Checkpoints
     run_dir: str = "runs/herriott"
-    resume: bool = True  # Auto-resume from latest checkpoint if found
+    resume_last: bool = True
+    resume_best: bool = False
 
     # Logging
     use_wandb: bool = True
@@ -86,25 +87,49 @@ class CheckpointManager:
         self.ckpt_dir = self.run_dir / "checkpoints"
         self.ckpt_dir.mkdir(exist_ok=True)
 
-    def save(self, iteration: int, policy, optimizer, sampler, extra: dict = None):
+    def save(
+        self,
+        iteration: int,
+        policy,
+        optimizer,
+        sampler,
+        extra: dict = None,
+        best: bool = False,
+        ret: float = None,
+    ) -> Path:
         state = {
             "iteration": iteration,
             "policy_state_dict": policy.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "sampler_state_dict": sampler.state_dict(),
             "extra": extra or {},
+            "return": ret or None,
         }
-        path = self.ckpt_dir / f"ckpt_{iteration:07d}.pt"
+        path = self.ckpt_dir / f"ckpt_{iteration:07d}_{'best' if best else ''}.pt"
         torch.save(state, path)
 
         # Write latest pointer (Windows-compatible, no symlink)
         pointer = self.ckpt_dir / "latest.txt"
         pointer.write_text(path.name)
 
+        if best:
+            pointer = self.ckpt_dir / "best.txt"
+            pointer.write_text(path.name)
+
         return path
 
     def load_latest(self) -> Optional[dict]:
         pointer = self.ckpt_dir / "latest.txt"
+        if not pointer.exists():
+            return None
+        ckpt_name = pointer.read_text().strip()
+        ckpt_path = self.ckpt_dir / ckpt_name
+        if not ckpt_path.exists():
+            return None
+        return torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    def load_best(self) -> Optional[dict]:
+        pointer = self.ckpt_dir / "best.txt"
         if not pointer.exists():
             return None
         ckpt_name = pointer.read_text().strip()
@@ -288,15 +313,19 @@ def train(
     B = cfg.num_envs
     T = cfg.max_steps
     start_iter = 0
+    best_return = float("-inf")
 
     # ── Resume from checkpoint ────────────────────────────────────────
-    if cfg.resume:
-        ckpt = ckpt_mgr.load_latest()
+    if cfg.resume_last or cfg.resume_best:
+
+        ckpt = ckpt_mgr.load_latest() if cfg.resume_last else None
+        ckpt = ckpt_mgr.load_best() if cfg.resume_best else None
         if ckpt is not None:
             policy.load_state_dict(ckpt["policy_state_dict"])
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             sampler.load_state_dict(ckpt["sampler_state_dict"])
             start_iter = ckpt["iteration"] + 1
+            best_return = ckpt["return"] if ckpt["return"] is not None else best_return
             print(f"[RESUME] Loaded checkpoint at iteration {ckpt['iteration']}")
         else:
             print("[START] No checkpoint found, training from scratch")
@@ -462,12 +491,26 @@ def train(
             logger.log(log_data, step=iteration)
 
             print(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} | "
                 f"iter {iteration:6d} | "
                 f"ret {iter_return:7.2f} | "
                 f"pg {pg_loss:.4f} vf {vf_loss:.4f} ent {ent_loss:.4f} | "
                 f"fps {fps:.0f} | "
                 f"eps {len(completed_returns)}"
             )
+
+        if iter_return > best_return:
+            best_return = iter_return
+            ckpt_mgr.save(
+                iteration,
+                policy,
+                optimizer,
+                sampler,
+                extra={"iter_return": iter_return},
+                best=True,
+                ret=best_return,
+            )
+            print(f"[NEW BEST] {best_return:.2f} at iteration {iteration}")
 
         # 8. Checkpoint
         if iteration % cfg.save_interval == 0 and iteration > 0:
@@ -489,10 +532,12 @@ def train(
 if __name__ == "__main__":
     train(
         cfg=TrainConfig(
-            num_envs=512,
-            max_steps=64,
+            num_envs=256,
+            max_steps=16,
             total_iterations=25_000,
             ent_coef=0.05,
+            mini_batch_envs=256,
+            resume_last=False,
         ),
         sampler_cfg=SimpleSamplerConfig(
             ranges=ConfigRange(
