@@ -32,7 +32,9 @@ SPOT_SIGMA = 0.5
 
 
 class InteractiveHerriottCell:
-    def __init__(self, checkpoint_path: str = None):
+    def __init__(
+        self, checkpoint_path: str = None, obs_mirror="M2", policy_step_limit=16
+    ):
         self.sim = create_sim(mounted_laser=True)
 
         # ── Policy state ──────────────────────────────────────────────
@@ -42,7 +44,9 @@ class InteractiveHerriottCell:
         self.step_count = 0
         self.running = False
         self.timer = None
-
+        self.obs_mirror = obs_mirror
+        self.policy_step_limit = policy_step_limit
+        self.checkpoint_path = checkpoint_path
         if checkpoint_path:
             self._load_policy(checkpoint_path)
 
@@ -90,12 +94,12 @@ class InteractiveHerriottCell:
         X, Y = np.meshgrid(x, x)
         img = np.zeros((OBS_SIZE, OBS_SIZE), dtype=np.float32)
 
-        m1_hits = [
+        m_hits = [
             (h["point"][0], h["point"][1], 0.98 ** (i + 1))
             for i, h in enumerate(hits)
-            if h["mirror"] == "M1"
+            if h["mirror"] == self.obs_mirror
         ]
-        for px, py, intensity in m1_hits:
+        for px, py, intensity in m_hits:
             img += intensity * np.exp(
                 -((X - px) ** 2 + (Y - py) ** 2) / (2 * SPOT_SIGMA**2)
             )
@@ -149,6 +153,9 @@ class InteractiveHerriottCell:
         self.prev_action = action
         self.step_count += 1
 
+        if self.step_count == self.policy_step_limit:
+            self._on_run(None)  # stop if we hit the step limit
+
         # 6. Update info display
         self._update_info(action, log_prob, value)
 
@@ -182,7 +189,7 @@ class InteractiveHerriottCell:
                 return
             self.running = True
             self.btn_run.label.set_text("Stop")
-            self.timer = self.fig.canvas.new_timer(interval=200)  # ms between steps
+            self.timer = self.fig.canvas.new_timer(interval=500)  # ms between steps
             self.timer.add_callback(self._timer_step)
             self.timer.start()
         self.fig.canvas.draw_idle()
@@ -259,7 +266,7 @@ class InteractiveHerriottCell:
         self.ax2d_real = self.fig.add_subplot(143)
         self.ax_obs = self.fig.add_subplot(144)
 
-        plt.subplots_adjust(bottom=0.35, top=0.93, left=0.05, right=0.97)
+        plt.subplots_adjust(bottom=0.35, top=0.93, left=0.02, right=0.98, wspace=0.05)
 
         # ── Sliders ──────────────────────────────────────────────────
         ax_m1_pitch = plt.axes([0.10, 0.24, 0.25, 0.025])
@@ -272,7 +279,7 @@ class InteractiveHerriottCell:
         self.s_m1_yaw = Slider(ax_m1_yaw, "M1 Yaw", -5, 5, valinit=0)
         self.s_m2_pitch = Slider(ax_m2_pitch, "M2 Pitch", -5, 5, valinit=0)
         self.s_m2_yaw = Slider(ax_m2_yaw, "M2 Yaw", -5, 5, valinit=0)
-        self.s_sep = Slider(ax_sep, "Separation", 50, 400, valinit=200)
+        self.s_sep = Slider(ax_sep, "Separation", 50, 400, valinit=100)
 
         for s in [
             self.s_m1_pitch,
@@ -298,14 +305,22 @@ class InteractiveHerriottCell:
 
         # ── Checkpoint path text box ─────────────────────────────────
         ax_path = plt.axes([0.52, 0.06, 0.35, 0.04])
-        self.textbox = TextBox(ax_path, "Ckpt: ", initial="policy.pt")
+        self.textbox = TextBox(
+            ax_path,
+            "Ckpt: ",
+            initial=(self.checkpoint_path if self.checkpoint_path else ""),
+        )
         self.textbox.on_submit(self._on_load)
 
         # ── Info text ────────────────────────────────────────────────
         self.info_text = self.fig.text(
             0.50,
             0.01,
-            "No policy loaded. Enter checkpoint path and press Enter.",
+            (
+                "No policy loaded. Enter checkpoint path and press Enter."
+                if not self.checkpoint_path
+                else ""
+            ),
             ha="center",
             fontsize=9,
             family="monospace",
@@ -328,26 +343,28 @@ class InteractiveHerriottCell:
         X, Y = np.meshgrid(x, x)
 
         img = np.zeros((res, res), dtype=np.float32)
-        m1_hits = [
+        m_hits = [
             (h["point"][0], h["point"][1], 0.98 ** (i + 1))
             for i, h in enumerate(hits)
-            if h["mirror"] == "M1"
+            if h["mirror"] == self.obs_mirror
         ]
-        for px, py, intensity in m1_hits:
+        for px, py, intensity in m_hits:
             img += intensity * np.exp(
                 -((X - px) ** 2 + (Y - py) ** 2) / (2 * spot_sigma**2)
             )
 
         R2 = X**2 + Y**2
         mirror_mask = R2 <= (DIAMETER / 2) ** 2
-        hole_mask = X**2 + (Y - HOLE_OFFSET) ** 2 <= (HOLE_DIAMETER / 2) ** 2
 
         rgb = np.zeros((res, res, 3), dtype=np.float32)
         rgb[..., 0], rgb[..., 1], rgb[..., 2] = img, img * 0.2, img * 0.1
 
         bg = np.zeros((res, res, 3), dtype=np.float32)
         bg[mirror_mask] = [0.1, 0.10, 0.1]
-        bg[hole_mask] = 0
+
+        if self.obs_mirror == "M1":
+            hole_mask = X**2 + (Y - HOLE_OFFSET) ** 2 <= (HOLE_DIAMETER / 2) ** 2
+            bg[hole_mask] = 0
 
         ax.imshow(
             np.clip(bg + rgb * 2, 0, 1),
@@ -418,22 +435,30 @@ class InteractiveHerriottCell:
         self.ax3d.set_title(f"Bounces: {len(hits)}")
 
         # ── 2D schematic ─────────────────────────────────────────────
-        self.ax2d.add_patch(plt.Circle((0, 0), DIAMETER / 2, fill=False, color="blue"))
-        self.ax2d.add_patch(
-            plt.Circle((0, HOLE_OFFSET), HOLE_DIAMETER / 2, color="yellow", alpha=0.5)
-        )
+        self.ax2d.add_patch(plt.Circle((0, 0), DIAMETER / 2, fill=False, color="red"))
+
+        if self.obs_mirror == "M1":
+            self.ax2d.add_patch(
+                plt.Circle(
+                    (0, HOLE_OFFSET), HOLE_DIAMETER / 2, color="yellow", alpha=0.5
+                )
+            )
         for i, h in enumerate(hits):
-            if h["mirror"] == "M1":
-                self.ax2d.scatter(h["point"][0], h["point"][1], c="blue", s=30)
+            if h["mirror"] == self.obs_mirror:
+                self.ax2d.scatter(h["point"][0], h["point"][1], c="red", s=30)
                 self.ax2d.annotate(str(i + 1), h["point"][:2], fontsize=7)
         self.ax2d.set_xlim(-15, 15)
         self.ax2d.set_ylim(-15, 15)
+        self.ax2d.set_xticks([])
+        self.ax2d.set_yticks([])
         self.ax2d.set_aspect("equal")
-        self.ax2d.set_title("M1 Schematic")
+        self.ax2d.set_title(f"{self.obs_mirror} Schematic")
 
         # ── 2D realistic ─────────────────────────────────────────────
         self._render_gaussian_spots(self.ax2d_real, hits)
-        self.ax2d_real.set_title("M1 Realistic")
+        self.ax2d_real.set_title(f"{self.obs_mirror} Realistic")
+        self.ax2d_real.set_xticks([])
+        self.ax2d_real.set_yticks([])
 
         # ── Policy observation (what the agent sees) ──────────────────
         obs = self._render_obs(hits)
@@ -446,6 +471,8 @@ class InteractiveHerriottCell:
         )
         self.ax_obs.set_title(f"Policy Obs (64×64)  Step {self.step_count}")
         self.ax_obs.set_aspect("equal")
+        self.ax_obs.set_xticks([])
+        self.ax_obs.set_yticks([])
 
         self.fig.canvas.draw_idle()
 

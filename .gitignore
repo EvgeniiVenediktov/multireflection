@@ -180,3 +180,4 @@ wandb/*
 *_log.txt
 cnn_comparison.ipynb
 runs/
+*.npz
