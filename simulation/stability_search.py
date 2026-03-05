@@ -45,7 +45,7 @@ MIN_PATH_MM = 4100.0
 BATCH_SIZE = 180_000
 
 # Stage 1: coarse search
-SEP_RANGE = (102.0, 155.0, 1.0)  # (min, max, step) mm
+SEP_RANGE = (80.0, 100.0, 1.0)  # (min, max, step) mm
 LASER_ANGLE_RANGE = (-5.0, 5.0, 0.05)  # (min, max, step) deg
 
 # Stage 2: m2 compensator (actively controlled)
