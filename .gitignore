@@ -181,3 +181,5 @@ wandb/*
 cnn_comparison.ipynb
 runs/
 *.npz
+
+results/

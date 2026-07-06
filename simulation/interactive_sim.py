@@ -8,30 +8,20 @@ Key perf fixes vs original:
   3. Artist reuse: update line/scatter data in place instead of cla() + recreate
   4. Selective redraw: only blit the axes that actually changed
   5. Mirror wireframe cached and only rebuilt when geometry params change
-
-Added: batch M2 tilt optimizer (200k sweep) with results table
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, TextBox, Button
-from herriott_sim import create_sim, make_state, STATE_DIM, DEVICE, MirrorConfig
-import torch
+from matplotlib.widgets import Slider, TextBox
+from herriott_sim import create_sim, make_state, STATE_DIM, DEVICE
 import time
 
-mirror_cfg = MirrorConfig()
-
-DIAMETER = mirror_cfg.diameter
-HOLE_DIAMETER = mirror_cfg.hole_radius * 2
-HOLE_OFFSET = mirror_cfg.hole_offset_y
+DIAMETER = 24.4
+HOLE_DIAMETER = 3.2
+HOLE_OFFSET = 7.0
 
 # Throttle interval in seconds
 UPDATE_INTERVAL = 0.03
-
-# Batch search config
-BATCH_SIZE = 200_000
-PITCH_STEP = 0.01  # degrees
-YAW_STEP = 0.01
 
 
 class InteractiveHerriottCell:
@@ -44,31 +34,7 @@ class InteractiveHerriottCell:
         # Cache keys for mirror geometry
         self._cached_mirror_params = None
 
-        # Indices into state vector for m2_pitch / m2_yaw (probed once)
-        self._m2_pitch_idx = None
-        self._m2_yaw_idx = None
-        self._probe_state_indices()
-
         self.setup_plot()
-
-    # ------------------------------------------------------------------ #
-    # One-time probe to find which state-vector columns are m2 pitch/yaw
-    # ------------------------------------------------------------------ #
-    def _probe_state_indices(self):
-        kw = dict(
-            separation=100,
-            m2_tx=0,
-            m2_ty=0,
-            laser_dx=0,
-            laser_dy=0,
-            laser_pitch=0,
-            laser_yaw=0,
-        )
-        s0 = make_state(m2_pitch=0, m2_yaw=0, **kw)
-        s1 = make_state(m2_pitch=1, m2_yaw=0, **kw)
-        s2 = make_state(m2_pitch=0, m2_yaw=1, **kw)
-        self._m2_pitch_idx = (s1[0] != s0[0]).nonzero(as_tuple=True)[0][0].item()
-        self._m2_yaw_idx = (s2[0] != s0[0]).nonzero(as_tuple=True)[0][0].item()
 
     # ------------------------------------------------------------------ #
     # Slider / textbox creation (unchanged logic, wired to throttled update)
@@ -110,10 +76,14 @@ class InteractiveHerriottCell:
     # Throttled update
     # ------------------------------------------------------------------ #
     def _request_update(self):
+        """Throttle: skip if called faster than UPDATE_INTERVAL."""
         now = time.monotonic()
         if now - self._last_update_time < UPDATE_INTERVAL:
+            # Schedule a trailing-edge update so the final position is always drawn
             if not self._pending_update:
                 self._pending_update = True
+                self.fig.canvas.new_timer(interval=int(UPDATE_INTERVAL * 1000))
+                # Use a simple timer callback
                 timer = self.fig.canvas.new_timer(interval=int(UPDATE_INTERVAL * 1000))
                 timer.add_callback(self._flush_pending)
                 timer.single_shot = True
@@ -133,16 +103,14 @@ class InteractiveHerriottCell:
     # ------------------------------------------------------------------ #
     def setup_plot(self):
         self.fig = plt.figure(figsize=(18, 10))
-
-        # --- Main plots: 3D + 2D schematic + 2D realistic ---
         gs = self.fig.add_gridspec(
-            1, 4, bottom=0.42, hspace=0.3, wspace=0.25, left=0.02, right=0.98
+            1, 5, bottom=0.42, hspace=0.3, wspace=0.05, left=0.02, right=0.98
         )
-        self.ax3d = self.fig.add_subplot(gs[0, 0:2], projection="3d")
-        self.ax2d = self.fig.add_subplot(gs[0, 2])
-        self.ax2d_real = self.fig.add_subplot(gs[0, 3])
+        self.ax3d = self.fig.add_subplot(gs[0, 0:3], projection="3d")
+        self.ax2d = self.fig.add_subplot(gs[0, 3])
+        self.ax2d_real = self.fig.add_subplot(gs[0, 4])
 
-        # --- Slider layout ---
+        # --- Slider layout (same as original) ---
         row_h = 0.025
         row_gap = 0.007
         left_x, left_w = 0.08, 0.32
@@ -202,38 +170,35 @@ class InteractiveHerriottCell:
             ax_m2_ty, ax_m2_ty_tb, "M2 ΔY (mm)", -3, 3
         )
         self.s_ldx, _ = self._make_slider_with_textbox(
-            ax_ldx, ax_ldx_tb, "Laser ΔX (mm)", -25, 25
+            ax_ldx, ax_ldx_tb, "Laser ΔX (mm)", -1.5, 1.5
         )
         self.s_ldy, _ = self._make_slider_with_textbox(
-            ax_ldy, ax_ldy_tb, "Laser ΔY (mm)", -25, 25
+            ax_ldy, ax_ldy_tb, "Laser ΔY (mm)", -1.5, 1.5
         )
         self.s_lpitch, _ = self._make_slider_with_textbox(
             ax_lpitch, ax_lpitch_tb, "Laser Pitch (°)", -10, 10
         )
         self.s_lyaw, _ = self._make_slider_with_textbox(
-            ax_lyaw, ax_lyaw_tb, "Laser Yaw (°)", -15, 15
+            ax_lyaw, ax_lyaw_tb, "Laser Yaw (°)", -10, 10
         )
 
-        # --- "Find Best M2 Tilt" button ---
-        ax_btn = plt.axes([left_x, row_y(8), 0.14, 0.03])
-        self.btn_optimize = Button(
-            ax_btn, "Find Best M2 Tilt", color="lightgoldenrodyellow", hovercolor="gold"
-        )
-        self.btn_optimize.on_clicked(self._on_optimize_clicked)
-
-        # --- Persistent artists ---
+        # --- Persistent artists (created once, data updated in place) ---
         self._init_artists()
         self._do_update()
         plt.show()
 
     def _init_artists(self):
+        """Create all plot artists once. We update their data each frame."""
+        # 3D: mirror wireframes (lists of Line3D — rebuilt only on geometry change)
         self._mirror_lines = []
 
+        # 3D: beam path + scatter
         (self._beam_line,) = self.ax3d.plot([], [], [], "g-", lw=1.5, alpha=0.4)
         self._m1_scatter = self.ax3d.scatter([], [], [], c="blue", s=15)
         self._m2_scatter = self.ax3d.scatter([], [], [], c="red", s=15)
         self._laser_scatter = self.ax3d.scatter([], [], [], c="green", s=80, marker="^")
 
+        # 2D schematic
         self._m2_circle = plt.Circle((0, 0), DIAMETER / 2, fill=False, color="red")
         self.ax2d.add_patch(self._m2_circle)
         self._m2_scat2d = self.ax2d.scatter([], [], c="red", s=30)
@@ -242,6 +207,7 @@ class InteractiveHerriottCell:
         self.ax2d.set_ylim(-15, 15)
         self.ax2d.set_aspect("equal")
 
+        # 2D realistic: pre-allocate image
         self._spot_res = 256
         self._spot_extent = 15
         x = np.linspace(-self._spot_extent, self._spot_extent, self._spot_res)
@@ -268,99 +234,6 @@ class InteractiveHerriottCell:
         self.ax3d.set_xlabel("X")
         self.ax3d.set_ylabel("Y")
         self.ax3d.set_zlabel("Z")
-
-    # ------------------------------------------------------------------ #
-    # Batch M2 tilt optimizer
-    # ------------------------------------------------------------------ #
-    def _on_optimize_clicked(self, event):
-        self.btn_optimize.label.set_text("Searching…")
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
-
-        try:
-            self._run_batch_sweep()
-        finally:
-            self.btn_optimize.label.set_text("Find Best M2 Tilt")
-            self.fig.canvas.draw_idle()
-
-    def _run_batch_sweep(self):
-        pitches = np.arange(-5, 5 + PITCH_STEP / 2, PITCH_STEP, dtype=np.float32)
-        yaws = np.arange(-5, 5 + YAW_STEP / 2, YAW_STEP, dtype=np.float32)
-        pp, yy = np.meshgrid(pitches, yaws)
-        pp = pp.ravel()
-        yy = yy.ravel()
-        N = len(pp)
-
-        base = make_state(
-            m2_pitch=0,
-            m2_yaw=0,
-            separation=self.s_sep.val,
-            m2_tx=self.s_m2_tx.val,
-            m2_ty=self.s_m2_ty.val,
-            laser_dx=self.s_ldx.val,
-            laser_dy=self.s_ldy.val,
-            laser_pitch=self.s_lpitch.val,
-            laser_yaw=self.s_lyaw.val,
-        )
-
-        all_counts = np.empty(N, dtype=np.int64)
-
-        n_batches = (N + BATCH_SIZE - 1) // BATCH_SIZE
-        print(
-            f"Sweeping {N:,} configs ({len(pitches)}×{len(yaws)} grid, "
-            f"step={PITCH_STEP}°×{YAW_STEP}°) in {n_batches} batches …"
-        )
-
-        for start in range(0, N, BATCH_SIZE):
-            end = min(start + BATCH_SIZE, N)
-            chunk_n = end - start
-
-            batch = base.repeat(chunk_n, 1)
-            batch[:, self._m2_pitch_idx] = torch.tensor(
-                pp[start:end], dtype=batch.dtype, device=batch.device
-            )
-            batch[:, self._m2_yaw_idx] = torch.tensor(
-                yy[start:end], dtype=batch.dtype, device=batch.device
-            )
-
-            with torch.no_grad():
-                result = self.sim.simulate(batch)
-
-            all_counts[start:end] = result["hit_counts"].cpu().numpy().ravel()[:chunk_n]
-            print(f"  batch {start // BATCH_SIZE + 1}/{n_batches} done")
-
-        # ---- Print results to terminal ----
-        best_idx = int(all_counts.argmax())
-        best_pitch = float(pp[best_idx])
-        best_yaw = float(yy[best_idx])
-        best_count = int(all_counts[best_idx])
-
-        unique_counts = np.unique(all_counts)[::-1]
-
-        print()
-        print(
-            f"Best: {best_count} bounces @ pitch={best_pitch:+.3f}° yaw={best_yaw:+.3f}°"
-        )
-        print(f"Swept {N:,} configs  ({len(pitches)}×{len(yaws)} grid)")
-        print()
-        print("Bounces │  Pitch range (°)     │  Yaw range (°)       │  Count")
-        print("────────┼──────────────────────┼──────────────────────┼────────")
-        for c in unique_counts[:15]:
-            mask = all_counts == c
-            p_min, p_max = pp[mask].min(), pp[mask].max()
-            y_min, y_max = yy[mask].min(), yy[mask].max()
-            n_hits = int(mask.sum())
-            print(
-                f"  {c:4d}  │ [{p_min:+6.3f}, {p_max:+6.3f}] │ [{y_min:+6.3f}, {y_max:+6.3f}] │ {n_hits:6d}"
-            )
-        print()
-
-        # Apply best values to sliders
-        self._updating = True
-        self.s_m2_pitch.set_val(best_pitch)
-        self.s_m2_yaw.set_val(best_yaw)
-        self._updating = False
-        self._do_update()
 
     # ------------------------------------------------------------------ #
     # Core update
@@ -394,7 +267,7 @@ class InteractiveHerriottCell:
         ]
 
     # ------------------------------------------------------------------ #
-    # Artist updates
+    # Artist updates (no cla!)
     # ------------------------------------------------------------------ #
     def _rotation_matrix(self, pitch, yaw):
         px, py = np.radians(pitch), np.radians(yaw)
@@ -415,6 +288,7 @@ class InteractiveHerriottCell:
         return R @ hole_local + m1_pos
 
     def _mirror_params_key(self):
+        """Tuple of values that affect mirror wireframe geometry."""
         return (
             self.s_sep.val,
             self.s_m2_pitch.val,
@@ -424,6 +298,7 @@ class InteractiveHerriottCell:
         )
 
     def _rebuild_mirror_wireframes(self):
+        """Remove old mirror lines and draw new ones. Only called when geometry changes."""
         for ln in self._mirror_lines:
             ln.remove()
         self._mirror_lines = []
@@ -461,6 +336,7 @@ class InteractiveHerriottCell:
             (ln,) = self.ax3d.plot(w[0], w[1], w[2], color=c, lw=2)
             self._mirror_lines.append(ln)
 
+        # Hole on M1
         hole = np.stack(
             [
                 HOLE_DIAMETER / 2 * np.cos(u),
@@ -469,18 +345,20 @@ class InteractiveHerriottCell:
             ],
             axis=1,
         )
-        hw = hole.T
+        hw = hole.T  # M1 at identity
         (ln,) = self.ax3d.plot(hw[0], hw[1], hw[2], "yellow", lw=2)
         self._mirror_lines.append(ln)
 
     def _update_artists(self, hits, state):
         sep = self.s_sep.val
 
+        # --- Conditionally rebuild mirror wireframes ---
         key = self._mirror_params_key()
         if key != self._cached_mirror_params:
             self._cached_mirror_params = key
             self._rebuild_mirror_wireframes()
 
+        # --- 3D beam path (update data in place) ---
         lp = self._get_laser_pos(state)
         if hits:
             path = np.array([lp] + [h["point"] for h in hits])
@@ -504,12 +382,14 @@ class InteractiveHerriottCell:
 
         self._laser_scatter._offsets3d = ([lp[0]], [lp[1]], [lp[2]])
 
+        # Adjust 3D axis limits to contain geometry
         pad = DIAMETER / 2 + 2
         self.ax3d.set_xlim(-pad, pad)
         self.ax3d.set_ylim(-pad, pad)
         self.ax3d.set_zlim(-10, sep + 10)
         self.ax3d.set_title(f"Bounces: {len(hits)}")
 
+        # --- 2D schematic (update scatter data, not cla) ---
         self._m2_circle.center = (self.s_m2_tx.val, self.s_m2_ty.val)
         m2_hits_2d = [(i, h) for i, h in enumerate(hits) if h["mirror"] == "M2"]
         if m2_hits_2d:
@@ -518,6 +398,7 @@ class InteractiveHerriottCell:
         else:
             self._m2_scat2d.set_offsets(np.empty((0, 2)))
 
+        # Annotations: remove old, add new
         for ann in self._m2_annotations:
             ann.remove()
         self._m2_annotations = []
@@ -526,10 +407,12 @@ class InteractiveHerriottCell:
             self._m2_annotations.append(ann)
         self.ax2d.set_title("M2 Schematic")
 
+        # --- 2D realistic spots (vectorized) ---
         self._update_spots_vectorized(hits)
         self.ax2d_real.set_title("M2 Realistic")
 
     def _update_spots_vectorized(self, hits, spot_sigma=0.5):
+        """Render all Gaussian spots in one vectorized pass — no Python loop."""
         X, Y = self._spot_X, self._spot_Y
         res = self._spot_res
 
@@ -542,9 +425,12 @@ class InteractiveHerriottCell:
         img = np.zeros((res, res), dtype=np.float32)
 
         if m2_data:
-            arr = np.array(m2_data, dtype=np.float32)
-            px, py, intensity = arr[:, 0], arr[:, 1], arr[:, 2]
+            arr = np.array(m2_data, dtype=np.float32)  # (N, 3)
+            px = arr[:, 0]  # (N,)
+            py = arr[:, 1]
+            intensity = arr[:, 2]
 
+            # Broadcast: (N, 1, 1) vs (1, res, res) -> (N, res, res)
             dx = X[np.newaxis, :, :] - px[:, np.newaxis, np.newaxis]
             dy = Y[np.newaxis, :, :] - py[:, np.newaxis, np.newaxis]
             inv2s2 = -1.0 / (2.0 * spot_sigma * spot_sigma)

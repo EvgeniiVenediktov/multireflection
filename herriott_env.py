@@ -166,7 +166,7 @@ class HerriottEnv:
             m1_cfg=c.m1,
             m2_cfg=c.m2,
             sim_cfg=c.sim,
-            mounted_laser=True,
+            # mounted_laser=True,
         )
         self.renderer = GaussianRenderer(c)
 

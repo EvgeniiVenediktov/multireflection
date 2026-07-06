@@ -13,6 +13,10 @@ STAGE 1 — Find peak configurations & laser angle tolerance
             - pitch/yaw tolerance ranges from that contiguous region
     Save: results/stage1.json, results/stage1_maps.npz
 
+    --symmetrical: exploits yaw symmetry around 0 to halve the
+    laser-yaw search space.  Only yaw >= 0 is simulated; results
+    are mirrored so all outputs keep their original shape.
+
 STAGE 2 — Mechanical stability with M2 pitch/yaw compensation
     For each winning laser position from Stage 1:
         Build 5D disturbance grid (all offsets from nominal):
@@ -41,18 +45,18 @@ from herriott_sim import create_sim, make_state, STATE_DIM, DEVICE, DTYPE
 # ================================================================
 
 OUTPUT_DIR = "results"
-MIN_PATH_MM = 4100.0
+MIN_PATH_MM = 4000.0
 BATCH_SIZE = 180_000
 
 # Stage 1: coarse search
-SEP_RANGE = (80.0, 100.0, 1.0)  # (min, max, step) mm
-LASER_ANGLE_RANGE = (-5.0, 5.0, 0.05)  # (min, max, step) deg
+SEP_RANGE = (189, 191.0, 0.25)  # (min, max, step) mm
+LASER_ANGLE_RANGE = (-10.0, 10.0, 0.05)  # (min, max, step) deg
 
 # Stage 2: m2 compensator (actively controlled)
 M2_COMP_RANGE = (-3.0, 3.0, 0.2)  # (min, max, step) deg
 
 # Stage 2: mechanical disturbance grids (offsets from nominal)
-SEP_ERR_RANGE = (-5.0, 5.0, 0.5)  # mm
+SEP_ERR_RANGE = (-3.0, 3.0, 0.5)  # mm
 LDX_RANGE = (-0.5, 0.5, 0.25)  # mm
 LDY_RANGE = (-0.5, 0.5, 0.25)  # mm
 M2TX_RANGE = (-0.5, 0.5, 0.25)  # mm
@@ -80,6 +84,15 @@ def batched_sim(sim, states):
             for i in range(0, N, BATCH_SIZE)
         ]
     )
+
+
+def mirror_yaw(half):
+    """Mirror a (n_p, n_y_half) array to full (n_p, n_y).
+
+    half[:, 0] is yaw=0.  The negative-yaw columns are filled by
+    flipping the positive side: full = [half[:, N-1..1], half[:, 0..N-1]].
+    """
+    return np.concatenate([half[:, :0:-1], half], axis=1)
 
 
 def flood_fill_nd(grid, center):
@@ -159,14 +172,29 @@ class Stage1Result:
     centroid: Tuple[float, float]
 
 
-def run_stage1(sim) -> List[Stage1Result]:
+def run_stage1(sim, *, symmetrical=False) -> List[Stage1Result]:
     seps = grid1d(*SEP_RANGE)
     pitches = grid1d(*LASER_ANGLE_RANGE)
-    yaws = grid1d(*LASER_ANGLE_RANGE)
-    pg, yg = torch.meshgrid(pitches, yaws, indexing="ij")
+    yaws_full = grid1d(*LASER_ANGLE_RANGE)
+    n_p = len(pitches)
+    n_y = len(yaws_full)
+
+    # --- yaw grid actually simulated (halved when --symmetrical) ---
+    if symmetrical:
+        yaws_sim = yaws_full[yaws_full >= 0]
+        print("  [symmetrical] simulating yaw >= 0 only "
+              f"({len(yaws_sim)}/{n_y} yaw values)")
+    else:
+        yaws_sim = yaws_full
+    n_y_sim = len(yaws_sim)
+
+    pg, yg = torch.meshgrid(pitches, yaws_sim, indexing="ij")
     p_flat, y_flat = pg.reshape(-1), yg.reshape(-1)
-    n_p, n_y = len(pitches), len(yaws)
     N_angles = len(p_flat)
+
+    # Full-grid flat coords (for extracting winning positions after mirroring)
+    pg_full, yg_full = torch.meshgrid(pitches, yaws_full, indexing="ij")
+    p_flat_full, y_flat_full = pg_full.reshape(-1), yg_full.reshape(-1)
 
     # M2 compensator grid (same as Stage 2)
     cp_1d = grid1d(*M2_COMP_RANGE)
@@ -177,8 +205,10 @@ def run_stage1(sim) -> List[Stage1Result]:
 
     N_total = len(seps) * N_angles * N_comp
     print(
-        f"  Grid: {len(seps)} seps x {n_p} pitches x {n_y} yaws x {N_comp} comp "
-        f"= {N_total:,} total sims\n"
+        f"  Grid: {len(seps)} seps x {n_p} pitches x {n_y_sim} yaws x {N_comp} comp "
+        f"= {N_total:,} total sims"
+        + (f" (mirrored to {n_y} yaws)" if symmetrical else "")
+        + "\n"
     )
 
     # -- Run all sims in one flat loop --
@@ -216,19 +246,22 @@ def run_stage1(sim) -> List[Stage1Result]:
     # Save maps and build results
     maps_to_save = {}
     maps_to_save["pitches"] = pitches.cpu().numpy()
-    maps_to_save["yaws"] = yaws.cpu().numpy()
+    maps_to_save["yaws"] = yaws_full.cpu().numpy()
 
     results = []
     for si, sep in enumerate(seps):
         sf = sep.item()
         threshold = int(np.ceil(MIN_PATH_MM / sf))
 
-        # Compensated bounce map
-        bounce_map = best_per_angle[si].cpu().numpy().reshape(n_p, n_y)
-        maps_to_save[f"bounces_comp_sep{sf:.0f}"] = bounce_map.astype(np.int16)
+        # Compensated bounce map — (n_p, n_y_sim), then mirror if needed
+        bounce_map_sim = best_per_angle[si].cpu().numpy().reshape(n_p, n_y_sim)
+        bounce_map = mirror_yaw(bounce_map_sim) if symmetrical else bounce_map_sim
 
         # Uncompensated bounce map
-        uncomp_map = uncomp[si].cpu().numpy().reshape(n_p, n_y)
+        uncomp_map_sim = uncomp[si].cpu().numpy().reshape(n_p, n_y_sim)
+        uncomp_map = mirror_yaw(uncomp_map_sim) if symmetrical else uncomp_map_sim
+
+        maps_to_save[f"bounces_comp_sep{sf:.0f}"] = bounce_map.astype(np.int16)
         maps_to_save[f"bounces_uncomp_sep{sf:.0f}"] = uncomp_map.astype(np.int16)
 
         mb = int(bounce_map.max())
@@ -238,9 +271,9 @@ def run_stage1(sim) -> List[Stage1Result]:
             tqdm.write(f"    sep={sf:.0f}mm: nothing above threshold ({threshold})")
             continue
 
-        # Winning positions (from compensated map)
+        # Winning positions (from full-grid coords)
         mask = torch.from_numpy(above.reshape(-1))
-        wp = list(zip(p_flat[mask].cpu().tolist(), y_flat[mask].cpu().tolist()))
+        wp = list(zip(p_flat_full[mask].cpu().tolist(), y_flat_full[mask].cpu().tolist()))
 
         # Contiguous region
         ri, ci = np.where(above)
@@ -255,7 +288,7 @@ def run_stage1(sim) -> List[Stage1Result]:
         maps_to_save[f"contiguous_sep{sf:.0f}"] = contiguous
 
         pitch_np = pitches.cpu().numpy()
-        yaw_np = yaws.cpu().numpy()
+        yaw_np = yaws_full.cpu().numpy()
         cont_rows = contiguous.any(axis=1)
         cont_cols = contiguous.any(axis=0)
         cp_range = (float(pitch_np[cont_rows].min()), float(pitch_np[cont_rows].max()))
@@ -515,6 +548,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage2", action="store_true", help="Run Stage 2 only (needs stage1.json)"
     )
+    parser.add_argument(
+        "--symmetrical",
+        action="store_true",
+        help="Exploit yaw symmetry around 0 to halve Stage 1 search space",
+    )
     args = parser.parse_args()
 
     # Default: run both
@@ -532,7 +570,7 @@ if __name__ == "__main__":
         print("=" * 60)
         print("STAGE 1: Peak finding + laser angle tolerance")
         print("=" * 60)
-        s1 = run_stage1(sim)
+        s1 = run_stage1(sim, symmetrical=args.symmetrical)
         t1 = time.perf_counter()
         print(f"\n  Done in {t1 - t0:.1f}s, {len(s1)} viable separations\n")
         save_json(s1, s1_path)

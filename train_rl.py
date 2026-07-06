@@ -541,7 +541,7 @@ if __name__ == "__main__":
         ),
         sampler_cfg=SimpleSamplerConfig(
             ranges=ConfigRange(
-                sep=(80.0, 100.1),
+                sep=(93, 94),
                 m1_pitch=(-0.1, 0.1),
                 m1_yaw=(-0.1, 0.1),
                 m2_pitch=(-5, 5),

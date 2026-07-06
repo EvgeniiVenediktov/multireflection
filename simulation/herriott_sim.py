@@ -52,14 +52,17 @@ STATE_DIM = 13
 class MirrorConfig:
     """Static mirror configuration."""
 
-    roc: float = 200.0  # Radius of curvature (mm)
+    roc: float = 150.0  # Radius of curvature (mm)
+    # roc: float = 200.0  # Radius of curvature (mm)
     diameter: float = (
-        24.4  # Mirror diameter (mm), FIXME: 24.4 instead of actual 25.4 for sim2real
+        24.4  # Mirror diameter (mm), FIXME: for sim2real 24.4 instead of usual 25.4
+        # 25.4
     )
     hole_radius: float = (
-        1.6  # Hole radius (mm), FIXME: 1.6 instead of actual 1.5 for sim2real
+        1.8  # Hole radius (mm), FIXME: for sim2real 1.8 instead of actual 1.5
+        # 1.5
     )
-    hole_offset_y: float = 7.0  # Hole Y offset (mm)
+    hole_offset_y: float = 7.0  # Hole Y offset (mm).
     reflectivity: float = 0.98
 
 
@@ -67,7 +70,8 @@ class MirrorConfig:
 class SimConfig:
     """Simulation parameters."""
 
-    max_bounces: int = 50
+    max_bounces: int = 100  # FIXME: for simulation
+    # max_bounces: int = 50  # FIXME: for training
     intensity_threshold: float = 1e-4
     device: torch.device = DEVICE
     dtype: torch.dtype = DTYPE
@@ -175,11 +179,10 @@ class HerriottSim:
         directions: torch.Tensor,
         centers: torch.Tensor,
         radius: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Batched ray-sphere intersection.
-        origins: (B, 3), directions: (B, 3), centers: (B, 3)
-        Returns: t (B,), valid (B,)
+        Batched ray-sphere intersection — returns BOTH roots.
+        Returns: t_near (B,), valid_near (B,), t_far (B,), valid_far (B,)
         """
         oc = origins - centers
         a = (directions * directions).sum(dim=-1)
@@ -194,11 +197,12 @@ class HerriottSim:
         t2 = (-b + sqrt_disc) / (2 * a + 1e-10)
 
         inf = torch.tensor(float("inf"), device=self.device)
-        t1 = torch.where((t1 > 1e-5) & valid, t1, inf)
-        t2 = torch.where((t2 > 1e-5) & valid, t2, inf)
-        t = torch.minimum(t1, t2)
+        v1 = (t1 > 1e-5) & valid
+        v2 = (t2 > 1e-5) & valid
+        t_near = torch.where(v1, t1, inf)
+        t_far = torch.where(v2, t2, inf)
 
-        return t, t < inf
+        return t_near, v1, t_far, v2
 
     def _check_aperture(
         self,
@@ -322,20 +326,23 @@ class HerriottSim:
             if not active.any():
                 break
 
-            # Intersect both mirrors
-            t1, v1 = self._ray_sphere_intersect(
+            # Intersect both mirrors (get BOTH roots per sphere)
+            t1_near, v1_near, t1_far, v1_far = self._ray_sphere_intersect(
                 origins, directions, m1_center, self.m1_cfg.roc
             )
-            t2, v2 = self._ray_sphere_intersect(
+            t2_near, v2_near, t2_far, v2_far = self._ray_sphere_intersect(
                 origins, directions, m2_center, self.m2_cfg.roc
             )
 
-            hit1 = origins + t1.unsqueeze(-1) * directions
-            hit2 = origins + t2.unsqueeze(-1) * directions
+            # Compute hit points for all four candidates
+            hit1_near = origins + t1_near.unsqueeze(-1) * directions
+            hit1_far = origins + t1_far.unsqueeze(-1) * directions
+            hit2_near = origins + t2_near.unsqueeze(-1) * directions
+            hit2_far = origins + t2_far.unsqueeze(-1) * directions
 
-            # Aperture checks
-            v1 = v1 & self._check_aperture(
-                hit1,
+            # Aperture check each candidate
+            v1_near = v1_near & self._check_aperture(
+                hit1_near,
                 m1_pos,
                 m1_R,
                 m1_normal,
@@ -344,8 +351,26 @@ class HerriottSim:
                 self.m1_cfg.hole_radius,
                 self.m1_hole_offset,
             )
-            v2 = v2 & self._check_aperture(
-                hit2,
+            v1_far = v1_far & self._check_aperture(
+                hit1_far,
+                m1_pos,
+                m1_R,
+                m1_normal,
+                self.m1_aperture,
+                self.m1_sag,
+                self.m1_cfg.hole_radius,
+                self.m1_hole_offset,
+            )
+            v2_near = v2_near & self._check_aperture(
+                hit2_near,
+                m2_pos,
+                m2_R,
+                m2_normal,
+                self.m2_aperture,
+                self.m2_sag,
+            )
+            v2_far = v2_far & self._check_aperture(
+                hit2_far,
                 m2_pos,
                 m2_R,
                 m2_normal,
@@ -353,12 +378,25 @@ class HerriottSim:
                 self.m2_sag,
             )
 
+            # For each mirror, pick the closer valid hit (prefer near, fallback far)
+            inf = torch.tensor(float("inf"), device=self.device)
+            t1_near = torch.where(v1_near, t1_near, inf)
+            t1_far = torch.where(v1_far, t1_far, inf)
+            t1 = torch.minimum(t1_near, t1_far)
+            v1 = t1 < inf
+            hit1 = torch.where((t1 == t1_near).unsqueeze(-1), hit1_near, hit1_far)
+
+            t2_near = torch.where(v2_near, t2_near, inf)
+            t2_far = torch.where(v2_far, t2_far, inf)
+            t2 = torch.minimum(t2_near, t2_far)
+            v2 = t2 < inf
+            hit2 = torch.where((t2 == t2_near).unsqueeze(-1), hit2_near, hit2_far)
+
             # Don't hit the same mirror twice in a row
             v1 = v1 & (last_hit_mirror != 1)
             v2 = v2 & (last_hit_mirror != 2)
 
-            # Pick closer valid hit
-            inf = torch.tensor(float("inf"), device=self.device)
+            # Pick closer valid hit across mirrors
             t1 = torch.where(v1, t1, inf)
             t2 = torch.where(v2, t2, inf)
 
@@ -475,7 +513,7 @@ def create_sim(device: str = None) -> HerriottSim:
     """Create simulator with default configs."""
     dev = torch.device(device) if device else DEVICE
     return HerriottSim(
-        m1_cfg=MirrorConfig(hole_radius=1.5, hole_offset_y=7.0),
+        m1_cfg=MirrorConfig(),
         m2_cfg=MirrorConfig(hole_radius=0),
         sim_cfg=SimConfig(device=dev),
     )
