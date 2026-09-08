@@ -1,0 +1,158 @@
+\documentclass[]{spie}  %>>> use for US letter paper
+%\documentclass[a4paper]{spie}  %>>> use this instead for A4 paper
+
+\renewcommand{\baselinestretch}{1.0} % Change to 1.65 for double spacing
+
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage[colorlinks=true, allcolors=blue]{hyperref}
+
+\graphicspath{{figures/}}
+
+\title{Deep learning for in situ automatic alignment of Herriott cells}
+
+\author{Evgenii Venediktov}
+\author{Shuda Zhong}
+\author{Guangyin Zhang}
+\author{Emeka Ikpeazu}
+\affil{Department of Electrical and Computer Engineering, University of Pittsburgh, Pittsburgh, PA 15213, USA}
+
+\authorinfo{Further author information: (Send correspondence to E.V.)\\E.V.: E-mail: e.i.venediktov@gmail.com}
+
+\pagestyle{empty} % no page numbers, per SPIE guidelines
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Herriott cells fold a long optical path into a compact volume, making them attractive for trace-gas detection; however, their multipass geometry is highly sensitive to mirror misalignment. Conventional systems protect alignment with heavy, expensive optomechanical assemblies and periodic manual tuning, which raises sensor cost and limits field deployment. We present a deep-learning method for autonomous in situ alignment of a Herriott cell using low-cost stepper motors and camera feedback on a Raspberry~Pi~4: a ResNet-18 network infers angular corrections for a motorized mirror mount directly from the cavity's reflection pattern. Trained on 228{,}000 labeled images spanning the actuation range, the closed-loop system recovered optimal alignment from every position in its actuation range, converging in fewer than two correction steps on average with a mean residual error of $0.045^\circ$. The approach provides a practical path toward low-cost, field-deployable multipass gas sensors that recover from thermal and mechanical disturbances without human intervention.
+\end{abstract}
+
+\keywords{Automatic alignment, computer vision, gas sensors, Herriott cell, machine learning, multipass, optics, real-time systems}
+
+\section{INTRODUCTION}
+\label{sec:intro}
+
+Fiber-optic and free-space optical sensors are increasingly deployed in industrial and energy systems.\cite{zhang2025fbgdemodulation,ZHANG2026114908} Among them, tunable diode laser absorption spectroscopy (TDLAS) is a powerful method for industrial gas monitoring, offering exceptional sensitivity and selectivity.\cite{enhancementofmethanedetection,hydrogen} To maximize this sensitivity, TDLAS systems often employ multipass Herriott cells, which fold a long optical path into a compact volume,\cite{multipasscell,ultra-high-sensitive-multipass} but their effectiveness depends critically on mirror alignment: angular deviations as small as a few milliradians can significantly degrade system performance.
+
+This sensitivity to misalignment is a significant barrier to widespread industrial adoption. To minimize the risk, optical elements are typically mounted on high-precision kinematic mounts attached to rigid metal frameworks.\cite{yoder} While effective, this approach increases weight and cost, forcing compromises between performance and robustness. Each optical element has at least two rotational degrees of freedom, so maintaining alignment under thermal stress and vibration is challenging, and the task is traditionally handled manually by experienced personnel. Automated correction with sensor feedback and optimization algorithms is possible, but the high dimensionality of the problem, compounded by environmental variation, makes it complex even for seasoned optical engineers.\cite{RAKHMATULIN2024107923}
+
+Machine learning has recently been applied to such problems, with a strong trend toward vision-based neural networks that interpret camera data directly. Deep learning has been used to diagnose misalignment in multi-lens imaging systems,\cite{slor2025deeplearningopticalmisalignment} reinforcement learning to align camera lens systems,\cite{burkhardt2025activealignmentslenssystems} and a CNN--genetic-algorithm approach to align a Fabry--P\'{e}rot cavity.\cite{qin2025automated} These methods target different components and do not generalize to Herriott cells, whose automated alignment remains a notable gap in the literature. This paper closes that gap with an imaging-based deep neural network that provides real-time feedback for closed-loop, in situ alignment of a Herriott cell; the cell, with its high sensitivity to misalignment, is an ideal and challenging testbed for autonomous optical systems intended for remote and industrial applications.
+
+\section{EXPERIMENTAL SYSTEM}
+\label{sec:system}
+
+In the Herriott cell under study, two gold-plated semitransparent (98\% reflectivity) concave mirrors with 100~mm focal length (Thorlabs CM254-100-M02 and CM254-100EH3-M02) face each other at a separation of 85~mm, aligned at a paraxial angle to extend the optical path. At optimal alignment the cavity produces a ring pattern of 16 reflections on the output mirror, which a high-resolution camera observes from outside the cavity.
+
+The complete alignment setup (Figure~\ref{fig:system-photo}) comprises the cavity, two stepper motors, a fixed gradient-index (GRIN) lens launching the input beam, the camera, and a Raspberry~Pi~4 serving as the central control unit. The single-board computer manages both image acquisition and motor actuation, and was selected for its suitability as a low-cost edge computing device in an industrial Internet of Things context. The GRIN lens remains fixed while one mirror is carried by a two-axis kinematic mount (Thorlabs KC1-L), allowing independent rotational control about the X and Y axes. The stepper motors are mechanically coupled to the fine-adjustment screws of the mount through rigid shafts, enabling bidirectional rotation without displacing the motors and preserving compactness and mechanical stability. Model predictions, expressed as angular deviations in degrees, are translated into discrete motor steps based on the mechanical characteristics of the mount and motor assembly, achieving an effective angular resolution of $0.01^\circ$.
+
+\begin{figure}[ht]
+    \centering
+    \begin{minipage}[b]{0.55\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{system_topdown_view.jpg}
+    \end{minipage}\hfill
+    \begin{minipage}[b]{0.42\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{sysphoto_cut.jpg}
+    \end{minipage}
+    \caption{Experimental system for Herriott cell automatic alignment: top-down view (left) and side view (right).}
+    \label{fig:system-photo}
+\end{figure}
+
+\section{DATA COLLECTION AND PROCESSING}
+\label{sec:data}
+
+Experimental data was collected by actuating the mirror frame over $[-2^\circ, +3.7^\circ]$ on the X axis and $[-2^\circ, +2^\circ]$ on the Y axis. The X range was limited to $+3.7^\circ$ because larger misalignments cause the beam to exit the cavity after a single reflection, yielding uninformative images; the model nevertheless generalizes up to $+4.0^\circ$ during evaluation. The minimum adjustment increment of $0.01^\circ$ on both axes is set by the mechanical precision of the stepper motors and linkage. A complete scan of this actuation space produced 228{,}000 image samples, each paired with the precise mirror orientation as its label. At optimal alignment the experimental cavity reproduces the expected 16-reflection ring pattern, while increasing misalignment skews and finally scatters the spot geometry (Figure~\ref{fig:raw-input}).
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.21\textwidth]{raw_optimal.png}\hspace{0.012\textwidth}%
+    \includegraphics[width=0.21\textwidth]{raw_suboptimal.png}\hspace{0.012\textwidth}%
+    \includegraphics[width=0.21\textwidth]{raw_misaligned.png}\\[2pt]
+    \includegraphics[width=0.21\textwidth]{input_aligned.jpg}\hspace{0.012\textwidth}%
+    \includegraphics[width=0.21\textwidth]{input_skewed.jpg}\hspace{0.012\textwidth}%
+    \includegraphics[width=0.21\textwidth]{input_scattered.jpg}
+    \caption{Camera views at optimal (left), suboptimal (center), and misaligned (right) mirror positions: raw images (top) and the corresponding preprocessed model inputs (bottom).}
+    \label{fig:raw-input}
+\end{figure}
+
+RGB images are captured at a native resolution of $2592 \times 1944$ pixels, centrally cropped to $1944 \times 1944$, and resized to $512 \times 512$ with bilinear interpolation. During inference, the resized image $I_{\text{rs}}$ is converted to grayscale using a luminance-weighted sum of the color channels:
+\begin{equation}
+I = 0.29 \cdot I_{\text{rs}}(R) + 0.58 \cdot I_{\text{rs}}(G) + 0.11 \cdot I_{\text{rs}}(B).
+\end{equation}
+During training, augmentation transformations (brightness, contrast, saturation, and hue jitter, plus Gaussian noise) are applied in RGB space \emph{before} grayscale conversion, so the model observes a wide range of color and lighting variation during learning and relies on the geometry of the spot pattern rather than pixel-level cues.\cite{shorten2019survey} Finally, a circular binary mask $M(x, y) \in \{0, 1\}$ zeroes all pixels outside the lens region:
+\begin{equation}
+I_{\text{masked}}(x, y) = I(x, y) \cdot M(x, y).
+\end{equation}
+Figure~\ref{fig:raw-input} (bottom row) shows preprocessed examples corresponding to the raw views above them.
+
+\section{MODEL ARCHITECTURE AND TRAINING}
+\label{sec:model}
+
+In misaligned configurations the laser reflections exhibit highly scattered geometries that render classical computer vision techniques such as the Hough transform\cite{duda1972use} or blob detection\cite{lindeberg1998feature} ineffective. The preprocessed input consists of sparse, high-contrast spots against a uniform background, where the critical information lies in the global spatial relationships between spot positions; convolutional networks capture such patterns through sufficient depth, with residual connections enabling effective training of deep architectures.\cite{he2016deep} The regression model is therefore based on a ResNet-18 backbone whose final classification layer is replaced by a regression head of 512 fully connected neurons predicting the alignment correction vector $\hat{\theta} = [\theta_x, \theta_y]$, trained end-to-end on our dataset.
+
+The 228{,}000 samples were partitioned into training and validation subsets (80/20 split), with the augmentations of Section~\ref{sec:data} applied at train time. The training objective is the mean squared error
+\begin{equation}
+\mathcal{L}_{\text{MSE}} = \frac{1}{N} \sum_{i=1}^{N} \|\hat{\theta}_i - \theta_i\|_2^2,
+\end{equation}
+where $\hat{\theta}_i, \theta_i \in \mathbb{R}^2$ are the predicted and ground-truth adjustment vectors for the $i$-th sample. Optimization used AdamW\cite{loshchilov2019decoupledweightdecayregularization} with $L_2$ weight decay and a cosine-annealing learning-rate schedule with warm restarts.\cite{loshchilov2017sgdrstochasticgradientdescent}
+
+\section{AUTOMATIC ALIGNMENT}
+\label{sec:alignment}
+
+Alignment operates in a closed loop using camera feedback and stepper motor control (Algorithm~\ref{alg:alignment}). A captured image is preprocessed as in Section~\ref{sec:data} and compared with a reference image $I_{\text{ref}}$ of the aligned state using the structural similarity index (SSIM),\cite{1284395} which quantifies perceptual similarity based on luminance, contrast, and structure:
+\begin{equation}
+\text{SSIM}(x, y) = \frac{(2\mu_x \mu_y + C_1)(2\sigma_{xy} + C_2)}
+{(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)},
+\end{equation}
+where $\mu$, $\sigma^2$, and $\sigma_{xy}$ are patch means, variances, and covariance, and $C_1$, $C_2$ are small stabilizing constants. If SSIM exceeds a threshold $\tau$, alignment is declared successful; otherwise the network infers a correction $\Delta\theta$, which is translated into motor steps, and the loop repeats for at most $N$ iterations before reverting to the initial state as a safe fallback. Empirically, an SSIM of $\tau = 0.97$ corresponds to a physical alignment error below $\pm 0.07^\circ$, a tolerance that ensures stable operation of the cell in our application; runs failing to converge within six adjustments never reached the optimum, motivating the choice of $N$.
+
+\begin{algorithm}[ht]
+\caption{Automatic Alignment}
+\label{alg:alignment}
+\begin{algorithmic}[1]
+    \STATE $alignment\_successful \gets \text{False}$
+    \FOR{$i = 1$ \TO $N$}
+        \STATE $I \gets \text{Capture image from camera}$
+        \STATE $I_{\text{proc}} \gets \text{Preprocess}(I)$
+        \IF{$\text{SSIM}(I_{\text{proc}}, I_{\text{ref}}) > \tau$}
+            \STATE $alignment\_successful \gets \text{True}$
+            \STATE \textbf{break}
+        \ENDIF
+        \STATE $\Delta \theta \gets \mathcal{F}(I_{\text{proc}})$
+        \STATE Send motor control signal based on $\Delta \theta$
+    \ENDFOR
+    \IF{\textbf{not} $alignment\_successful$}
+        \STATE Return system to the origin
+    \ENDIF
+\end{algorithmic}
+\end{algorithm}
+
+In deployment, thermal stress, vibration, and mechanical drift perturb alignment by displacing the kinematic-mounted mirror in pitch and yaw. To evaluate recovery from such disturbances, we emulate their effect with controlled angular displacements: a grid of origins covering the full range of motion of both axes at $0.5^\circ$ spacing, from sub-degree offsets representative of thermal drift up to several-degree offsets representative of mechanical shock. For every grid point the mirror is driven to that origin, the alignment procedure is executed, and the number of adjustments is recorded; because the loop uses images captured between adjustments, it also restores alignment once a transient disturbance subsides.
+
+\section{RESULTS AND DISCUSSION}
+\label{sec:results}
+
+Averaged over five complete evaluation runs, the system recovered the aligned state from every starting position, in $1.80 \pm 0.79$ correction steps ($3.07 \pm 1.58$~s) on average, with a final SSIM of $0.977 \pm 0.007$ and a final error of $0.045^\circ \pm 0.021^\circ$. Figure~\ref{fig:evaluation} maps the mean number of corrections against the induced misalignment: recovery takes fewer than two steps on average across the entire operational range. The deployed model contains $1.1\times10^7$ parameters, occupies 83~MiB of memory, and completes one inference in 1.16~s on the Raspberry~Pi~4. Performance is sensitive to input resolution: reducing the input from $512 \times 512$ to $256 \times 256$ increased mean angular error by a factor of 12, indicating that sufficient spatial detail is necessary to distinguish mirror positions separated by as little as $0.02^\circ$.
+
+Compared with related machine-learning alignment systems, our approach is distinguished by its single-shot regression formulation. Qin et al.\cite{qin2025automated} align a Fabry--P\'{e}rot cavity with a CNN classifier and a genetic algorithm, reaching roughly 90\% mode-matching efficiency over about ten optimization generations; Burkhardt et al.\cite{burkhardt2025activealignmentslenssystems} learn lens-alignment policies by reinforcement learning in a manufacturing setting; and Slor et al.\cite{slor2025deeplearningopticalmisalignment} diagnose multi-lens misalignment offline with $0.5^\circ$ rotational accuracy. In contrast, our pre-trained regression model completes alignment in fewer than two steps on average, requires no iterative optimization or online learning, and runs on resource-constrained hardware suitable for field-deployed gas sensors.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.60\textwidth]{resnet18_eval.png}
+    \caption{Automatic alignment evaluation. The axes give the X and Y origin (induced misalignment) of the mirror frame; color encodes the mean number of adjustments needed to reach the optimum.}
+    \label{fig:evaluation}
+\end{figure}
+
+\section{CONCLUSION}
+\label{sec:conclusion}
+
+A lightweight vision-based neural network is an effective tool for autonomous alignment of multipass Herriott cells. By inferring alignment corrections directly from the cavity's reflection pattern, the system achieves complete recovery across its operational range in fewer than two correction steps on average while remaining deployable on a Raspberry~Pi~4. This compact implementation enables in situ recalibration against thermal and mechanical disturbances and unattended operation of field-deployed multipass gas sensors where manual adjustment is impractical.
+
+\bibliography{refs}
+\bibliographystyle{spiebib}
+
+\end{document}

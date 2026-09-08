@@ -1,3 +1,6 @@
 [submodule "mf_control"]
 	path = mf_control
 	url = https://github.com/EvgeniiVenediktov/mf_control.git
+[submodule "paper"]
+	path = paper
+	url = https://github.com/EvgeniiVenediktov/Multireflection-IEEE-ACCESS-Revised.git
