@@ -1,0 +1,92 @@
+\begin{thebibliography}{10}
+
+\bibitem{zhang2025fbgdemodulation}
+Zhang, G., Zhao, K., Wen, H., Wang, Q., Wu, Z., Zhong, S., Ma, G., Venediktov,
+  E., and Chen, K.~P., ``Cost-effective {FBG} demodulation for high-temperature
+  and dynamic strain via modified {Levenberg}--{Marquardt},'' {\em IEEE Sens.
+  J.}~{\bf 25}(10),  17011--17017 (2025).
+
+\bibitem{ZHANG2026114908}
+Zhang, G., Zhao, K., Zhong, S., Ma, G., Dominguez-Ontiveros, E., Rubenstein,
+  M., Venediktov, E., Wang, Q., Wu, Z., and Chen, K., ``Long-term thermal
+  stability and calibration of {Type-II} fiber {Bragg} grating array inscribed
+  in radiation-hardened fibers,'' {\em Opt. Laser Technol.}~{\bf 198},  114908
+  (2026).
+
+\bibitem{enhancementofmethanedetection}
+Chen, S., Tian, X., Mu, T., Yuan, J., Cao, X., and Cheng, G., ``Enhancement of
+  methane detection in tunable diode laser absorption spectroscopy using
+  {Savitzky}--{Golay} filtering,'' {\em Photonics}~{\bf 12}(1),  2 (2025).
+
+\bibitem{hydrogen}
+Avetisov, V., Bjoroey, O., Wang, J., Geiser, P., and Paulsen, K.~G., ``Hydrogen
+  sensor based on tunable diode laser absorption spectroscopy,'' {\em
+  Sensors}~{\bf 19}(23),  5313 (2019).
+
+\bibitem{multipasscell}
+Chen, H., Chen, C., Wang, Y., Piao, H., and Wang, P., ``Optical design and
+  verification of multipass cell with two spherical mirrors using space
+  equation method,'' {\em IEEE Trans. Instrum. Meas.}~{\bf 70},  1--8 (2021).
+
+\bibitem{ultra-high-sensitive-multipass}
+Zhao, X., Chen, K., Guo, M., Li, C., Li, C., Zhang, G., Gong, Z., Zhou, Z., and
+  Peng, W., ``Ultra-high sensitive multipass absorption enhanced fiber-optic
+  photoacoustic gas analyzer,'' {\em IEEE Trans. Instrum. Meas.}~{\bf 72},
+  1--8 (2023).
+
+\bibitem{yoder}
+Yoder, P.,  [{\em Mounting Optics in Optical
+  Instruments}{\nolinebreak\hspace{0.1em}]}, Online access with subscription:
+  SPIE Digital Library, SPIE (2008).
+
+\bibitem{RAKHMATULIN2024107923}
+Rakhmatulin, I., Risbridger, D., Carter, R.~M., Esser, M.~D., and Erden, M.~S.,
+  ``A review of automation of laser optics alignment with a focus on machine
+  learning applications,'' {\em Opt. Lasers Eng.}~{\bf 173},  107923 (2024).
+
+\bibitem{slor2025deeplearningopticalmisalignment}
+Slor, T., Oren, D., Baneth, S., Coen, T., and Suchowski, H., ``Deep learning
+  for optical misalignment diagnostics in multi-lens imaging systems,'' (2025).
+\newblock arXiv:2506.23173.
+
+\bibitem{burkhardt2025activealignmentslenssystems}
+Burkhardt, M., Schm{\"a}hling, T., Layh, M., and Windisch, T., ``Active
+  alignments of lens systems with reinforcement learning,'' (2025).
+
+\bibitem{qin2025automated}
+Qin, J., Kinder, K., Jadhav, S., Chugh, P., and Slagmolen, B. J.~J.,
+  ``Automated alignment of an optical cavity using machine learning,'' {\em
+  Classical and Quantum Gravity}~{\bf 42},  045003 (2025).
+
+\bibitem{shorten2019survey}
+Shorten, C. and Khoshgoftaar, T.~M., ``A survey on image data augmentation for
+  deep learning,'' {\em Journal of Big Data}~{\bf 6}(1),  1--48 (2019).
+
+\bibitem{duda1972use}
+Duda, R.~O. and Hart, P.~E., ``Use of the hough transformation to detect lines
+  and curves in pictures,'' {\em Communications of the ACM}~{\bf 15}(1),
+  11--15 (1972).
+
+\bibitem{lindeberg1998feature}
+Lindeberg, T., ``Feature detection with automatic scale selection,'' {\em
+  International journal of computer vision}~{\bf 30}(2),  79--116 (1998).
+
+\bibitem{he2016deep}
+He, K., Zhang, X., Ren, S., and Sun, J., ``Deep residual learning for image
+  recognition,'' in [{\em IEEE CVPR}{\nolinebreak\hspace{0.1em}]},   770--778
+  (2016).
+
+\bibitem{loshchilov2019decoupledweightdecayregularization}
+Loshchilov, I. and Hutter, F., ``Decoupled weight decay regularization,''
+  (2019).
+
+\bibitem{loshchilov2017sgdrstochasticgradientdescent}
+Loshchilov, I. and Hutter, F., ``{SGDR}: Stochastic gradient descent with warm
+  restarts,'' (2017).
+
+\bibitem{1284395}
+Wang, Z., Bovik, A., Sheikh, H., and Simoncelli, E., ``Image quality
+  assessment: from error visibility to structural similarity,'' {\em IEEE
+  Trans. Image Process.}~{\bf 13}(4),  600--612 (2004).
+
+\end{thebibliography}

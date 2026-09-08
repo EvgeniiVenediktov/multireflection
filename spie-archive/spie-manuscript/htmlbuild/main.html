@@ -1,0 +1,383 @@
+<!DOCTYPE html> 
+<html lang='en-US' xml:lang='en-US'> 
+<head><title>Deep learning for in situ automatic alignment of Herriott cells</title> 
+<meta charset='utf-8' /> 
+<meta content='TeX4ht (https://tug.org/tex4ht/)' name='generator' /> 
+<meta content='width=device-width,initial-scale=1' name='viewport' /> 
+<link href='main.css' rel='stylesheet' type='text/css' /> 
+<meta content='main.tex' name='src' /> 
+</head><body>
+   <div class='maketitle'>                                                                                          
+                                                                                             
+                                                                                             
+                                                                                             
+
+<h1 class='titleHead'>Deep learning for in situ automatic alignment of Herriott
+cells</h1>
+<h1 class='titleHead'>Deep learning for in situ automatic alignment of Herriott
+cells</h1>
+<div class='author'><span class='cmr-12'>Evgenii Venediktov, Shuda Zhong, Guangyin Zhang, and Emeka Ikpeazu</span><br /><br />
+<span class='cmr-12'>Department of Electrical and Computer Engineering, University of Pittsburgh, Pittsburgh, PA
+15213, USA</span></div>
+<div class='date'></div>
+   </div>
+   <section class='abstract' role='doc-abstract'> 
+
+   <h3 class='likesectionHead' id='abstract'> <a id='x1-1000'></a>ABSTRACT</h3>
+<!-- l. 30 --><p class='noindent'>Herriott cells fold a long optical path into a compact volume, making them attractive for trace-gas detection; however,
+their multipass geometry is highly sensitive to mirror misalignment. Conventional systems protect alignment with heavy,
+expensive optomechanical assemblies and periodic manual tuning, which raises sensor cost and limits field deployment.
+We present a deep-learning method for autonomous in situ alignment of a Herriott cell using low-cost stepper
+motors and camera feedback on a Raspberry Pi 4: a ResNet-18 network infers angular corrections for a
+motorized mirror mount directly from the cavity’s reflection pattern. Trained on 228,000 labeled images
+spanning the actuation range, the closed-loop system recovered optimal alignment from every position in its
+actuation range, converging in fewer than two correction steps on average with a mean residual error of
+<!-- l. 30 --><math display='inline'><mrow><mn>0.04</mn><msup><mrow><mn>5</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math>. The
+approach provides a practical path toward low-cost, field-deployable multipass gas sensors that recover from thermal and
+mechanical disturbances without human intervention. </p></section>
+<!-- l. 33 --><p class='noindent'><span class='cmbx-10'>Keywords: </span>Automatic alignment, computer vision, gas sensors, Herriott cell, machine learning, multipass, optics,
+real-time systems
+   
+<span class='cmbx-12'>1.</span>
+</p>
+   <h3 class='sectionHead' id='introduction'><span class='titlemark'>1   </span>   <a id='x1-20001'></a>INTRODUCTION</h3>
+<!-- l. 38 --><p class='noindent'>Fiber-optic and free-space optical sensors are increasingly deployed in industrial and energy
+systems.<!-- l. 38 --><math display='inline'><mrow><mn>1</mn><mi>,</mi><mn>2</mn></mrow></math> Among
+them, tunable diode laser absorption spectroscopy (TDLAS) is a powerful method for industrial gas monitoring, offering exceptional
+sensitivity and selectivity.<!-- l. 38 --><math display='inline'><mrow><mn>3</mn><mi>,</mi><mn>4</mn></mrow></math>
+To maximize this sensitivity, TDLAS systems often employ multipass Herriott cells, which fold a long optical path into a compact
+volume,<!-- l. 38 --><math display='inline'><mrow><mn>5</mn><mi>,</mi><mn>6</mn></mrow></math>
+but their effectiveness depends critically on mirror alignment: angular deviations as small as a few milliradians can
+significantly degrade system performance.
+                                                                                             
+                                                                                             
+</p><!-- l. 40 --><p class='indent'>   This sensitivity to misalignment is a significant barrier to widespread industrial adoption. To minimize the
+risk, optical elements are typically mounted on high-precision kinematic mounts attached to rigid metal
+frameworks.<!-- l. 40 --><math display='inline'><mn>7</mn></math>
+While effective, this approach increases weight and cost, forcing compromises between performance and
+robustness. Each optical element has at least two rotational degrees of freedom, so maintaining alignment under
+thermal stress and vibration is challenging, and the task is traditionally handled manually by experienced
+personnel. Automated correction with sensor feedback and optimization algorithms is possible, but the high
+dimensionality of the problem, compounded by environmental variation, makes it complex even for seasoned optical
+engineers.<!-- l. 40 --><math display='inline'><mn>8</mn></math>
+</p><!-- l. 42 --><p class='indent'>   Machine learning has recently been applied to such problems, with a strong trend toward vision-based neural networks
+that interpret camera data directly. Deep learning has been used to diagnose misalignment in multi-lens imaging
+systems,<!-- l. 42 --><math display='inline'><mn>9</mn></math> reinforcement learning
+to align camera lens systems,<!-- l. 42 --><math display='inline'><mrow><mn>10</mn></mrow></math>
+and a CNN–genetic-algorithm approach to align a Fabry–Pérot
+cavity.<!-- l. 42 --><math display='inline'><mrow><mn>11</mn></mrow></math>
+These methods target different components and do not generalize to Herriott cells, whose automated alignment remains
+a notable gap in the literature. This paper closes that gap with an imaging-based deep neural network that provides
+real-time feedback for closed-loop, in situ alignment of a Herriott cell; the cell, with its high sensitivity to misalignment,
+is an ideal and challenging testbed for autonomous optical systems intended for remote and industrial
+applications.
+   
+<span class='cmbx-12'>2.</span>
+</p>
+   <h3 class='sectionHead' id='experimental-system'><span class='titlemark'>2   </span>   <a id='x1-30002'></a>EXPERIMENTAL SYSTEM</h3>
+<!-- l. 47 --><p class='noindent'>In the Herriott cell under study, two gold-plated semitransparent (98% reflectivity) concave mirrors with 100 mm focal
+length (Thorlabs CM254-100-M02 and CM254-100EH3-M02) face each other at a separation of 85 mm,
+aligned at a paraxial angle to extend the optical path. At optimal alignment the cavity produces a ring
+pattern of 16 reflections on the output mirror, which a high-resolution camera observes from outside the
+cavity.
+</p><!-- l. 49 --><p class='indent'>   The complete alignment setup (Figure <a href='#experimental-system-for-herriott-cell-automatic-alignment-topdown-view-left-and-side-view-right'>1<!-- tex4ht:ref: fig:system-photo  --></a>) comprises the cavity, two stepper motors, a fixed gradient-index (GRIN)
+lens launching the input beam, the camera, and a Raspberry Pi 4 serving as the central control unit. The single-board
+computer manages both image acquisition and motor actuation, and was selected for its suitability as a low-cost edge
+computing device in an industrial Internet of Things context. The GRIN lens remains fixed while one mirror is carried by
+a two-axis kinematic mount (Thorlabs KC1-L), allowing independent rotational control about the X and Y axes. The
+stepper motors are mechanically coupled to the fine-adjustment screws of the mount through rigid shafts, enabling
+bidirectional rotation without displacing the motors and preserving compactness and mechanical stability. Model
+predictions, expressed as angular deviations in degrees, are translated into discrete motor steps based on the
+mechanical characteristics of the mount and motor assembly, achieving an effective angular resolution of
+<!-- l. 49 --><math display='inline'><mrow><mn>0.0</mn><msup><mrow><mn>1</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math>.
+</p>
+   <figure class='figure' id='x1-3001r1'><span id='experimental-system-for-herriott-cell-automatic-alignment-topdown-view-left-and-side-view-right'></span> 
+
+                                                                                             
+                                                                                             
+
+                                                                                             
+                                                                                             
+<div class='minipage'><!-- l. 55 --><p class='noindent'><img alt='PIC' height='268' src='figures/system_topdown_view.jpg' width='268' />                                                </p></div>   <div class='minipage'><img alt='PIC' height='204' src='figures/sysphoto_cut.jpg' width='204' />                                                        </div>
+<figcaption class='caption'><span class='id'>Figure 1: </span><span class='content'>Experimental system for Herriott cell automatic alignment: top-down view (left) and side view (right).</span></figcaption><!-- tex4ht:label?: x1-3001r1  -->
+                                                                                             
+                                                                                             
+   </figure>
+   
+<p><span class='cmbx-12'>3.</span>
+   </p><h3 class='sectionHead' id='data-collection-and-processing'><span class='titlemark'>3   </span>   <a id='x1-40003'></a>DATA COLLECTION AND PROCESSING</h3>
+<!-- l. 68 --><p class='noindent'>Experimental data was collected by actuating the mirror frame over
+<!-- l. 68 --><math display='inline'><mrow><mo class='MathClass-open' stretchy='false'>[</mo><mo class='MathClass-bin' stretchy='false'>−</mo><msup><mrow><mn>2</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup><mo class='MathClass-punc' stretchy='false'>,</mo><mo class='MathClass-bin' stretchy='false'>+</mo><mn>3</mn><mo class='MathClass-punc' stretchy='false'>.</mo><msup><mrow><mn>7</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup><mo class='MathClass-close' stretchy='false'>]</mo></mrow></math> on the X axis and
+<!-- l. 68 --><math display='inline'><mrow><mo class='MathClass-open' stretchy='false'>[</mo><mo class='MathClass-bin' stretchy='false'>−</mo><msup><mrow><mn>2</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup><mo class='MathClass-punc' stretchy='false'>,</mo><mo class='MathClass-bin' stretchy='false'>+</mo><msup><mrow><mn>2</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup><mo class='MathClass-close' stretchy='false'>]</mo></mrow></math> on the Y axis. The X
+range was limited to <!-- l. 68 --><math display='inline'><mrow> <mo class='MathClass-bin' stretchy='false'>+</mo> <mn>3</mn><mo class='MathClass-punc' stretchy='false'>.</mo><msup><mrow><mn>7</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math>
+because larger misalignments cause the beam to exit the cavity after a single
+reflection, yielding uninformative images; the model nevertheless generalizes up to
+<!-- l. 68 --><math display='inline'><mrow> <mo class='MathClass-bin' stretchy='false'>+</mo> <mn>4</mn><mo class='MathClass-punc' stretchy='false'>.</mo><msup><mrow><mn>0</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math> during evaluation. The minimum
+adjustment increment of <!-- l. 68 --><math display='inline'><mrow><mn>0.0</mn><msup><mrow><mn>1</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math>
+on both axes is set by the mechanical precision of the stepper motors and linkage. A complete scan of this actuation
+space produced 228,000 image samples, each paired with the precise mirror orientation as its label. At optimal alignment
+the experimental cavity reproduces the expected 16-reflection ring pattern, while increasing misalignment skews and
+finally scatters the spot geometry (Figure <a href='#camera-views-at-optimal-left-suboptimal-center-and-misaligned-right-mirror-positions-raw-images-top-and-the-corresponding-preprocessed-model-inputs-bottom'>2<!-- tex4ht:ref: fig:raw-input  --></a>).
+</p>
+   <figure class='figure' id='x1-4001r2'><span id='camera-views-at-optimal-left-suboptimal-center-and-misaligned-right-mirror-positions-raw-images-top-and-the-corresponding-preprocessed-model-inputs-bottom'></span> 
+
+                                                                                             
+                                                                                             
+
+                                                                                             
+                                                                                             
+<!-- l. 72 --><p class='noindent'><img alt='PIC' height='102' src='figures/raw_optimal.png' width='102' />  <img alt='PIC' height='102' src='figures/raw_suboptimal.png' width='102' />  <img alt='PIC' height='102' src='figures/raw_misaligned.png' width='102' /><br />
+<img alt='PIC' height='102' src='figures/input_aligned.jpg' width='102' />  <img alt='PIC' height='102' src='figures/input_skewed.jpg' width='102' />  <img alt='PIC' height='102' src='figures/input_scattered.jpg' width='102' />
+</p>
+<figcaption class='caption'><span class='id'>Figure 2: </span><span class='content'>Camera views at optimal (left), suboptimal (center), and misaligned (right) mirror positions: raw
+images (top) and the corresponding preprocessed model inputs (bottom).</span></figcaption><!-- tex4ht:label?: x1-4001r2  -->
+                                                                                             
+                                                                                             
+   </figure>
+<!-- l. 82 --><p class='indent'>   RGB images are captured at a native resolution of <!-- l. 82 --><math display='inline'><mrow><mn>2592</mn> <mo class='MathClass-bin' stretchy='false'>×</mo> <mn>1944</mn></mrow></math>
+pixels, centrally cropped to <!-- l. 82 --><math display='inline'><mrow><mn>1944</mn> <mo class='MathClass-bin' stretchy='false'>×</mo> <mn>1944</mn></mrow></math>, and
+resized to <!-- l. 82 --><math display='inline'><mrow><mn>512</mn> <mo class='MathClass-bin' stretchy='false'>×</mo> <mn>512</mn></mrow></math> with bilinear interpolation.
+During inference, the resized image <!-- l. 82 --><math display='inline'><msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>rs</mtext></mstyle></mrow></msub></math>
+is converted to grayscale using a luminance-weighted sum of the color channels: </p><table class='equation'><tr><td>
+<!-- l. 83 --><math class='equation' display='block'><mrow>
+                           <mstyle class='label' id='x1-4002r1'></mstyle><!-- endlabel --><mi>I</mi> <mo class='MathClass-rel' stretchy='false'>=</mo> <mn>0.29</mn> <mo class='MathClass-bin' stretchy='false'>⋅</mo> <msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>rs</mtext></mstyle></mrow></msub><mo class='MathClass-open' stretchy='false'>(</mo><mi>R</mi><mo class='MathClass-close' stretchy='false'>)</mo> <mo class='MathClass-bin' stretchy='false'>+</mo> <mn>0.58</mn> <mo class='MathClass-bin' stretchy='false'>⋅</mo> <msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>rs</mtext></mstyle></mrow></msub><mo class='MathClass-open' stretchy='false'>(</mo><mi>G</mi><mo class='MathClass-close' stretchy='false'>)</mo> <mo class='MathClass-bin' stretchy='false'>+</mo> <mn>0.11</mn> <mo class='MathClass-bin' stretchy='false'>⋅</mo> <msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>rs</mtext></mstyle></mrow></msub><mo class='MathClass-open' stretchy='false'>(</mo><mi>B</mi><mo class='MathClass-close' stretchy='false'>)</mo><mo class='MathClass-punc' stretchy='false'>.</mo>
+</mrow></math></td><td class='eq-no'>(1)</td></tr></table>
+<!-- l. 85 --><p class='noindent'>During training, augmentation transformations (brightness, contrast, saturation, and hue jitter, plus Gaussian noise)
+are applied in RGB space <span class='cmti-10'>before </span>grayscale conversion, so the model observes a wide range of color and
+lighting variation during learning and relies on the geometry of the spot pattern rather than pixel-level
+cues.<!-- l. 86 --><math display='inline'><mrow><mn>12</mn></mrow></math> Finally, a
+circular binary mask <!-- l. 86 --><math display='inline'><mrow><mi>M</mi><mo class='MathClass-open' stretchy='false'>(</mo><mi>x</mi><mo class='MathClass-punc' stretchy='false'>,</mo><mi>y</mi><mo class='MathClass-close' stretchy='false'>)</mo> <mo class='MathClass-rel' stretchy='false'>∈</mo><mo class='MathClass-open' stretchy='false'>{</mo><mn>0</mn><mo class='MathClass-punc' stretchy='false'>,</mo><mn>1</mn><mo class='MathClass-close' stretchy='false'>}</mo></mrow></math>
+zeroes all pixels outside the lens region: </p><table class='equation'><tr><td>
+<!-- l. 87 --><math class='equation' display='block'><mrow>
+                                <mstyle class='label' id='x1-4003r2'></mstyle><!-- endlabel --><msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>masked</mtext></mstyle></mrow></msub><mo class='MathClass-open' stretchy='false'>(</mo><mi>x</mi><mo class='MathClass-punc' stretchy='false'>,</mo><mi>y</mi><mo class='MathClass-close' stretchy='false'>)</mo> <mo class='MathClass-rel' stretchy='false'>=</mo> <mi>I</mi><mo class='MathClass-open' stretchy='false'>(</mo><mi>x</mi><mo class='MathClass-punc' stretchy='false'>,</mo><mi>y</mi><mo class='MathClass-close' stretchy='false'>)</mo> <mo class='MathClass-bin' stretchy='false'>⋅</mo> <mi>M</mi><mo class='MathClass-open' stretchy='false'>(</mo><mi>x</mi><mo class='MathClass-punc' stretchy='false'>,</mo><mi>y</mi><mo class='MathClass-close' stretchy='false'>)</mo><mo class='MathClass-punc' stretchy='false'>.</mo>
+</mrow></math></td><td class='eq-no'>(2)</td></tr></table>
+<!-- l. 89 --><p class='noindent'>Figure <a href='#camera-views-at-optimal-left-suboptimal-center-and-misaligned-right-mirror-positions-raw-images-top-and-the-corresponding-preprocessed-model-inputs-bottom'>2<!-- tex4ht:ref: fig:raw-input  --></a> (bottom row) shows preprocessed examples corresponding to the raw views above them.
+   
+<span class='cmbx-12'>4.</span>
+</p>
+   <h3 class='sectionHead' id='model-architecture-and-training'><span class='titlemark'>4   </span>   <a id='x1-50004'></a>MODEL ARCHITECTURE AND TRAINING</h3>
+<!-- l. 95 --><p class='noindent'>In misaligned configurations the laser reflections exhibit highly scattered geometries that render classical computer vision techniques such
+as the Hough transform<!-- l. 95 --><math display='inline'><mrow><mn>13</mn></mrow></math>
+or blob detection<!-- l. 95 --><math display='inline'><mrow><mn>14</mn></mrow></math>
+ineffective. The preprocessed input consists of sparse, high-contrast spots against a uniform background, where the
+critical information lies in the global spatial relationships between spot positions; convolutional networks
+capture such patterns through sufficient depth, with residual connections enabling effective training of deep
+architectures.<!-- l. 95 --><math display='inline'><mrow><mn>15</mn></mrow></math>
+The regression model is therefore based on a ResNet-18 backbone whose final classification layer is
+replaced by a regression head of 512 fully connected neurons predicting the alignment correction vector
+                                                                                             
+                                                                                             
+<!-- l. 95 --><math display='inline'><mrow><mover accent='true'><mrow><mi>𝜃</mi></mrow><mo accent='true'>^</mo></mover> <mo class='MathClass-rel' stretchy='false'>=</mo> <mo class='MathClass-open' stretchy='false'>[</mo><msub><mrow><mi>𝜃</mi></mrow><mrow><mi>x</mi></mrow></msub><mo class='MathClass-punc' stretchy='false'>,</mo><msub><mrow><mi>𝜃</mi></mrow><mrow><mi>y</mi></mrow></msub><mo class='MathClass-close' stretchy='false'>]</mo></mrow></math>, trained
+end-to-end on our dataset.
+</p><!-- l. 97 --><p class='indent'>   The 228,000 samples were partitioned into training and validation subsets (80/20 split), with the augmentations of
+Section <a href='#data-collection-and-processing'>3<!-- tex4ht:ref: sec:data  --></a> applied at train time. The training objective is the mean squared error </p><table class='equation'><tr><td>
+<!-- l. 98 --><math class='equation' display='block'><mrow>
+                                <mstyle class='label' id='x1-5001r3'></mstyle><!-- endlabel --><msub><mrow><mi mathvariant='script'>L</mi></mrow><mrow><mstyle class='text'><mtext>MSE</mtext></mstyle></mrow></msub> <mo class='MathClass-rel' stretchy='false'>=</mo>  <mfrac><mrow><mn>1</mn></mrow> 
+<mrow><mi>N</mi></mrow></mfrac><munderover accent='false' accentunder='false'><mrow><mo>∑</mo>
+  </mrow><mrow><mi>i</mi><mo class='MathClass-rel' stretchy='false'>=</mo><mn>1</mn></mrow><mrow><mi>N</mi></mrow></munderover><mo class='MathClass-rel' stretchy='false'>∥</mo><msub><mrow><mover accent='true'><mrow><mi>𝜃</mi></mrow><mo accent='true'>^</mo></mover></mrow><mrow>
+<mi>i</mi></mrow></msub> <mo class='MathClass-bin' stretchy='false'>−</mo> <msub><mrow><mi>𝜃</mi></mrow><mrow><mi>i</mi></mrow></msub><msubsup><mrow><mo class='MathClass-rel' stretchy='false'>∥</mo></mrow><mrow><mn>2</mn></mrow><mrow><mn>2</mn></mrow></msubsup><mo class='MathClass-punc' stretchy='false'>,</mo>
+</mrow></math></td><td class='eq-no'>(3)</td></tr></table>
+<!-- l. 100 --><p class='noindent'>where <!-- l. 101 --><math display='inline'><mrow><msub><mrow><mover accent='true'><mrow><mi>𝜃</mi></mrow><mo accent='true'>^</mo></mover></mrow><mrow><mi>i</mi></mrow></msub><mo class='MathClass-punc' stretchy='false'>,</mo><msub><mrow><mi>𝜃</mi></mrow><mrow><mi>i</mi></mrow></msub> <mo class='MathClass-rel' stretchy='false'>∈</mo> <msup><mrow><mi>ℝ</mi></mrow><mrow><mn>2</mn></mrow></msup></mrow></math> are the predicted and ground-truth
+adjustment vectors for the <!-- l. 101 --><math display='inline'><mi>i</mi></math>-th
+sample. Optimization used AdamW<!-- l. 101 --><math display='inline'><mrow><mn>16</mn></mrow></math>
+with <!-- l. 101 --><math display='inline'><msub><mrow><mi>L</mi></mrow><mrow><mn>2</mn></mrow></msub></math>
+weight decay and a cosine-annealing learning-rate schedule with warm
+restarts.<!-- l. 101 --><math display='inline'><mrow><mn>17</mn></mrow></math>
+   
+<span class='cmbx-12'>5.</span>
+</p>
+   <h3 class='sectionHead' id='automatic-alignment'><span class='titlemark'>5   </span>   <a id='x1-60005'></a>AUTOMATIC ALIGNMENT</h3>
+<!-- l. 106 --><p class='noindent'>Alignment operates in a closed loop using camera feedback and stepper motor control (Algorithm <a href='#automatic-alignment1'>1<!-- tex4ht:ref: alg:alignment  --></a>).
+A captured image is preprocessed as in Section <a href='#data-collection-and-processing'>3<!-- tex4ht:ref: sec:data  --></a> and compared with a reference image
+<!-- l. 106 --><math display='inline'><msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>ref</mtext></mstyle></mrow></msub></math> of the aligned state using the
+structural similarity index (SSIM),<!-- l. 106 --><math display='inline'><mrow><mn>18</mn></mrow></math>
+which quantifies perceptual similarity based on luminance, contrast, and structure: </p><table class='equation'><tr><td>
+<!-- l. 107 --><math class='equation' display='block'><mrow>
+                          <mstyle class='label' id='x1-6001r4'></mstyle><!-- endlabel --><mstyle class='text'><mtext>SSIM</mtext></mstyle><mo class='MathClass-open' stretchy='false'>(</mo><mi>x</mi><mo class='MathClass-punc' stretchy='false'>,</mo><mi>y</mi><mo class='MathClass-close' stretchy='false'>)</mo> <mo class='MathClass-rel' stretchy='false'>=</mo>       <mfrac><mrow><mo class='MathClass-open' stretchy='false'>(</mo><mn>2</mn><msub><mrow><mi>μ</mi></mrow><mrow><mi>x</mi></mrow></msub><msub><mrow><mi>μ</mi></mrow><mrow><mi>y</mi></mrow></msub> <mo class='MathClass-bin' stretchy='false'>+</mo> <msub><mrow><mi>C</mi></mrow><mrow><mn>1</mn></mrow></msub><mo class='MathClass-close' stretchy='false'>)</mo><mo class='MathClass-open' stretchy='false'>(</mo><mn>2</mn><msub><mrow><mi>σ</mi></mrow><mrow><mi mathvariant='italic'>𝑥𝑦</mi></mrow></msub> <mo class='MathClass-bin' stretchy='false'>+</mo> <msub><mrow><mi>C</mi></mrow><mrow><mn>2</mn></mrow></msub><mo class='MathClass-close' stretchy='false'>)</mo></mrow> 
+<mrow><mo class='MathClass-open' stretchy='false'>(</mo><msubsup><mrow><mi>μ</mi></mrow><mrow><mi>x</mi></mrow><mrow><mn>2</mn></mrow></msubsup> <mo class='MathClass-bin' stretchy='false'>+</mo> <msubsup><mrow><mi>μ</mi></mrow><mrow><mi>y</mi></mrow><mrow><mn>2</mn></mrow></msubsup> <mo class='MathClass-bin' stretchy='false'>+</mo> <msub><mrow><mi>C</mi></mrow><mrow><mn>1</mn></mrow></msub><mo class='MathClass-close' stretchy='false'>)</mo><mo class='MathClass-open' stretchy='false'>(</mo><msubsup><mrow><mi>σ</mi></mrow><mrow><mi>x</mi></mrow><mrow><mn>2</mn></mrow></msubsup> <mo class='MathClass-bin' stretchy='false'>+</mo> <msubsup><mrow><mi>σ</mi></mrow><mrow><mi>y</mi></mrow><mrow><mn>2</mn></mrow></msubsup> <mo class='MathClass-bin' stretchy='false'>+</mo> <msub><mrow><mi>C</mi></mrow><mrow><mn>2</mn></mrow></msub><mo class='MathClass-close' stretchy='false'>)</mo></mrow></mfrac><mo class='MathClass-punc' stretchy='false'>,</mo>
+</mrow></math></td><td class='eq-no'>(4)</td></tr></table>
+<!-- l. 110 --><p class='noindent'>where <!-- l. 111 --><math display='inline'><mi>μ</mi></math>,
+<!-- l. 111 --><math display='inline'><msup><mrow><mi>σ</mi></mrow><mrow><mn>2</mn></mrow></msup></math>, and
+<!-- l. 111 --><math display='inline'><msub><mrow><mi>σ</mi></mrow><mrow><mi mathvariant='italic'>𝑥𝑦</mi></mrow></msub></math> are patch means, variances,
+and covariance, and <!-- l. 111 --><math display='inline'><msub><mrow><mi>C</mi></mrow><mrow><mn>1</mn></mrow></msub></math>,
+<!-- l. 111 --><math display='inline'><msub><mrow><mi>C</mi></mrow><mrow><mn>2</mn></mrow></msub></math> are small stabilizing constants.
+If SSIM exceeds a threshold <!-- l. 111 --><math display='inline'><mi>τ</mi></math>,
+                                                                                             
+                                                                                             
+alignment is declared successful; otherwise the network infers a correction
+<!-- l. 111 --><math display='inline'><mrow><mi mathvariant='normal'>Δ</mi><mi>𝜃</mi></mrow></math>,
+which is translated into motor steps, and the loop repeats for at most
+<!-- l. 111 --><math display='inline'><mi>N</mi></math>
+iterations before reverting to the initial state as a safe fallback. Empirically, an SSIM of
+<!-- l. 111 --><math display='inline'><mrow><mi>τ</mi> <mo class='MathClass-rel' stretchy='false'>=</mo> <mn>0.97</mn></mrow></math> corresponds to a physical
+alignment error below <!-- l. 111 --><math display='inline'><mrow> <mo class='MathClass-bin' stretchy='false'>±</mo> <mn>0.0</mn><msup><mrow><mn>7</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math>,
+a tolerance that ensures stable operation of the cell in our application; runs failing to
+converge within six adjustments never reached the optimum, motivating the choice of
+<!-- l. 111 --><math display='inline'><mi>N</mi></math>.
+</p>
+   <div class='algorithm'>
+                                                                                             
+                                                                                             
+<!-- l. 113 --><p class='indent' id='automatic-alignment1'>   <a id='x1-6002r1'></a></p><figure class='float'>
+                                                                                             
+                                                                                             
+<figcaption class='caption'><span class='id'>Algorithm 1: </span><span class='content'>Automatic Alignment</span></figcaption><!-- tex4ht:label?: x1-6002r1  -->
+<div class='algorithmic'>
+<a id='x1-6003r1'></a>
+ <span class='ALCitem'>1:</span><span class='ALIndent' style='width:5.0pt;'> </span> <!-- l. 117 --><math display='inline'><mrow><mi mathvariant='italic'>𝑎𝑙𝑖𝑔𝑛𝑚𝑒𝑛𝑡</mi><mstyle class='text'><mtext>_</mtext></mstyle><mi mathvariant='italic'>𝑠𝑢𝑐𝑐𝑒𝑠𝑠𝑓𝑢𝑙</mi> <mo class='MathClass-rel' stretchy='false'>←</mo><mstyle class='text'><mtext>False</mtext></mstyle></mrow></math>
+   <a id='x1-6004r2'></a>
+ <br /><span class='ALCitem'>2:</span><span class='ALIndent' style='width:5.0pt;'>  </span><span class='cmbx-10'>for</span> <!-- l. 118 --><math display='inline'><mrow><mi>i</mi> <mo class='MathClass-rel' stretchy='false'>=</mo> <mn>1</mn></mrow></math> <span class='cmbx-10'>to</span>
+   <!-- l. 118 --><math display='inline'><mi>N</mi></math> <span class='cmbx-10'>do</span><span class='for-body'>
+<a id='x1-6005r3'></a>
+ <br /><span class='ALCitem'>3:</span><span class='ALIndent' style='width:15.00002pt;'> </span>   <!-- l. 119 --><math display='inline'><mrow><mi>I</mi> <mo class='MathClass-rel' stretchy='false'>←</mo><mstyle class='text'><mtext>Capture image from camera</mtext></mstyle></mrow></math>
+     <a id='x1-6006r4'></a>
+ <br /><span class='ALCitem'>4:</span><span class='ALIndent' style='width:15.00002pt;'> </span>   <!-- l. 120 --><math display='inline'><mrow><msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>proc</mtext></mstyle></mrow></msub> <mo class='MathClass-rel' stretchy='false'>←</mo><mstyle class='text'><mtext>Preprocess</mtext></mstyle><mo class='MathClass-open' stretchy='false'>(</mo><mi>I</mi><mo class='MathClass-close' stretchy='false'>)</mo></mrow></math>
+     <a id='x1-6007r5'></a>
+ <br /><span class='ALCitem'>5:</span><span class='ALIndent' style='width:15.00002pt;'>    </span><span class='cmbx-10'>if</span> <!-- l. 121 --><math display='inline'><mrow><mstyle class='text'><mtext>SSIM</mtext></mstyle><mo class='MathClass-open' stretchy='false'>(</mo><msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>proc</mtext></mstyle></mrow></msub><mo class='MathClass-punc' stretchy='false'>,</mo><msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>ref</mtext></mstyle></mrow></msub><mo class='MathClass-close' stretchy='false'>)</mo> <mo class='MathClass-rel' stretchy='false'>&gt;</mo> <mi>τ</mi></mrow></math> <span class='cmbx-10'>then</span><span class='if-body'>
+<a id='x1-6008r6'></a>
+ <br /><span class='ALCitem'>6:</span><span class='ALIndent' style='width:25.00003pt;'> </span>     <!-- l. 122 --><math display='inline'><mrow><mi mathvariant='italic'>𝑎𝑙𝑖𝑔𝑛𝑚𝑒𝑛𝑡</mi><mstyle class='text'><mtext>_</mtext></mstyle><mi mathvariant='italic'>𝑠𝑢𝑐𝑐𝑒𝑠𝑠𝑓𝑢𝑙</mi> <mo class='MathClass-rel' stretchy='false'>←</mo><mstyle class='text'><mtext>True</mtext></mstyle></mrow></math>
+       <a id='x1-6009r7'></a>
+ <br /><span class='ALCitem'>7:</span><span class='ALIndent' style='width:25.00003pt;'>      </span><span class='cmbx-10'>break</span>
+     </span><a id='x1-6010r8'></a>
+ <br /><span class='ALCitem'>8:</span><span class='ALIndent' style='width:15.00002pt;'>    </span><span class='cmbx-10'>end</span> <span class='cmbx-10'>if</span><a id='x1-6011r9'></a>
+ <br /><span class='ALCitem'>9:</span><span class='ALIndent' style='width:15.00002pt;'> </span>   <!-- l. 125 --><math display='inline'><mrow><mi mathvariant='normal'>Δ</mi><mi>𝜃</mi> <mo class='MathClass-rel' stretchy='false'>←</mo><mi mathvariant='script'>F</mi><mo class='MathClass-open' stretchy='false'>(</mo><msub><mrow><mi>I</mi></mrow><mrow><mstyle class='text'><mtext>proc</mtext></mstyle></mrow></msub><mo class='MathClass-close' stretchy='false'>)</mo></mrow></math>
+     <a id='x1-6012r10'></a>
+<br /><span class='ALCitem'>10:</span><span class='ALIndent' style='width:15.00002pt;'> </span>   Send motor control signal based on <!-- l. 126 --><math display='inline'><mrow><mi mathvariant='normal'>Δ</mi><mi>𝜃</mi></mrow></math>
+   </span><a id='x1-6013r11'></a>
+<br /><span class='ALCitem'>11:</span><span class='ALIndent' style='width:5.0pt;'>  </span><span class='cmbx-10'>end</span> <span class='cmbx-10'>for</span><a id='x1-6014r12'></a>
+<br /><span class='ALCitem'>12:</span><span class='ALIndent' style='width:5.0pt;'>  </span><span class='cmbx-10'>if</span> <span class='cmbx-10'>not </span><!-- l. 128 --><math display='inline'><mrow><mi mathvariant='italic'>𝑎𝑙𝑖𝑔𝑛𝑚𝑒𝑛𝑡</mi><mstyle class='text'><mtext>_</mtext></mstyle><mi mathvariant='italic'>𝑠𝑢𝑐𝑐𝑒𝑠𝑠𝑓𝑢𝑙</mi></mrow></math> <span class='cmbx-10'>then</span><span class='if-body'>
+<a id='x1-6015r13'></a>
+<br /><span class='ALCitem'>13:</span><span class='ALIndent' style='width:15.00002pt;'> </span>   Return system to the origin
+   </span><a id='x1-6016r14'></a>
+<br /><span class='ALCitem'>14:</span><span class='ALIndent' style='width:5.0pt;'>  </span><span class='cmbx-10'>end</span> <span class='cmbx-10'>if</span>
+</div>
+                                                                                             
+                                                                                             
+   </figure>
+   </div>
+<!-- l. 134 --><p class='indent'>   In deployment, thermal stress, vibration, and mechanical drift perturb alignment by displacing the
+kinematic-mounted mirror in pitch and yaw. To evaluate recovery from such disturbances, we emulate their effect
+with controlled angular displacements: a grid of origins covering the full range of motion of both axes at
+<!-- l. 134 --><math display='inline'><mrow><mn>0</mn><mo class='MathClass-punc' stretchy='false'>.</mo><msup><mrow><mn>5</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math> spacing,
+from sub-degree offsets representative of thermal drift up to several-degree offsets representative of mechanical shock. For
+every grid point the mirror is driven to that origin, the alignment procedure is executed, and the number of adjustments
+is recorded; because the loop uses images captured between adjustments, it also restores alignment once a transient
+disturbance subsides.
+   
+<span class='cmbx-12'>6.</span>
+</p>
+   <h3 class='sectionHead' id='results-and-discussion'><span class='titlemark'>6   </span>   <a id='x1-70006'></a>RESULTS AND DISCUSSION</h3>
+<!-- l. 139 --><p class='noindent'>Averaged over five complete evaluation runs, the system recovered the aligned state from every starting position, in
+<!-- l. 139 --><math display='inline'><mrow><mn>1.80</mn> <mo class='MathClass-bin' stretchy='false'>±</mo> <mn>0.79</mn></mrow></math> correction steps
+(<!-- l. 139 --><math display='inline'><mrow><mn>3.07</mn> <mo class='MathClass-bin' stretchy='false'>±</mo> <mn>1.58</mn></mrow></math> s) on average, with
+a final SSIM of <!-- l. 139 --><math display='inline'><mrow><mn>0.977</mn> <mo class='MathClass-bin' stretchy='false'>±</mo> <mn>0.007</mn></mrow></math> and
+a final error of <!-- l. 139 --><math display='inline'><mrow><mn>0.04</mn><msup><mrow><mn>5</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup><mo class='MathClass-bin' stretchy='false'>±</mo> <mn>0.02</mn><msup><mrow><mn>1</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math>.
+Figure <a href='#automatic-alignment-evaluation-the-axes-give-the-x-and-y-origin-induced-misalignment-of-the-mirror-frame-color-encodes-the-mean-number-of-adjustments-needed-to-reach-the-optimum'>3<!-- tex4ht:ref: fig:evaluation  --></a> maps the mean number of corrections against the induced misalignment: recovery takes
+fewer than two steps on average across the entire operational range. The deployed model contains
+<!-- l. 139 --><math display='inline'><mrow><mn>1.1</mn> <mo class='MathClass-bin' stretchy='false'>×</mo> <mn>1</mn><msup><mrow><mn>0</mn></mrow><mrow><mn>7</mn></mrow></msup></mrow></math> parameters, occupies
+83 MiB of memory, and completes one inference in 1.16 s on the Raspberry Pi 4. Performance is sensitive to input resolution: reducing
+the input from <!-- l. 139 --><math display='inline'><mrow><mn>512</mn> <mo class='MathClass-bin' stretchy='false'>×</mo> <mn>512</mn></mrow></math> to
+<!-- l. 139 --><math display='inline'><mrow><mn>256</mn> <mo class='MathClass-bin' stretchy='false'>×</mo> <mn>256</mn></mrow></math> increased mean
+angular error by a factor of 12, indicating that sufficient spatial detail is necessary to distinguish mirror positions separated by
+as little as <!-- l. 139 --><math display='inline'><mrow><mn>0.0</mn><msup><mrow><mn>2</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math>.
+</p><!-- l. 141 --><p class='indent'>   Compared with related machine-learning alignment systems, our approach is distinguished by its single-shot regression formulation.
+Qin et al.<!-- l. 141 --><math display='inline'><mrow><mn>11</mn></mrow></math>
+align a Fabry–Pérot cavity with a CNN classifier and a genetic algorithm, reaching roughly
+90% mode-matching efficiency over about ten optimization generations; Burkhardt et
+al.<!-- l. 141 --><math display='inline'><mrow><mn>10</mn></mrow></math>
+learn lens-alignment policies by reinforcement learning in a manufacturing setting; and Slor et
+al.<!-- l. 141 --><math display='inline'><mn>9</mn></math> diagnose multi-lens
+misalignment offline with <!-- l. 141 --><math display='inline'><mrow><mn>0</mn><mo class='MathClass-punc' stretchy='false'>.</mo><msup><mrow><mn>5</mn></mrow><mrow><mo class='MathClass-bin' stretchy='false'>∘</mo></mrow></msup></mrow></math>
+rotational accuracy. In contrast, our pre-trained regression model completes alignment in fewer than two steps on
+average, requires no iterative optimization or online learning, and runs on resource-constrained hardware suitable for
+field-deployed gas sensors.
+</p>
+   <figure class='figure' id='x1-7001r3'><span id='automatic-alignment-evaluation-the-axes-give-the-x-and-y-origin-induced-misalignment-of-the-mirror-frame-color-encodes-the-mean-number-of-adjustments-needed-to-reach-the-optimum'></span> 
+
+                                                                                             
+                                                                                             
+
+                                                                                             
+                                                                                             
+<!-- l. 145 --><p class='noindent'><img alt='PIC' height='292' src='figures/resnet18_eval.png' width='292' />
+</p>
+<figcaption class='caption'><span class='id'>Figure 3: </span><span class='content'>Automatic alignment evaluation. The axes give the X and Y origin (induced misalignment) of the
+mirror frame; color encodes the mean number of adjustments needed to reach the optimum.</span></figcaption><!-- tex4ht:label?: x1-7001r3  -->
+                                                                                             
+                                                                                             
+   </figure>
+   
+<p><span class='cmbx-12'>7.</span>
+   </p><h3 class='sectionHead' id='conclusion'><span class='titlemark'>7   </span>   <a id='x1-80007'></a>CONCLUSION</h3>
+<!-- l. 153 --><p class='noindent'>A lightweight vision-based neural network is an effective tool for autonomous alignment of multipass Herriott cells. By
+inferring alignment corrections directly from the cavity’s reflection pattern, the system achieves complete recovery
+across its operational range in fewer than two correction steps on average while remaining deployable on a
+Raspberry Pi 4. This compact implementation enables in situ recalibration against thermal and mechanical
+disturbances and unattended operation of field-deployed multipass gas sensors where manual adjustment is
+impractical.
+   
+</p>
+   <h3 class='likesectionHead' id='references'>  <a id='x1-9000'></a>REFERENCES</h3>
+<!-- l. 1 --><p class='noindent'>
+    </p><section class='thebibliography' role='doc-bibliography'><dl><dt>
+ [1] </dt><dd><a id='Xzhang2025fbgdemodulation'></a>Zhang,  G.,  Zhao,  K.,  Wen,  H.,  Wang,  Q.,  Wu,  Z.,  Zhong,  S.,  Ma,  G.,  Venediktov,  E.,  and  Chen,
+    K. P.,  “Cost-effective  FBG  demodulation  for  high-temperature  and  dynamic  strain  via  modified
+    Levenberg–Marquardt,” <span class='cmti-10'>IEEE Sens. J.</span> <span class='cmbx-10'>25</span>(10), 17011–17017 (2025).
+    </dd><dt>
+ [2] </dt><dd><a id='XZHANG2026114908'></a>Zhang, G., Zhao, K., Zhong, S., Ma, G., Dominguez-Ontiveros, E., Rubenstein, M., Venediktov, E., Wang,
+    Q., Wu, Z., and Chen, K., “Long-term thermal stability and calibration of Type-II fiber Bragg grating array
+    inscribed in radiation-hardened fibers,” <span class='cmti-10'>Opt. Laser Technol.</span> <span class='cmbx-10'>198</span>, 114908 (2026).
+    </dd><dt>
+ [3] </dt><dd><a id='Xenhancementofmethanedetection'></a>Chen, S., Tian, X., Mu, T., Yuan, J., Cao, X., and Cheng, G., “Enhancement of methane detection in
+    tunable diode laser absorption spectroscopy using Savitzky–Golay filtering,” <span class='cmti-10'>Photonics</span> <span class='cmbx-10'>12</span>(1), 2 (2025).
+    </dd><dt>
+ [4] </dt><dd><a id='Xhydrogen'></a>Avetisov, V., Bjoroey, O., Wang, J., Geiser, P., and Paulsen, K. G., “Hydrogen sensor based on tunable
+    diode laser absorption spectroscopy,” <span class='cmti-10'>Sensors</span> <span class='cmbx-10'>19</span>(23), 5313 (2019).
+    </dd><dt>
+ [5] </dt><dd><a id='Xmultipasscell'></a>Chen, H., Chen, C., Wang, Y., Piao, H., and Wang, P., “Optical design and verification of multipass cell
+    with two spherical mirrors using space equation method,” <span class='cmti-10'>IEEE Trans. Instrum. Meas.</span> <span class='cmbx-10'>70</span>, 1–8 (2021).
+    </dd><dt>
+ [6] </dt><dd><a id='Xultra-high-sensitive-multipass'></a>Zhao, X., Chen, K., Guo, M., Li, C., Li, C., Zhang, G., Gong, Z., Zhou, Z., and Peng, W., “Ultra-high
+    sensitive multipass absorption enhanced fiber-optic photoacoustic gas analyzer,” <span class='cmti-10'>IEEE Trans. Instrum.
+    Meas.</span> <span class='cmbx-10'>72</span>, 1–8 (2023).
+    </dd><dt>
+ [7] </dt><dd><a id='Xyoder'></a>Yoder, P., [<span class='cmti-10'>Mounting Optics in Optical Instruments</span>], Online access with subscription: SPIE Digital Library,
+    SPIE (2008).
+    </dd><dt>
+ [8] </dt><dd><a id='XRAKHMATULIN2024107923'></a>Rakhmatulin, I., Risbridger, D., Carter, R. M., Esser, M. D., and Erden, M. S., “A review of automation
+    of laser optics alignment with a focus on machine learning applications,” <span class='cmti-10'>Opt. Lasers Eng.</span> <span class='cmbx-10'>173</span>, 107923
+    (2024).
+    </dd><dt>
+ [9] </dt><dd><a id='Xslor2025deeplearningopticalmisalignment'></a>Slor, T., Oren, D., Baneth, S., Coen, T., and Suchowski, H., “Deep learning for optical misalignment
+    diagnostics in multi-lens imaging systems,” (2025). arXiv:2506.23173.
+                                                                                             
+                                                                                             
+    </dd><dt>
+[10] </dt><dd><a id='Xburkhardt2025activealignmentslenssystems'></a>Burkhardt, M., Schmähling, T., Layh, M., and Windisch, T., “Active alignments of lens systems with
+    reinforcement learning,” (2025).
+    </dd><dt>
+[11] </dt><dd><a id='Xqin2025automated'></a>Qin, J., Kinder, K., Jadhav, S., Chugh, P., and Slagmolen, B. J. J., “Automated alignment of an optical
+    cavity using machine learning,” <span class='cmti-10'>Classical and Quantum Gravity</span> <span class='cmbx-10'>42</span>, 045003 (2025).
+    </dd><dt>
+[12] </dt><dd><a id='Xshorten2019survey'></a>Shorten, C. and Khoshgoftaar, T. M., “A survey on image data augmentation for deep learning,” <span class='cmti-10'>Journal
+    of Big Data</span> <span class='cmbx-10'>6</span>(1), 1–48 (2019).
+    </dd><dt>
+[13] </dt><dd><a id='Xduda1972use'></a>Duda, R. O. and Hart, P. E., “Use of the hough transformation to detect lines and curves in pictures,”
+    <span class='cmti-10'>Communications of the ACM</span> <span class='cmbx-10'>15</span>(1), 11–15 (1972).
+    </dd><dt>
+[14] </dt><dd><a id='Xlindeberg1998feature'></a>Lindeberg,  T.,  “Feature  detection  with  automatic  scale  selection,”  <span class='cmti-10'>International  journal  of  computer
+    vision</span> <span class='cmbx-10'>30</span>(2), 79–116 (1998).
+    </dd><dt>
+[15] </dt><dd><a id='Xhe2016deep'></a>He, K., Zhang, X., Ren, S., and Sun, J., “Deep residual learning for image recognition,” in [<span class='cmti-10'>IEEE CVPR</span>],
+    770–778 (2016).
+    </dd><dt>
+[16] </dt><dd><a id='Xloshchilov2019decoupledweightdecayregularization'></a>Loshchilov, I. and Hutter, F., “Decoupled weight decay regularization,” (2019).
+    </dd><dt>
+[17] </dt><dd><a id='Xloshchilov2017sgdrstochasticgradientdescent'></a>Loshchilov, I. and Hutter, F., “SGDR: Stochastic gradient descent with warm restarts,” (2017).
+    </dd><dt>
+[18] </dt><dd><a id='X1284395'></a>Wang, Z., Bovik, A., Sheikh, H., and Simoncelli, E., “Image quality assessment: from error visibility to
+    structural similarity,” <span class='cmti-10'>IEEE Trans. Image Process.</span> <span class='cmbx-10'>13</span>(4), 600–612 (2004).
+    </dd></dl></section>
+    
+</body> 
+</html>
