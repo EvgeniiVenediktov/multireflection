@@ -65,7 +65,7 @@ mkdir -p "$RUN_DIR"
 # Keep the W&B run files next to the checkpoints on /ix1 instead of ./wandb on /ihome.
 export WANDB_DIR="$RUN_DIR"
 
-# bs 256 / lr 2e-3: 4x the local batch of 64, lr scaled by sqrt(4). ~21 GB of the 45 GB.
+# bs 512 / lr 2.8e-3: 8x the local batch of 64, lr scaled by sqrt(8). ~36 GB of the 45 GB.
 # W&B auth comes from ~/.netrc (wandb login); add --no-wandb for an unlogged run.
 # --cpus-per-task is passed explicitly: srun does not reliably inherit it from sbatch
 # (Slurm 22.05+), and the loader workers would otherwise be pinned to one core.
@@ -73,8 +73,8 @@ srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" train/train_resnet_
     --data-dir "$DATA_DIR" \
     --checkpoint-dir "$RUN_DIR" \
     --name "resnet18_l40s_${SLURM_JOB_ID:-manual}" \
-    --batch-size 256 \
-    --lr 0.002 \
+    --batch-size 512 \
+    --lr 0.0028 \
     --epochs 96 \
     --num-workers 10 \
     --val-num-workers 2 \
