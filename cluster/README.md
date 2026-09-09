@@ -11,8 +11,6 @@ GPU jobs need `--cluster=gpu`).
 
 ## One-time setup
 
-**Nothing is installed on the cluster.** Every import comes from a CRCD module.
-
 ```bash
 # from this machine - push the code (exclude .git, it is 259 MB and not needed there)
 rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' \
@@ -25,8 +23,8 @@ rsync -avP dark512.tar.gz crc:/ix1/kchen/evv/multireflection/data/
 # then on the cluster
 ssh crc
 cd /ihome/kchen/evv13/multireflection
-bash cluster/check_env.sh        # verifies the module provides every import
-python3 -m wandb login           # once; writes ~/.netrc, installs nothing
+bash cluster/check_env.sh              # builds the venv from uv.lock (~6 GB, once)
+./.venv/bin/python -m wandb login      # once; writes ~/.netrc
 ```
 
 ## Submit
@@ -72,58 +70,46 @@ below.
 Validated with `sbatch --test-only`: the scheduler accepts every directive and reported it
 would start within minutes on `gpu-n56`.
 
-### Software modules — nothing is installed
+### Environment
 
-Module names were read off the cluster (`module -t avail`, `module spider`), not assumed.
-Lmod 8.7.24.
+Built once from `uv.lock`, so the cluster runs the same versions as local development:
+torch 2.14.0+cu130, numpy 2.4.6, cv2 5.0.0, tqdm 4.70.0, wandb 0.30.0 on Python 3.11.
 
 ```bash
-module purge
-module load python/pytorch_251_311_cu124     # loads directly, no prerequisite module
+bash cluster/check_env.sh      # installs uv to ~/.local/bin, then uv sync
 ```
 
-That single module supplies **Python 3.11.11** and every import
-`train/train_resnet_direct.py` makes, verified on the cluster:
+CRCD permits this. The documented restriction is only against installing to the *system* —
+*"Users do not have privileges to install Python packages to the system"* — while conda
+envs, venvs and `pip install --user` are explicitly supported. All three were verified to
+work on this account, and uv is a single 48 MB static binary in `~/.local/bin`.
 
-| package | version |
-|---|---|
-| torch | 2.5.1 (CUDA build 12.4) |
-| numpy | 1.26.4 |
-| cv2 | 4.10.0 |
-| tqdm | 4.67.1 |
-| wandb | 0.23.1 |
+**The job never installs or syncs anything.** `train_l40s.slurm` runs `.venv/bin/python`
+directly, so it needs no network and starts instantly. The flip side is that it cannot
+notice a stale venv: **re-run `check_env.sh` after changing `uv.lock`.**
 
-Also present: torchvision 0.20.1, matplotlib 3.10.0, PIL 11.1.0, lmdb 1.7.5, pandas 3.0.2.
-**Absent: scipy, scikit-image, scikit-learn** — none are needed for training; they belong to
-`utils/graph_eval.py` and `app/inference.py`. Run `bash cluster/check_env.sh` to re-verify.
+**No modules are loaded — `module purge` and nothing else.** The venv carries its own
+CPython and its own CUDA runtime (the torch wheels bundle `nvidia-*` packages). Loading a
+CUDA module would be actively harmful: `module show cuda/12.9.0` prepends its `lib64` to
+`LD_LIBRARY_PATH`, which would shadow the CUDA 13 runtime in the venv. Only the driver
+matters at runtime, and the GPU nodes run 595.91.07.
 
-This is why the local `uv` environment is not used on the cluster: `pyproject.toml` and
-`uv.lock` are for local development, where torch 2.14 + CUDA 13 is resolved from PyPI. On
-CRCD the module provides torch 2.5.1 + CUDA 12.4 instead, which the training script runs on
-unmodified — verified by an actual 2-epoch run on an L40S (`gpu-n62`).
+### GPU architecture
 
-**No CUDA module is loaded, deliberately.** `module show cuda/12.9.0` prepends its `lib64`
-to `LD_LIBRARY_PATH`, which would shadow the CUDA runtime the python module already ships.
-Only the driver matters at runtime, and the GPU nodes run 595.91.07.
+The wheel is compiled for `sm_75 sm_80 sm_86 sm_90 sm_100 sm_120` — **no native `sm_89`**,
+which is what the L40S is. It runs correctly anyway: CUDA guarantees binary compatibility
+forward across minor revisions within a major compute capability, so `sm_86` cubins execute
+on `sm_89`, and cuDNN/cuBLAS ship their own Ada kernels. Verified on `gpu-n64`: correct
+matmul results and 2681 img/s on a conv stack.
 
-**Do not switch the Python module casually.** `module spider python` lists versions that
-`module avail` does not, including `python/3.11.11` and `python/3.13.5` — but both are
-*hierarchical*: Lmod reports "You will need to load all module(s) on any one of the lines
-below", and loading either directly fails, silently leaving `/usr/bin/python3` (3.9.21) on
-PATH. `python/3.11.9` and `python/pytorch_251_311_cu124` are flat and load standalone; only
-the latter carries torch.
+Worth knowing this is not specific to the CUDA 13 wheel — the CRCD module
+`python/pytorch_251_311_cu124` (torch 2.5.1) has the same gap and works for the same reason.
+`cluster/gpu_check.py` reports all of this on demand:
 
-### Verified on a compute node, not just the login node
-
-Module trees can differ between login and compute nodes. Checked on `gpu-n71` (l40s):
-
-- `MODULEPATH` hashes identical to the login node, so the tree is the same
-- `module load python/pytorch_251_311_cu124` resolves to Python 3.11.11 there, with
-  `torch.cuda.is_available()` True on an L40S
-- a full 2-epoch run of `train/train_resnet_direct.py` completed on `gpu-n62` under
-  torch 2.5.1: AMP fp16, TF32, channels_last, GPU augmentation and checkpointing all work
-- `crc-job-stats` is on the default PATH (`/ihome/crc/pipx/bin`) inside a job, so the call
-  at the end of the job script works without any PATH manipulation
+```bash
+srun -M gpu -p l40s --gres=gpu:1 -c 8 --mem=32G -t 00:05:00 \
+    ./.venv/bin/python cluster/gpu_check.py
+```
 
 ### Storage tiers — measured
 

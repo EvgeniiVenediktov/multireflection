@@ -5,42 +5,38 @@
 #   cd /ihome/kchen/evv13/multireflection
 #   bash cluster/check_env.sh
 #
-# CRCD does allow user-level package installs - the docs only forbid installing to the
-# system ("Users do not have privileges to install Python packages to the system"), and
-# conda envs, venvs and `pip install --user` are all explicitly supported. So this builds a
-# uv venv from uv.lock, which pins the same versions used in local development.
+# Run this once after cloning, and again whenever uv.lock changes - the job script does NOT
+# sync, it just runs .venv/bin/python, so a stale venv would go unnoticed.
 #
-# Set USE_MODULE=1 to skip that and use the CRCD module instead, which installs nothing.
+# CRCD permits user-level installs. The documented restriction is only against installing
+# to the system ("Users do not have privileges to install Python packages to the system");
+# conda envs, venvs and `pip install --user` are all explicitly supported, and uv is a
+# single static binary in ~/.local/bin.
 
 set -uo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DATA_ROOT="${DATA_ROOT:-/ix1/kchen/evv/multireflection}"
-PYTHON_MODULE="${PYTHON_MODULE:-python/pytorch_251_311_cu124}"
-USE_MODULE="${USE_MODULE:-0}"
 
 cd "$PROJECT_DIR"
+
+# The venv brings its own CPython and its own CUDA runtime, so no modules are needed.
+# Purge anyway, so a module left over from an interactive session cannot leak in.
 module purge
 
-if [ "$USE_MODULE" = "1" ]; then
-    # Fallback: zero-install path. torch 2.5.1 + CUDA 12.4, verified to run this project.
-    module load "$PYTHON_MODULE" || { echo "FAILED to load $PYTHON_MODULE"; exit 1; }
-    PY=$(command -v python3)
-    echo "using module : $PYTHON_MODULE"
-else
+export PATH="$HOME/.local/bin:$PATH"
+if ! command -v uv >/dev/null 2>&1; then
+    echo "installing uv into ~/.local/bin (a single static binary, no system changes)"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
-    if ! command -v uv >/dev/null 2>&1; then
-        echo "installing uv into ~/.local/bin (a single static binary, no system changes)"
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        export PATH="$HOME/.local/bin:$PATH"
-    fi
-    echo "uv           : $(uv --version)"
-    echo "syncing from uv.lock (~6 GB on first run) ..."
-    uv sync || { echo "uv sync failed"; exit 1; }
-    PY="$PROJECT_DIR/.venv/bin/python"
 fi
+echo "uv     : $(uv --version)"
 
-echo "python       : $PY ($($PY --version 2>&1))"
+echo "syncing from uv.lock (~6 GB on first run, near-instant afterwards) ..."
+uv sync || { echo "uv sync failed"; exit 1; }
+
+PY="$PROJECT_DIR/.venv/bin/python"
+echo "python : $PY ($($PY --version 2>&1))"
 echo
 
 "$PY" - <<'PYEOF'

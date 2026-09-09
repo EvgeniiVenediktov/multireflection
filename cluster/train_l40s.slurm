@@ -7,9 +7,10 @@
 # Monitor:  squeue -M gpu -u $USER      |  crc-job-stats <jobid>
 # Cancel:   scancel -M gpu <jobid>
 #
-# Uses the uv-managed venv built by cluster/check_env.sh, which matches uv.lock and so
-# matches local development exactly. A zero-install fallback on the CRCD module
-# python/pytorch_251_311_cu124 also works - see cluster/README.md.
+# Uses the uv venv built once by cluster/check_env.sh, which matches uv.lock and so
+# matches local development exactly. This script never installs or syncs anything: it runs
+# .venv/bin/python directly, so it needs no network and starts instantly. Re-run
+# check_env.sh after changing uv.lock.
 
 #SBATCH --job-name=mfl-resnet18
 #SBATCH --cluster=gpu
@@ -55,8 +56,8 @@ VENV_PY="${VENV_PY:-$PROJECT_DIR/.venv/bin/python}"
 # harmful - cuda/12.9.0 prepends its lib64 to LD_LIBRARY_PATH and would shadow the CUDA 13
 # runtime in the venv. Only the driver matters, and these nodes run 595.91.07.
 #
-# Note neither this wheel nor the CRCD module ships native sm_89 (Ada) kernels; both run
-# correctly on the L40S through CUDA's forward binary compatibility from sm_86. Verified.
+# Note the wheel ships no native sm_89 (Ada) kernels; it runs correctly on the L40S through
+# CUDA's forward binary compatibility from sm_86. Verified - see cluster/gpu_check.py.
 # ---------------------------------------------------------------------------
 module purge
 
