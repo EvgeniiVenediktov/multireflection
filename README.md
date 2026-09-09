@@ -71,6 +71,18 @@ ResNet-18 was selected for deployment due to its 12× lower memory footprint and
   <em>Number of adjustments needed to reach optimal alignment from each starting position. Most of the operational range converges in 1–2 steps.</em>
 </p>
 
+## Future Directions
+
+### Int8 Quantized Inference on the Edge
+
+The current bottleneck is not training but on-device inference: 1.16 s per prediction and 83 MiB of RAM on the Raspberry Pi 4. Since the alignment loop converges in 1–2 steps, inference latency dominates the 3.07 s time-to-align almost entirely.
+
+Quantizing ResNet-18 to int8 targets exactly this. The weights drop from ~44 MB to ~11 MB, and ARM CPUs have native NEON int8 paths reachable through ONNX Runtime, TFLite, or PyTorch's qnnpack backend — typically 2–3× faster inference on this class of hardware.
+
+The workflow would be to train in float on the workstation, apply a short quantization-aware fine-tune to recover any accuracy lost to the int8 grid, and export the quantized model for the Pi. QAT matters here because the system's headline result is sub-0.05° angular accuracy, so the regression head is the part worth validating carefully after quantization.
+
+Note that this is a deployment-side change only. Training stays in float: fp16 mixed precision is the useful lever on the training box, while int8 belongs at inference time.
+
 <!-- 
 ## Citation
 
