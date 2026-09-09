@@ -12,8 +12,10 @@ Design notes:
   - The network still sees exactly the same [0, 1] float32 input it always did.
   - fp16 autocast, TF32 and channels_last are on by default (measured on an RTX A2000,
     torch 2.14 + CUDA 13: 73 img/s fp32 -> 200 img/s with all three). Disable with --no-amp.
-  - Augmentation is brightness/contrast, affine, Gaussian noise and random occlusion, all
-    per-sample on the GPU. See GpuAugment for why torchvision's v2 transforms are not used.
+  - Augmentation is brightness/contrast, Gaussian noise and random occlusion, all
+    per-sample on the GPU. See GpuAugment for why torchvision's v2 transforms are not
+    used. Affine is implemented but off by default: it costs ~7% throughput and teaches
+    a translation invariance the task does not have.
   - Label normalization is derived from the tilt range in config.py so it cannot silently
     drift away from what app/inference.py uses to de-normalize predictions.
   - Every run is logged to W&B. Export WANDB_API_KEY, or pass --no-wandb.
@@ -21,7 +23,7 @@ Design notes:
 Run from the repository root:
     python train/train_resnet_direct.py
     python train/train_resnet_direct.py --data-share 0.25 --name quarter_data
-    python train/train_resnet_direct.py --affine-degrees 0 --affine-translate 0
+    python train/train_resnet_direct.py --affine-degrees 3 --affine-translate 0.02
     python train/train_resnet_direct.py --occlusion-prob 0.8 --occlusion-count 3
     python train/train_resnet_direct.py --no-augment --no-wandb --epochs 2
     python train/train_resnet_direct.py --help
@@ -79,14 +81,22 @@ config = {
     # Applied with split_seed, so the same share is reproducible across runs.
     "data_share": 1.0,
 
-    "batch_size": 32,
+    # Throughput is flat from bs=16 to bs=128 (153-159 img/s) because the GPU is
+    # power-limited, so this is chosen for headroom rather than speed: 3.9 GiB peak on a
+    # 12 GiB card. Do not go past 128 - bs=160 needs 10.65 GiB and collapses to 87 img/s.
+    "batch_size": 64,
     "lr": 0.001,
     "weight_decay": 0.001,
     "epochs": 96,
     "lr_scheduler_loop": 7,
     "lr_min": 0.00001,
 
-    "num_workers": 8,
+    # Worker count makes no measurable difference (2 workers feed the GPU as well as 12),
+    # so this is cores-1 rather than anything tuned. Validation runs once per epoch and
+    # gets its own smaller count so its persistent workers do not sit idle competing with
+    # the training workers for the whole run.
+    "num_workers": 5,
+    "val_num_workers": 2,
     "prefetch_factor": 4,
 
     # Measured on an RTX A2000: fp32 73 img/s, +TF32 98, +AMP 150, +channels_last 200.
@@ -101,12 +111,15 @@ config = {
     "jitter_contrast": 0.1,
     "noise_level": 0.1,
 
-    # Affine. NOTE: the label IS the position and shape of the spot pattern, so a
-    # translation looks to the network exactly like a different mirror tilt. Keep these
-    # small, and ablate against affine_degrees=0 / affine_translate=0 before trusting them.
-    "affine_degrees": 3.0,        # rotation, +/- degrees
-    "affine_translate": 0.02,     # max shift as a fraction of image size
-    "affine_scale": 0.05,         # zoom, +/- fraction
+    # Affine. OFF by default, for two reasons. Semantically, the label IS the position and
+    # shape of the spot pattern, so a translation looks to the network exactly like a
+    # different mirror tilt - the augmentation teaches an invariance the task does not
+    # have. It is also the single most expensive stage: enabling it costs ~7% throughput
+    # (174 -> 162 img/s), where occlusion and the photometric stages cost ~1% each.
+    # Enable deliberately, with an ablation, e.g. --affine-degrees 3 --affine-translate 0.02
+    "affine_degrees": 0.0,        # rotation, +/- degrees
+    "affine_translate": 0.0,      # max shift as a fraction of image size
+    "affine_scale": 0.0,          # zoom, +/- fraction
     "affine_shear": 0.0,          # shear, +/- degrees
 
     # Random occlusion (cutout). Models dust or debris on the mirror surface.
@@ -610,17 +623,26 @@ def main(cfg: dict) -> None:
     train_dataset = DirectImageDataset(cfg["data_dir"], train_names, resolution)
     val_dataset = DirectImageDataset(cfg["data_dir"], val_names, resolution)
 
-    loader_kwargs = dict(
-        batch_size=cfg["batch_size"],
-        num_workers=cfg["num_workers"],
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=cfg["num_workers"] > 0,
-    )
-    if cfg["num_workers"] > 0:
-        loader_kwargs["prefetch_factor"] = cfg["prefetch_factor"]
+    def loader_kwargs(workers: int) -> dict:
+        kw = dict(
+            batch_size=cfg["batch_size"],
+            num_workers=workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=workers > 0,
+        )
+        if workers > 0:
+            kw["prefetch_factor"] = cfg["prefetch_factor"]
+        return kw
 
-    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    # Separate counts on purpose: sharing one kwargs dict gives the validation loader as
+    # many persistent workers as training, and they stay alive competing for cores through
+    # every training epoch despite running once per epoch.
+    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True,
+                              **loader_kwargs(cfg["num_workers"]))
+    val_loader = DataLoader(val_dataset, shuffle=False,
+                            **loader_kwargs(cfg["val_num_workers"]))
+    print(f"loaders: batch_size={cfg['batch_size']}, "
+          f"train workers={cfg['num_workers']}, val workers={cfg['val_num_workers']}")
 
     model = resnet18(output_dim=2).to(device)
     if cfg["use_channels_last"]:
@@ -745,6 +767,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     opt.add_argument("--lr", type=float, default=config["lr"])
     opt.add_argument("--weight-decay", type=float, default=config["weight_decay"])
     opt.add_argument("--num-workers", type=int, default=config["num_workers"])
+    opt.add_argument("--val-num-workers", type=int, default=config["val_num_workers"],
+                     help="validation runs once per epoch, so it needs fewer")
+    opt.add_argument("--checkpoint-dir", default=config["checkpoint_dir"],
+                     help="where best_model.pth is written; use persistent storage on a cluster")
     opt.add_argument("--starting-checkpoint", default=config["starting_checkpoint"])
     opt.add_argument("--no-amp", action="store_true",
                      help="disable fp16 autocast and channels_last (both on by default)")
@@ -790,6 +816,8 @@ if __name__ == "__main__":
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "num_workers": args.num_workers,
+        "val_num_workers": args.val_num_workers,
+        "checkpoint_dir": args.checkpoint_dir,
         "starting_checkpoint": args.starting_checkpoint,
 
         "jitter_brightness": args.brightness,
