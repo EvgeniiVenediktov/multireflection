@@ -75,3 +75,28 @@ processing experiments, synthetic-data model, dog/conv scratch tests. Useful onl
 - Label normalization constants (`/5.7`, `/4`) are hardcoded in three places; changing the
   actuation range silently invalidates old checkpoints.
 - Hardcoded W&B API key at `train/cnn_train.py` (`wandb.login(key=...)`) - rotate it.
+
+## Direct-from-disk training - `train/train_resnet_direct.py`
+
+Alternative to `cnn_train.py` that skips the LMDB entirely. Measured on an RTX A2000: the
+float32 LMDB delivers 96.5 img/s with 8 workers (its ceiling), while the JPEG folder gives
+468 img/s cold and 1975 img/s once the 4.83 GB dataset is in page cache. The model itself
+does 73 img/s in fp32 and 200 img/s with fp16 autocast + TF32 + channels_last, so the LMDB
+path caps throughput as soon as AMP is enabled.
+
+- Workers return **uint8**; `/255` and every augmentation run batched on the GPU. The
+  network sees the same [0, 1] float32 as before - only the storage dtype changed.
+- fp16 autocast, TF32 and channels_last on by default (`--no-amp` to disable).
+- `GpuAugment` implements brightness/contrast, affine, Gaussian noise and random occlusion
+  **per sample**. torchvision's v2 transforms sample parameters once per call, so applying
+  them to a batched tensor would give every image in the batch the same jitter or the same
+  rotation. Affine is wired up but is semantically risky here: the label is the position of
+  the spot pattern, so a translation resembles a different mirror tilt. Ablate it.
+- Label normalization derives from `X/Y_TILT_START/STOP` in `config.py` instead of the
+  hardcoded 5.7 / 4, so it cannot drift from what `app/inference.py` de-normalizes with.
+- Checkpoints are plain state dicts, verified to load into
+  `TiltPredictor(model_type="ResNet18")` with `strict=True`.
+- W&B logging is on by default and reads `WANDB_API_KEY` from the environment; no key is
+  stored in the repository. `--no-wandb` disables it.
+- `--data-share` (fraction of the dataset, default 1.0) and `--step-filter` (1/2/4 = 0.01 /
+  0.02 / 0.04 deg grid) make data-density ablations cheap. `--help` lists every knob.

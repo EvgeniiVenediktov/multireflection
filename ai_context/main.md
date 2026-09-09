@@ -55,6 +55,7 @@ It is empty in the working tree; anything importing it only runs on the Raspberr
   resnet18 checkpoint. One of the two is stale.
 - `config.py:SIMILARITY_INDEX_THRESHOLD = 0.95`; paper, README and `utils/graph_eval.py` use 0.97.
 - `train/cnn_train.py` contains a hardcoded W&B API key. Should be rotated / moved to env.
+  `train/train_resnet_direct.py` reads `WANDB_API_KEY` from the environment instead.
 
 ## Environment
 
