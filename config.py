@@ -1,13 +1,20 @@
 # Frame settings
 X_TILT_START = -2
-# X_TILT_STOP = 3.7
-X_TILT_STOP = 2
+X_TILT_STOP = 3.7
 
 Y_TILT_START = -2
 Y_TILT_STOP = 2
 
 REAL_DATA_COLLECTION_STEP = 0.01
 REAL_DATA_COLLECTION_DELAY = 0.1
+
+# X/Y_TILT_START/STOP above define the system tilt range - the physical actuation limits
+# used for inference de-normalization and the closed-loop alignment/eval code.
+# The data-collection range below defaults to the system range and can be overridden
+# to sweep a different range when collecting a dataset.
+DATA_COLLECTION_X_TILT_STOP = X_TILT_STOP
+# DATA_COLLECTION_X_TILT_STOP = 2
+DATA_COLLECTION_Y_TILT_STOP = Y_TILT_STOP
 
 DATA_COLLECTION_CVT_TO_GRAYSCALE = True 
 DATA_COLLECTION_FOLDER = "data/dark512"

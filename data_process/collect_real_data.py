@@ -54,10 +54,10 @@ if __name__ == "__main__":
 
     # Set coordinate matrix
     x_coord_start = X_TILT_START
-    x_coord_stop = X_TILT_STOP
+    x_coord_stop = DATA_COLLECTION_X_TILT_STOP
 
     y_coord_start = Y_TILT_START
-    y_coord_stop = Y_TILT_STOP
+    y_coord_stop = DATA_COLLECTION_Y_TILT_STOP
 
 
 
