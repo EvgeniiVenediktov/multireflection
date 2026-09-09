@@ -40,6 +40,7 @@ utils/                  eval-log plotting, misc helpers
 simulation/             GPU ray-trace sim, stability search, interactive viewers
 graphs/                 figures used by README and paper
 hardware_design/        BOM
+cluster/                Pitt CRCD job scripts (see "Cluster" below)
 spie-archive/           earlier SPIE conference manuscript (frozen)
 paper/                  git submodule - IEEE Access revision (see paper/AGENTS.md, INDEX.md)
 mf_control/             git submodule - motor + camera driver (MFController), NOT checked out
@@ -48,6 +49,21 @@ mf_control/             git submodule - motor + camera driver (MFController), NO
 `mf_control` is an external submodule providing `MFController`
 (`start`, `capture_image`, `set_tilt_x/y`, `get_x_tilt/get_y_tilt`, `get_frame_position`, `close`).
 It is empty in the working tree; anything importing it only runs on the Raspberry Pi.
+
+## Cluster (Pitt CRCD)
+
+Reachable from this machine as `ssh crc` (h2p.crc.pitt.edu, user evv13, key in ~/.ssh/crcd;
+non-interactive, so commands can be run there from here). Project checkout at
+`/ihome/kchen/evv13/multireflection`, dataset and checkpoints at
+`/ix1/kchen/evv/multireflection`. GPU jobs run on the `gpu` cluster, `l40s` partition, via
+`cluster/train_l40s.slurm`; the environment is built once with `cluster/check_env.sh`. Compute
+nodes have outbound HTTPS and W&B credentials come from `~/.netrc` (verified 2026-09-09 on
+gpu-n55). The job script passes `--cpus-per-task` to `srun` explicitly: since Slurm 22.05 srun
+does not reliably inherit it from sbatch, which would pin the loader workers to one core.
+`WANDB_DIR` is set to the run directory on `/ix1`, so no W&B files accumulate on `/ihome`.
+The kchen group has no `smp` billing minutes left (jobs pend on AssocGrpBillingMinutes);
+use the `gpu` cluster for test jobs too. Resource rationale and storage notes:
+`cluster/README.md`.
 
 ## Known inconsistencies (verify before trusting)
 

@@ -7,10 +7,9 @@
 # Monitor:  squeue -M gpu -u $USER      |  crc-job-stats <jobid>
 # Cancel:   scancel -M gpu <jobid>
 #
-# Uses the uv venv built once by cluster/check_env.sh, which matches uv.lock and so
-# matches local development exactly. This script never installs or syncs anything: it runs
-# .venv/bin/python directly, so it needs no network and starts instantly. Re-run
-# check_env.sh after changing uv.lock.
+# Runs .venv/bin/python directly (built by cluster/check_env.sh from uv.lock; re-run it
+# after changing uv.lock). Never installs anything. Resource choices, storage layout and
+# the staging rationale are explained in cluster/README.md.
 
 #SBATCH --job-name=mfl-resnet18
 #SBATCH --cluster=gpu
@@ -24,20 +23,6 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
-# Resource rationale (measured, see cluster/README.md):
-#   1 GPU   - single-GPU job; the model is 11M params and the dataset 4.8 GB. Nothing to
-#             gain from multi-GPU, and it would only lengthen the queue wait.
-#   12 CPU  - the l40s nodes are 64 cores / 4 GPUs, so 16 cores is the per-GPU fair share.
-#             The loader needs far less (2 workers fed an A2000 as well as 12), but the
-#             L40S is several times faster, so this leaves real headroom.
-#   96 GB   - matches the partition default (DefMemPerCPU=8000 x 12 CPUs), so asking for
-#             less would only give up free headroom: memory is billed at weight 0 on the
-#             GPU cluster, where jobs are charged per card. Far more than the 4.8 GB
-#             dataset needs; it lands on node-local NVMe anyway.
-#   1 day   - the default "normal" QOS allows 3 days; GPU jobs top out at "long" (6 days,
-#             add --qos=long). Shorter QOS means higher priority, so do not over-request.
-#             See README for the runtime estimate.
-
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/ihome/kchen/evv13/multireflection}"
@@ -46,19 +31,8 @@ DATA_TAR="$DATA_ROOT/data/dark512.tar.gz"
 RUN_DIR="$DATA_ROOT/runs/${SLURM_JOB_ID:-manual}"
 VENV_PY="${VENV_PY:-$PROJECT_DIR/.venv/bin/python}"
 
-# ---------------------------------------------------------------------------
-# Environment.
-#
-# Slurm does not source ~/.bashrc or ~/.profile, so this has to be explicit.
-#
-# module purge and nothing else: the venv carries its own CPython and its own CUDA runtime
-# (the torch wheels bundle nvidia-* packages). Loading a cuda module would be actively
-# harmful - cuda/12.9.0 prepends its lib64 to LD_LIBRARY_PATH and would shadow the CUDA 13
-# runtime in the venv. Only the driver matters, and these nodes run 595.91.07.
-#
-# Note the wheel ships no native sm_89 (Ada) kernels; it runs correctly on the L40S through
-# CUDA's forward binary compatibility from sm_86. Verified - see cluster/gpu_check.py.
-# ---------------------------------------------------------------------------
+# No modules: the venv carries its own CPython and CUDA runtime, and a cuda module would
+# shadow it through LD_LIBRARY_PATH. Slurm does not source ~/.bashrc, so purge explicitly.
 module purge
 
 cd "$PROJECT_DIR"
@@ -73,15 +47,9 @@ $VENV_PY -c "import torch; print('torch       :', torch.__version__, '| cuda', t
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 echo "=================================================================="
 
-# ---------------------------------------------------------------------------
-# Stage the dataset onto node-local NVMe.
-#
-# This is the important part. The archive holds 228,800 files averaging 22 KB. Reading
-# those repeatedly over /ix1 (a shared network filesystem) is exactly the many-small-files
-# pattern such filesystems are worst at, and it would also hammer a resource other people
-# share. $SLURM_SCRATCH is node-local NVMe with several TB free, and it is wiped when the
-# job ends, so anything worth keeping must be copied back out before then.
-# ---------------------------------------------------------------------------
+# Stage the 228,800 small JPEGs onto node-local NVMe; reading them off /ix1 every epoch
+# would be slow and hammer a shared filesystem. $SLURM_SCRATCH is wiped at job end, so
+# checkpoints go to $RUN_DIR on /ix1.
 STAGE="${SLURM_SCRATCH:-/tmp/$USER-${SLURM_JOB_ID:-manual}}"
 mkdir -p "$STAGE"
 echo "staging $DATA_TAR -> $STAGE"
@@ -94,16 +62,14 @@ echo "staged $(ls "$DATA_DIR" | wc -l) files in $(( $(date +%s) - t0 ))s"
 df -h "$STAGE" | tail -1
 
 mkdir -p "$RUN_DIR"
+# Keep the W&B run files next to the checkpoints on /ix1 instead of ./wandb on /ihome.
+export WANDB_DIR="$RUN_DIR"
 
-# ---------------------------------------------------------------------------
-# Train.
-#
-# batch_size 256 with lr 2e-3: 4x the local batch of 64, scaled by sqrt(4)=2 from 1e-3.
-# Peak memory is roughly 70 MiB/image, so ~21 GB of the L40S's 45 GB.
-# Compute nodes have outbound internet, so W&B logs online. Drop --wandb-project and add
-# --no-wandb for an unlogged run.
-# ---------------------------------------------------------------------------
-srun "$VENV_PY" train/train_resnet_direct.py \
+# bs 256 / lr 2e-3: 4x the local batch of 64, lr scaled by sqrt(4). ~21 GB of the 45 GB.
+# W&B auth comes from ~/.netrc (wandb login); add --no-wandb for an unlogged run.
+# --cpus-per-task is passed explicitly: srun does not reliably inherit it from sbatch
+# (Slurm 22.05+), and the loader workers would otherwise be pinned to one core.
+srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" train/train_resnet_direct.py \
     --data-dir "$DATA_DIR" \
     --checkpoint-dir "$RUN_DIR" \
     --name "resnet18_l40s_${SLURM_JOB_ID:-manual}" \
@@ -120,5 +86,5 @@ echo "checkpoints : $RUN_DIR"
 ls -lh "$RUN_DIR" || true
 echo "=================================================================="
 
-# CRCD wrapper: prints the job's resource utilization. Must run after srun, at the end.
+# CRCD wrapper: appends the job's resource utilization. Must run after srun.
 crc-job-stats 2>/dev/null || true
