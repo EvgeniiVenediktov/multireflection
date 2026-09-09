@@ -97,18 +97,6 @@ If you use this work, please cite:
 ```
 
 
-## Installation
-
-*Coming soon.*
-
-## Usage
-
-*Coming soon.*
-
-## Repository Structure
-
-*Coming soon.*
-
 ## License
 
 *TBD*
@@ -169,6 +157,65 @@ On the Raspberry Pi (aarch64) the default PyPI CPU wheels are used, which is wha
 ```bash
 uv export --no-hashes --no-dev --format requirements-txt -o requirements.txt
 ```
+
+## Training
+
+Both training scripts build the same ResNet-18 and write plain state dicts, so their
+checkpoints load directly into `TiltPredictor(model_type="ResNet18")` for deployment.
+
+### `train/train_resnet_direct.py` (current)
+
+Reads the preprocessed JPEGs straight from the collection directory. Workers return uint8
+and the `/255` conversion plus every augmentation run batched on the GPU, so nothing carries
+four bytes per pixel through the loader. fp16 autocast, TF32 and channels_last are on by
+default. Runs are logged to Weights & Biases; export `WANDB_API_KEY`, or pass `--no-wandb`.
+
+```bash
+uv run python train/train_resnet_direct.py                    # full dataset
+uv run python train/train_resnet_direct.py --data-share 0.25  # a quarter of it
+uv run python train/train_resnet_direct.py --step-filter 4    # 0.04 deg grid instead of 0.01
+uv run python train/train_resnet_direct.py --help             # every augmentation knob
+```
+
+Augmentation is brightness, contrast, Gaussian noise and random occlusion, each sampled per
+image. Affine is implemented but off by default: the label *is* the position of the spot
+pattern, so a translation resembles a different mirror tilt.
+
+### `train/cnn_train.py` (earlier)
+
+The original pipeline, reading float32 tensors from an LMDB built by
+`data_process/prepare_lmdb.py`. Needs the `lmdb` extra. Kept for reproducing earlier runs.
+
+### On the Pitt CRCD cluster
+
+```bash
+rsync -avP dark512.tar.gz crc:/ix1/kchen/evv/multireflection/data/
+ssh crc
+cd /ihome/kchen/evv13/multireflection && git pull
+bash cluster/check_env.sh
+sbatch cluster/train_l40s.slurm
+```
+
+Resource choices, storage layout and the staging rationale are documented in
+[cluster/README.md](cluster/README.md).
+
+## Repository Structure
+
+| Path | Contents |
+|---|---|
+| `config.py` | actuation range, model selection, evaluation grid |
+| `app/` | runs on the Raspberry Pi: inference, closed-loop alignment, evaluation sweep |
+| `data_process/` | data collection, image preprocessing, LMDB packing |
+| `train/` | training scripts and experiment notebooks |
+| `cluster/` | Pitt CRCD job scripts |
+| `utils/` | evaluation-log parsing and plotting |
+| `simulation/` | GPU ray-trace simulator, stability search, interactive viewers |
+| `herriott_env.py`, `policy.py`, `train_rl.py`, `config_sampler.py` | reinforcement-learning exploration, currently dormant |
+| `ai_context/` | condensed per-module notes on the codebase |
+| `graphs/` | figures used here and in the paper |
+| `hardware_design/` | bill of materials |
+| `mf_control/` | motor and camera driver (git submodule) |
+| `paper/`, `spie-archive/` | manuscripts (submodule / archived) |
 
 ## Acknowledgments
 
