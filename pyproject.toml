@@ -1,0 +1,47 @@
+[project]
+name = "multireflection"
+version = "0.1.0"
+description = "Deep-learning-enabled autonomous alignment of multipass Herriott cells for gas detection"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Direct dependencies only. Floors, not pins: uv.lock holds the exact resolution.
+dependencies = [
+    "numpy>=2.2",
+    "opencv-python>=4.11",
+    "torch>=2.6",
+    "torchvision>=0.21",
+    "tqdm>=4.67",
+    "wandb>=0.19",
+    "matplotlib>=3.10",
+    # griddata interpolation for the evaluation heatmaps in utils/graph_eval.py
+    "scipy>=1.15",
+    # SSIM stopping criterion in app/inference.py
+    "scikit-image>=0.25",
+]
+
+[project.optional-dependencies]
+# Legacy LMDB pipeline: data_process/prepare_lmdb.py and train/cnn_train.py.
+# train/train_resnet_direct.py reads JPEGs straight from disk and needs none of this.
+lmdb = [
+    "lmdb>=1.6",
+    "msgpack>=1.1",
+    "lz4>=4.4",
+    "torchinfo>=1.8",
+]
+# Zemax OpticStudio data generation, data_process/generate_simulated_data.py.
+# Windows only: pythonnet needs the .NET runtime and the ZOS-API DLLs.
+zemax = [
+    "pythonnet>=3.0",
+    "pillow>=11.1",
+]
+# model_real.ipynb and train/experiments/*.ipynb. Those notebooks are historical and also
+# import the "lmdb" extra.
+notebooks = [
+    "ipykernel>=6.29",
+    "jupyterlab>=4.3",
+]
+
+[tool.uv]
+# Scripts and modules live at the repository root; this is not an installable package.
+package = false

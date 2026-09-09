@@ -114,6 +114,62 @@ If you use this work, please cite:
 *TBD*
  -->
 
+## Installation
+
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). Install it first:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then create the environment from the lockfile:
+
+```bash
+uv sync                      # core: training, inference, simulation, analysis
+uv sync --extra lmdb         # adds the legacy LMDB pipeline
+uv sync --all-extras         # everything, including notebooks
+```
+
+Run anything through `uv run`, which resolves the environment automatically:
+
+```bash
+uv run python train/train_resnet_direct.py --help
+uv run python utils/graph_eval.py eval.log 0.97
+```
+
+### Extras
+
+| Extra | Adds | Needed for |
+|---|---|---|
+| `lmdb` | `lmdb`, `msgpack`, `lz4`, `torchinfo` | `data_process/prepare_lmdb.py`, `train/cnn_train.py` |
+| `zemax` | `pythonnet`, `pillow` | `data_process/generate_simulated_data.py` (Windows + OpticStudio only) |
+| `notebooks` | `ipykernel`, `jupyterlab` | `model_real.ipynb`, `train/experiments/*.ipynb` |
+
+### PyTorch and CUDA
+
+PyTorch is installed from PyPI, whose Linux x86_64 wheels bundle the CUDA runtime — no extra index is configured. On Windows, if CUDA is not picked up, add PyTorch's own index to `pyproject.toml`:
+
+```toml
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch" }]
+torchvision = [{ index = "pytorch" }]
+```
+
+On the Raspberry Pi (aarch64) the default PyPI CPU wheels are used, which is what inference needs.
+
+### requirements.txt
+
+`requirements.txt` is generated from `uv.lock` and kept only for environments without uv, such as the Raspberry Pi. Do not edit it by hand — regenerate it with:
+
+```bash
+uv export --no-hashes --no-dev --format requirements-txt -o requirements.txt
+```
+
 ## Acknowledgments
 
 This work was supported by the University of Pittsburgh.

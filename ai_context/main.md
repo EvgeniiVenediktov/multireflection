@@ -30,6 +30,8 @@ Result claimed in the paper/README: 100% alignment success over the full actuati
 ## Repository layout
 
 ```
+pyproject.toml          dependencies and extras, managed with uv (uv.lock is committed)
+requirements.txt        generated from uv.lock, for environments without uv (the Pi)
 config.py               global constants for data collection / inference / eval
 app/                    on-device: inference, closed-loop alignment, eval sweep
 data_process/           data collection, image preprocessing, LMDB build
@@ -53,3 +55,15 @@ It is empty in the working tree; anything importing it only runs on the Raspberr
   resnet18 checkpoint. One of the two is stale.
 - `config.py:SIMILARITY_INDEX_THRESHOLD = 0.95`; paper, README and `utils/graph_eval.py` use 0.97.
 - `train/cnn_train.py` contains a hardcoded W&B API key. Should be rotated / moved to env.
+
+## Environment
+
+Managed with **uv**; `uv.lock` is committed. `uv sync` gives the core set, `--extra lmdb`
+adds the legacy LMDB pipeline, `--extra zemax` the Windows OpticStudio path, `--extra
+notebooks` Jupyter. Run things with `uv run python <script>`.
+
+Removed as unnecessary during the uv transition: `scikit-learn` (was pulled in for a single
+`train_test_split` call, now a four-line stdlib shuffle in `prepare_lmdb.py`),
+`torchsummary` (unmaintained since 2018, replaced by `torchinfo`), and dead `msgpack` /
+`lz4` imports in `cnn_train.py`. `lmdb`, `msgpack`, `lz4` and `torchinfo` moved to the
+`lmdb` extra; `pillow` and `pythonnet` to `zemax`.
