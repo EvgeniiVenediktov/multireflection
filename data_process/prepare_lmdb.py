@@ -1,5 +1,6 @@
 import lmdb
 import os
+import random
 from preprocess_images import process_single_image
 from config import DATA_COLLECTION_CVT_TO_GRAYSCALE, DATA_COLLECTION_FINAL_RESOLUTION, TRAINING_IMAGE_RESOLUTION
 import pickle
@@ -8,7 +9,6 @@ import numpy as np
 import msgpack
 from tqdm import tqdm
 import lz4.frame
-from sklearn.model_selection import train_test_split
 import torch
 import io
 from typing import Callable
@@ -179,7 +179,10 @@ def write_split_keys(keys:list[str], path, filter:callable = None, val_share=0.2
         keys = new_keys
 
     # Split
-    train, val = train_test_split(keys, test_size=val_share)
+    shuffled = list(keys)
+    random.Random(0).shuffle(shuffled)
+    n_val = int(len(shuffled) * val_share)
+    val, train = shuffled[:n_val], shuffled[n_val:]
     print("train len:", len(train))
     print("val len:", len(val))
     # Write

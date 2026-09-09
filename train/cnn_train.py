@@ -14,16 +14,14 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.v2 as T
-from torchsummary import summary
+from torchinfo import summary
 import cv2 
 import wandb
 from config import LMDB_USE_COMPRESSION
 
 import lmdb
 import os
-import msgpack
 import io
-import lz4.frame
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
@@ -601,7 +599,7 @@ if config["use_weight_initialization"]:
                 nn.init.zeros_(m.bias)
 
 
-summary(model, (1,512,512), config["batch_size"])
+summary(model, input_size=(config["batch_size"], 1, 512, 512))
        
 # %%
 optimizer = optim.AdamW(model.parameters(), config["lr"], weight_decay=0.001)
