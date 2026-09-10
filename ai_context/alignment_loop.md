@@ -73,9 +73,13 @@ keeps it near 0.1, so the loop never "converges" even though the final error is 
 `--model-resolution N` area-downscales the (perturbed) frame to the model's input size and
 re-quantizes it; the SSIM stop test stays on the bank's frame. Run every model on dark512
 with it to compare input sizes on identical frames and stop test.
-`utils/eval_sweep.py` runs 29 conditions (clean, noise 0.02/0.05/0.1/0.15/0.2/0.3,
+`--occlusion-angle A` rotates each box by an angle in [-A, A] deg and
+`--occlusion-bright-prob P` fills it white (`--occlusion-bright-value`) with probability P;
+their draws follow the box geometry, so older conditions are unchanged.
+`utils/eval_sweep.py` runs 39 conditions (clean, noise 0.02/0.05/0.1/0.15/0.2/0.3,
 brightness 0.4/0.6/0.8/1.2/1.4/1.6, contrast 0.9/1.1, occlusion 1/2 boxes of random edge
-0.15-0.40, 1/2 boxes of fixed edge 10/20/30/40/50%, combined, combined_harsh) and writes
+0.15-0.40, 1/2 boxes of fixed edge 10/20/30/40/50%, 1x30/2x30/2x50 bright, rotated and
+both, occlusion_2_mixed, combined, combined_harsh) and writes
 `sweep.csv` / `sweep.md`; `--conditions` selects a subset, `--wandb` logs a table.
 `utils/eval_compare.py` merges several `sweep.csv` into one table;
 `cluster/eval_sweep_l40s.slurm` runs one checkpoint's sweep on an L40S.

@@ -15,8 +15,9 @@ threshold. Training is supervised regression on the collected image bank.
 **Run names** (since 2026-09-10; checkpoints, run directories and W&B display names):
 `r<resolution>[_ft]_occ<box edge % min-max><img|batch>_n<noise sigma x100>_e<epochs>_<job>`.
 All runs so far use 2 boxes with p 0.5; `img` = boxes drawn per image, `batch` = drawn once
-per batch; `n00-20` = sigma per image in [0, 0.2]; `_ft` = fine-tuned; `local` = trained on
-the dev machine. Checkpoints are `<name>.pth` in `runs/<name>/` on the cluster and in
+per batch; `-rot90-bri50` = boxes rotated in [-90, 90] deg and white with p 0.5 (absent =
+axis-aligned black boxes); `n00-20` = sigma per image in [0, 0.2]; `_ft` = fine-tuned;
+`local` = trained on the dev machine. Checkpoints are `<name>.pth` in `runs/<name>/` on the cluster and in
 `saved_models/real/` locally. Old names: `resnet18_l40s_<job>_best_model.pth` in `runs/<job>/`.
 
 **Current best 512 px checkpoint:** `r512_occ05-20img_n10_e96_3854472.pth`, CRCD job
@@ -101,7 +102,7 @@ occlusion):
 | brightness jitter | factor in [0.6, 1.4] | `--brightness 0.4` | original |
 | contrast jitter | factor in [0.9, 1.1] | `--contrast 0.1` | original |
 | Gaussian noise | sigma per image uniform in [0, 0.2] | `--noise-min 0.0 --noise 0.2` | 2026-09-10 (was fixed 0.1) |
-| occlusion (cutout) | 2 boxes, each with p 0.5, edges 0.15 to 0.40 of the image, fill 0, drawn once per batch and applied to every image in it | `--occlusion-*` | boxes per batch and 0.15-0.40 since 2026-09-10 (was per image, 0.05-0.20) |
+| occlusion (cutout) | 2 boxes, each with p 0.5, edges 0.15 to 0.40 of the image, rotated about the centre by an angle in [-90, 90] deg, white (1.0, glare) with p 0.5 else black (dust), drawn once per batch and applied to every image in it | `--occlusion-*`, `--occlusion-angle`, `--occlusion-bright-prob/-value` | boxes per batch and 0.15-0.40 since 2026-09-10 (was per image, 0.05-0.20); rotation and bright boxes since 2026-09-11 |
 | affine | off | `--affine-*` | never on; a translation resembles a different tilt |
 
 The run names encode which recipe each run used (section 1). A rerun of
@@ -220,12 +221,17 @@ trajectory index) and kept for all its steps, since dust does not move between m
 Frames are quantized to 8 bit. The SSIM stop test uses the clean frame unless
 `--perturb-ssim`, which disables memoization and computes SSIM per trajectory and step.
 
-**`utils/eval_sweep.py`** runs 29 conditions on one checkpoint and writes `sweep.csv` /
+**`utils/eval_sweep.py`** runs 39 conditions on one checkpoint and writes `sweep.csv` /
 `sweep.md` (`--conditions` selects a subset, `--wandb` logs a table): clean; noise sigma
 0.02/0.05/0.10/0.15/0.20/0.30; brightness factor 0.4/0.6/0.8/1.2/1.4/1.6; contrast 0.9/1.1;
 1 or 2 boxes of random edge 0.15-0.40 (`occlusion_1/2`); 1 or 2 boxes of fixed edge
-10/20/30/40/50% (`occlusion_<n>x<edge>`, 1 to 25% of the area per box); `combined` (the
-training augmentation) and `combined_harsh` (noise 0.2, brightness 0.6, 2 boxes of 30%).
+10/20/30/40/50% (`occlusion_<n>x<edge>`, 1 to 25% of the area per box); 1x30, 2x30 and
+2x50 boxes white (`_bright`), rotated in [-45, 45] deg (`_rot`) or both (`_rotbright`);
+`occlusion_2_mixed` (2 boxes of 0.15-0.40, rotated in [-90, 90], white with p 0.5: the
+training occlusion with every box applied); `combined` (the training augmentation before
+2026-09-11) and `combined_harsh` (noise 0.2, brightness 0.6, 2 boxes of 30%). Eval flags:
+`--occlusion-angle A`, `--occlusion-bright-prob P`, `--occlusion-bright-value V`; the new
+draws come after the box geometry, so conditions without them are unchanged.
 Seed 0, so every model gets the same per-start draws. Clean-frame SSIM stop test.
 
 **Comparing input sizes.** `eval_batched.py --model-resolution N` perturbs the 512 px frame,

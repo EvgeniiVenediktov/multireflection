@@ -177,6 +177,9 @@ class Perturbation:
         self.occlusion_prob = args.occlusion_prob
         if self.occlusion_prob is None:
             self.occlusion_prob = 1.0 if self.occlusion_count > 0 else 0.0
+        self.occlusion_angle = args.occlusion_angle
+        self.occlusion_bright_prob = args.occlusion_bright_prob
+        self.occlusion_bright_value = args.occlusion_bright_value
         self.ssim = bool(args.perturb_ssim)
         self.use_brightness = bool(self.brightness) or self.brightness_fixed is not None
         self.use_contrast = bool(self.contrast) or self.contrast_fixed is not None
@@ -190,6 +193,8 @@ class Perturbation:
         contr = np.ones(n)
         sigma = np.full(n, self.noise)
         boxes = np.zeros((n, max(K, 1), 4), dtype=np.int64)  # top, left, h, w; h = w = 0: not applied
+        angles = np.zeros((n, max(K, 1)))  # degrees, rotation about the box centre
+        fills = np.zeros((n, max(K, 1)))  # 0 = dark box, occlusion_bright_value = bright box
         b_amp = self.brightness or 0.0
         c_amp = self.contrast or 0.0
         for i in range(n):
@@ -210,7 +215,14 @@ class Perturbation:
                 left = int(rng.integers(0, W - box_w + 1))
                 if applied:
                     boxes[i, k] = (top, left, box_h, box_w)
+            # Drawn after all boxes, so the geometry above is what it was before these existed
+            for k in range(K):
+                angles[i, k] = rng.uniform(-1.0, 1.0) * self.occlusion_angle
+                if rng.random() < self.occlusion_bright_prob:
+                    fills[i, k] = self.occlusion_bright_value
         self.bright_np, self.contr_np, self.sigma_np, self.boxes_np = bright, contr, sigma, boxes
+        self.angles = torch.tensor(angles, dtype=torch.float32, device=device)
+        self.fills = torch.tensor(fills, dtype=torch.float32, device=device)
         self.bright = torch.tensor(bright, dtype=torch.float32, device=device)
         self.contr = torch.tensor(contr, dtype=torch.float32, device=device)
         self.sigma = torch.tensor(sigma, dtype=torch.float32, device=device)
@@ -230,6 +242,9 @@ class Perturbation:
             "occlusion_min": self.occlusion_min if self.use_occlusion else None,
             "occlusion_max": self.occlusion_max if self.use_occlusion else None,
             "occlusion_prob": self.occlusion_prob if self.use_occlusion else None,
+            **({"occlusion_angle": self.occlusion_angle, "occlusion_bright_prob": self.occlusion_bright_prob,
+                "occlusion_bright_value": self.occlusion_bright_value}
+               if self.use_occlusion and (self.occlusion_angle or self.occlusion_bright_prob) else {}),
             "perturb_ssim": self.ssim,
             "perturb_seed": self.seed,
         }
@@ -251,7 +266,11 @@ class Perturbation:
                 parts.append(f"noise sigma {self.noise:g}, re-drawn per step")
         if self.use_occlusion:
             parts.append(f"{self.occlusion_count} occlusion box(es) of edge [{self.occlusion_min:g}, {self.occlusion_max:g}] "
-                         f"with prob {self.occlusion_prob:g} per trajectory")
+                         f"with prob {self.occlusion_prob:g} per trajectory"
+                         + (f", rotated in [-{self.occlusion_angle:g}, {self.occlusion_angle:g}] deg"
+                            if self.occlusion_angle else "")
+                         + (f", bright ({self.occlusion_bright_value:g}) with prob {self.occlusion_bright_prob:g}"
+                            if self.occlusion_bright_prob else ""))
         if not parts:
             return "none"
         return "; ".join(parts) + f"; seed {self.seed}; SSIM on {'perturbed' if self.ssim else 'clean'} image"
@@ -267,7 +286,7 @@ class Perturbation:
         if self.use_noise:
             noise = torch.randn(x.shape, generator=self.gen, device=self.device, dtype=x.dtype)
             x = (x + noise * self.sigma[idx].view(-1, 1, 1, 1)).clamp_(0.0, 1.0)
-        if self.use_occlusion:
+        if self.use_occlusion and not (self.occlusion_angle or self.occlusion_bright_prob):
             H, W = x.shape[-2:]
             box = self.boxes[idx]  # (B, K, 4)
             top, left, bh, bw = box[..., 0, None], box[..., 1, None], box[..., 2, None], box[..., 3, None]
@@ -277,6 +296,21 @@ class Perturbation:
             cmask = (cols >= left) & (cols < left + bw)  # (B, K, W)
             mask = (rmask[..., :, None] & cmask[..., None, :]).any(dim=1)  # (B, H, W)
             x = x.masked_fill(mask[:, None], 0.0)
+        elif self.use_occlusion:
+            # Rotated and/or bright boxes, one at a time (a later box paints over an earlier one).
+            # Pixel centres at +0.5, so angle 0 covers exactly the axis-aligned box above.
+            H, W = x.shape[-2:]
+            rows = torch.arange(H, device=self.device, dtype=torch.float32).view(1, H, 1) + 0.5
+            cols = torch.arange(W, device=self.device, dtype=torch.float32).view(1, 1, W) + 0.5
+            for k in range(self.boxes.shape[1]):
+                top, left, bh, bw = (self.boxes[idx, k, j].float().view(-1, 1, 1) for j in range(4))
+                t = torch.deg2rad(self.angles[idx, k]).view(-1, 1, 1)
+                dr = rows - (top + bh / 2)
+                dc = cols - (left + bw / 2)
+                u = dc * torch.cos(t) + dr * torch.sin(t)
+                v = dr * torch.cos(t) - dc * torch.sin(t)
+                mask = (u.abs() <= bw / 2) & (v.abs() <= bh / 2) & (bh > 0)  # (B, H, W)
+                x = torch.where(mask[:, None], self.fills[idx, k].view(-1, 1, 1, 1), x)
         # A camera frame is 8 bit: quantize so the model and the SSIM test see the same frame
         return x.mul_(255.0).round_().div_(255.0)
 
@@ -669,6 +703,11 @@ def parse_args(argv=None):
     q.add_argument("--occlusion-max", type=float, default=0.40)
     q.add_argument("--occlusion-prob", type=float, default=None,
                    help="probability each box is applied (default 1.0 when --occlusion-count > 0)")
+    q.add_argument("--occlusion-angle", type=float, default=0.0,
+                   help="each box is rotated about its centre by an angle drawn in [-A, A] degrees")
+    q.add_argument("--occlusion-bright-prob", type=float, default=0.0,
+                   help="probability a box is filled with --occlusion-bright-value instead of black")
+    q.add_argument("--occlusion-bright-value", type=float, default=1.0, help="bright box fill in [0, 1]")
     q.add_argument("--perturb-ssim", action="store_true",
                    help="also feed the perturbed frame to the SSIM stop test (default: SSIM on the clean image)")
     q.add_argument("--perturb-seed", type=int, default=0)

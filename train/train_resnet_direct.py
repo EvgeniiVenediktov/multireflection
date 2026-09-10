@@ -134,6 +134,9 @@ config = {
     "occlusion_min": 0.15,        # box edge as a fraction of image size
     "occlusion_max": 0.40,
     "occlusion_value": 0.0,       # fill value in normalized units
+    "occlusion_angle": 90.0,      # each box rotated about its centre by an angle in [-A, A] deg
+    "occlusion_bright_prob": 0.5,  # probability a box is a bright patch (glare) instead of dark
+    "occlusion_bright_value": 1.0,
 
     "checkpoint_dir": "./saved_models/real",
     "starting_checkpoint": None,
@@ -254,6 +257,18 @@ class DirectImageDataset(Dataset):
         return torch.from_numpy(img).unsqueeze(0), self.labels[index]
 
 
+def rotated_box_mask(H, W, top, left, box_h, box_w, angle_deg, device):
+    """(H, W) bool mask of the box_h x box_w rectangle placed at (top, left), rotated by
+    angle_deg about its centre. Pixel centres sit at +0.5, so angle 0 covers exactly rows
+    top..top+box_h-1 and columns left..left+box_w-1. utils/eval_batched.py uses the same test."""
+    t = math.radians(angle_deg)
+    dr = torch.arange(H, device=device, dtype=torch.float32)[:, None] + 0.5 - (top + box_h / 2)
+    dc = torch.arange(W, device=device, dtype=torch.float32)[None, :] + 0.5 - (left + box_w / 2)
+    u = dc * math.cos(t) + dr * math.sin(t)
+    v = dr * math.cos(t) - dc * math.sin(t)
+    return (u.abs() <= box_w / 2) & (v.abs() <= box_h / 2)
+
+
 class GpuAugment:
     """
     Photometric jitter, affine warp, Gaussian noise and random occlusion, applied to a
@@ -266,7 +281,8 @@ class GpuAugment:
     pipeline, which was why these are written out by hand.
 
     Occlusion is the exception: its boxes are drawn once PER BATCH and applied to every
-    image in it (decided 2026-09-10; runs before that used per-image boxes).
+    image in it (decided 2026-09-10; runs before that used per-image boxes). Each box is
+    rotated by a random angle and is dark (dust) or bright (glare); both since 2026-09-11.
 
     Order: affine -> photometric (brightness/contrast, random order) -> noise -> occlusion.
     Occlusion goes last so the boxes are not blurred away or rescaled by the warp.
@@ -275,7 +291,8 @@ class GpuAugment:
     def __init__(self, brightness=0.0, contrast=0.0, noise_sigma=0.0, noise_sigma_min=None,
                  affine_degrees=0.0, affine_translate=0.0, affine_scale=0.0,
                  affine_shear=0.0, occlusion_prob=0.0, occlusion_count=0,
-                 occlusion_min=0.05, occlusion_max=0.2, occlusion_value=0.0):
+                 occlusion_min=0.05, occlusion_max=0.2, occlusion_value=0.0,
+                 occlusion_angle=0.0, occlusion_bright_prob=0.0, occlusion_bright_value=1.0):
         self.brightness = brightness
         self.contrast = contrast
         self.noise_sigma = noise_sigma
@@ -291,6 +308,9 @@ class GpuAugment:
         self.occlusion_min = occlusion_min
         self.occlusion_max = occlusion_max
         self.occlusion_value = occlusion_value
+        self.occlusion_angle = occlusion_angle
+        self.occlusion_bright_prob = occlusion_bright_prob
+        self.occlusion_bright_value = occlusion_bright_value
 
     @property
     def uses_affine(self) -> bool:
@@ -356,7 +376,13 @@ class GpuAugment:
         )
 
     def _occlude(self, x):
-        """Cutout boxes drawn once per batch and applied to every image in it."""
+        """Cutout boxes drawn once per batch and applied to every image in it.
+
+        Each box is placed as an axis-aligned rectangle, rotated about its centre by an
+        angle in [-occlusion_angle, occlusion_angle] degrees (corners may leave the frame),
+        and filled with occlusion_bright_value with probability occlusion_bright_prob,
+        otherwise occlusion_value.
+        """
         _, _, H, W = x.shape
         rng = random.Random()  # CPU draws; a handful of scalars per batch
         for _ in range(self.occlusion_count):
@@ -366,7 +392,13 @@ class GpuAugment:
             box_w = max(1, min(W, int(rng.uniform(self.occlusion_min, self.occlusion_max) * W)))
             top = rng.randint(0, H - box_h)
             left = rng.randint(0, W - box_w)
-            x[:, :, top:top + box_h, left:left + box_w] = self.occlusion_value
+            angle = rng.uniform(-self.occlusion_angle, self.occlusion_angle)
+            bright = rng.random() < self.occlusion_bright_prob
+            value = self.occlusion_bright_value if bright else self.occlusion_value
+            if angle == 0.0:
+                x[:, :, top:top + box_h, left:left + box_w] = value
+            else:
+                x.masked_fill_(rotated_box_mask(H, W, top, left, box_h, box_w, angle, x.device), value)
         return x
 
     # -- pipeline -----------------------------------------------------------
@@ -413,6 +445,9 @@ def make_gpu_augment(cfg: dict):
         occlusion_min=cfg["occlusion_min"],
         occlusion_max=cfg["occlusion_max"],
         occlusion_value=cfg["occlusion_value"],
+        occlusion_angle=cfg["occlusion_angle"],
+        occlusion_bright_prob=cfg["occlusion_bright_prob"],
+        occlusion_bright_value=cfg["occlusion_bright_value"],
     )
     active = (aug.brightness or aug.contrast or aug.noise_sigma
               or aug.uses_affine or aug.uses_occlusion)
@@ -708,7 +743,8 @@ def main(cfg: dict) -> None:
               f"translate={augment.affine_translate} scale={augment.affine_scale} "
               f"shear={augment.affine_shear} | occlusion p={augment.occlusion_prob} "
               f"n={augment.occlusion_count} size=[{augment.occlusion_min}, "
-              f"{augment.occlusion_max}]")
+              f"{augment.occlusion_max}] angle=+-{augment.occlusion_angle} "
+              f"bright p={augment.occlusion_bright_prob} value={augment.occlusion_bright_value}")
 
     run = None
     if cfg["use_wandb"]:
@@ -846,6 +882,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     aug.add_argument("--occlusion-count", type=int, default=config["occlusion_count"])
     aug.add_argument("--occlusion-min", type=float, default=config["occlusion_min"])
     aug.add_argument("--occlusion-max", type=float, default=config["occlusion_max"])
+    aug.add_argument("--occlusion-angle", type=float, default=config["occlusion_angle"],
+                     help="box rotation drawn in [-A, A] degrees; 0 keeps boxes axis-aligned")
+    aug.add_argument("--occlusion-bright-prob", type=float, default=config["occlusion_bright_prob"],
+                     help="probability a box is filled with --occlusion-bright-value instead of black")
+    aug.add_argument("--occlusion-bright-value", type=float, default=config["occlusion_bright_value"])
     aug.add_argument("--no-augment", action="store_true",
                      help="turn every augmentation stage off at once")
 
@@ -891,6 +932,9 @@ if __name__ == "__main__":
         "occlusion_count": args.occlusion_count,
         "occlusion_min": args.occlusion_min,
         "occlusion_max": args.occlusion_max,
+        "occlusion_angle": args.occlusion_angle,
+        "occlusion_bright_prob": args.occlusion_bright_prob,
+        "occlusion_bright_value": args.occlusion_bright_value,
 
         "wandb_project": args.wandb_project,
         "use_wandb": not args.no_wandb,

@@ -19,7 +19,10 @@ decode. Throughput numbers are in the history section above.
   **per sample**, except occlusion, whose boxes are drawn once per batch and shared by every
   image in it (since 2026-09-10; earlier runs, r512_occ05-20img_n10_e96_3854472,
   r512_ft_occ15-40img_n10_e49_3866737 and r512_occ15-40img_n00-20_e96_3866805, used per-image
-  boxes, hence `img` in their names; later runs have `batch`). Default epochs 98 = 14 cosine cycles of 7 (was 96).
+  boxes, hence `img` in their names; later runs have `batch`). Since 2026-09-11 each box is
+  also rotated about its centre by an angle in [-90, 90] deg (`--occlusion-angle`) and is
+  white (1.0, glare) with p 0.5 instead of black (`--occlusion-bright-prob/-value`);
+  `rotated_box_mask` is the shared geometry, and run names carry `-rot90-bri50`. Default epochs 98 = 14 cosine cycles of 7 (was 96).
   torchvision's v2 transforms sample parameters once per call, so applying
   them to a batched tensor would give every image in the batch the same jitter or the same
   rotation. Affine is wired up but is semantically risky here: the label is the position of

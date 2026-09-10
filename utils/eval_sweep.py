@@ -9,6 +9,11 @@ checkpoint under each condition and writes one comparison table. Conditions, in 
     contrast_0.9, contrast_1.1               fixed contrast factor (GpuAugment's 0.1 extremes)
     occlusion_1, occlusion_2                 1 or 2 boxes per trajectory, edge 0.15 to 0.40
     occlusion_1x10 .. occlusion_2x50         1 or 2 boxes of a fixed edge, 10 to 50% of the image
+    occlusion_{1x30,2x30,2x50}_bright        the same boxes filled white (saturated) instead of black
+    occlusion_{1x30,2x30,2x50}_rot           rotated by an angle in [-45, 45] deg (a square repeats every 90)
+    occlusion_{1x30,2x30,2x50}_rotbright     rotated and white
+    occlusion_2_mixed                        2 boxes, edge 0.15-0.40, rotated in [-90, 90], white with p 0.5:
+                                             the training occlusion (every box applied) at eval
     combined                                 noise 0.1 + brightness 0.4 + contrast 0.1 +
                                              2 boxes: the training augmentation at eval
     combined_harsh                           noise 0.2 + brightness 0.6 + 2 boxes of edge 30%
@@ -46,6 +51,12 @@ CONDITIONS = [
     ("occlusion_1", _boxes(1, "0.15", "0.40")),
     ("occlusion_2", _boxes(2, "0.15", "0.40")),
     *[(f"occlusion_{n}x{e}", _boxes(n, f"0.{e}", f"0.{e}")) for n in (1, 2) for e in ("10", "20", "30", "40", "50")],
+    *[(f"occlusion_{n}x{e}_{kind}", _boxes(n, f"0.{e}", f"0.{e}") + flags)
+      for kind, flags in (("bright", ["--occlusion-bright-prob", "1.0"]),
+                          ("rot", ["--occlusion-angle", "45"]),
+                          ("rotbright", ["--occlusion-angle", "45", "--occlusion-bright-prob", "1.0"]))
+      for n, e in ((1, "30"), (2, "30"), (2, "50"))],
+    ("occlusion_2_mixed", _boxes(2, "0.15", "0.40") + ["--occlusion-angle", "90", "--occlusion-bright-prob", "0.5"]),
     ("combined", ["--noise", "0.1", "--brightness", "0.4", "--contrast", "0.1", *_boxes(2, "0.15", "0.40")]),
     ("combined_harsh", ["--noise", "0.2", "--brightness-fixed", "0.6", *_boxes(2, "0.30", "0.30")]),
 ]
