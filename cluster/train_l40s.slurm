@@ -5,6 +5,10 @@
 #   cd /ihome/kchen/evv13/multireflection
 #   sbatch cluster/train_l40s.slurm
 #
+# Fine-tune from an existing checkpoint, fewer epochs (values are read from the environment):
+#   sbatch --export=ALL,START_CKPT=/ix1/kchen/evv/multireflection/runs/3854472/resnet18_l40s_3854472_best_model.pth,EPOCHS=49 \
+#       cluster/train_l40s.slurm
+#
 # Monitor:  squeue -M gpu -u $USER      |  crc-job-stats <jobid>
 # Cancel:   scancel -M gpu <jobid>
 #
@@ -31,6 +35,8 @@ DATA_ROOT="${DATA_ROOT:-/ix1/kchen/evv/multireflection}"
 DATA_TAR="$DATA_ROOT/data/dark512.tar.gz"
 RUN_DIR="$DATA_ROOT/runs/${SLURM_JOB_ID:-manual}"
 VENV_PY="${VENV_PY:-$PROJECT_DIR/.venv/bin/python}"
+EPOCHS="${EPOCHS:-96}"
+START_CKPT="${START_CKPT:-}"        # absolute path to a state dict, empty = from scratch
 
 # No modules: the venv carries its own CPython and CUDA runtime, and a cuda module would
 # shadow it through LD_LIBRARY_PATH. Slurm does not source ~/.bashrc, so purge explicitly.
@@ -73,13 +79,21 @@ export WANDB_RUN_ID="l40s-${SLURM_JOB_ID:-manual}"
 # --cpus-per-task is passed explicitly: srun does not reliably inherit it from sbatch
 # (Slurm 22.05+), and the loader workers would otherwise be pinned to one core.
 RUN_NAME="resnet18_l40s_${SLURM_JOB_ID:-manual}"
+START_ARGS=()
+if [ -n "$START_CKPT" ]; then
+    [ -f "$START_CKPT" ] || { echo "no checkpoint at $START_CKPT"; exit 1; }
+    RUN_NAME="resnet18_l40s_ft_${SLURM_JOB_ID:-manual}"
+    START_ARGS=(--starting-checkpoint "$START_CKPT")
+    echo "fine-tuning : $START_CKPT"
+fi
 srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" train/train_resnet_direct.py \
     --data-dir "$DATA_DIR" \
     --checkpoint-dir "$RUN_DIR" \
     --name "$RUN_NAME" \
+    "${START_ARGS[@]}" \
     --batch-size 512 \
     --lr 0.0028 \
-    --epochs 96 \
+    --epochs "$EPOCHS" \
     --num-workers 10 \
     --val-num-workers 2 \
     --wandb-project multireflection
