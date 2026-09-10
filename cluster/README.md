@@ -38,7 +38,10 @@ scancel -M gpu <jobid>
 tail -f logs/mfl-resnet18-<jobid>.out
 ```
 
-Checkpoints land in `/ix1/kchen/evv/multireflection/runs/<jobid>/`.
+Checkpoints land in `/ix1/kchen/evv/multireflection/runs/<jobid>/`. After training the job
+runs `utils/eval_batched.py` on the best checkpoint against the staged image bank; the
+trace, log, summary and heatmaps land in `runs/<jobid>/eval/` and the summary metrics and
+heatmaps are attached to the training's W&B run (both stages share `WANDB_RUN_ID`).
 
 ## Resource request, and why
 

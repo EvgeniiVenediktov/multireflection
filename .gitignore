@@ -194,3 +194,4 @@ paper-wip/spie-manuscript/dark.html
 *.out
 *.synctex.gz
 *.toc
+eval_results/

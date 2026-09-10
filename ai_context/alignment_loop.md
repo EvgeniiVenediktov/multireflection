@@ -38,6 +38,23 @@ origin_x:..,origin_y:..,adj_n:..,pred_x:..,pred_y:..,pos_x:..,pos_y:..,sim_index
 
 Reported numbers are averaged over five complete runs.
 
+## Offline batched sweep - `utils/eval_batched.py`
+
+Replays the sweep above on the image bank (`/mnt/h/dark512` locally, the staged copy on the
+cluster) with no hardware: the folder is the position -> image lookup, every start on a
+grid (`--grid-step`, default 0.1) is advanced simultaneously, the model runs in GPU batches,
+SSIM is memoized per position in a thread pool. Same update rule as `app/eval.py`
+(negated clipped prediction, round to 0.01, cap `--max-adj` 10), threshold 0.97 by
+default, SSIM rounded to 2 decimals like `evaluate_position`. Outputs in
+`eval_results/<ckpt>/` (gitignored): `trace.csv` (every start at every step t, t=0
+included, with `ssim_raw` unrounded), `eval.log` (hardware format, `graph_eval.py` reads
+it), `summary.json`, `heatmap_{adjustments,angular_error,final_ssim}.png`. `--wandb`
+resumes the run in `WANDB_RUN_ID` and writes `eval/*` summary keys plus the images; the
+L40S job uses this. Starts are training positions, and time-to-align does not exist here.
+
+Result for `resnet18_l40s_3854472` (2026-09-10): 2320 starts, 100% converged,
+1.14 +- 0.35 adjustments, final SSIM 0.984 +- 0.007, angular error 0.027 +- 0.015 deg.
+
 ## Log analysis - `utils/graph_eval.py`
 
 `python utils/graph_eval.py [eval.log] [threshold=0.97]`. Groups lines by origin, finds the first

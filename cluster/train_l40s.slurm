@@ -1,5 +1,6 @@
 #!/bin/bash
-# train_l40s.slurm - ResNet-18 tilt regression on one CRCD L40S.
+# train_l40s.slurm - ResNet-18 tilt regression on one CRCD L40S, then the offline
+# alignment sweep (utils/eval_batched.py) on the best checkpoint.
 #
 #   cd /ihome/kchen/evv13/multireflection
 #   sbatch cluster/train_l40s.slurm
@@ -63,16 +64,19 @@ df -h "$STAGE" | tail -1
 
 mkdir -p "$RUN_DIR"
 # Keep the W&B run files next to the checkpoints on /ix1 instead of ./wandb on /ihome.
+# A fixed run id lets the eval stage below resume the same run and attach its summary.
 export WANDB_DIR="$RUN_DIR"
+export WANDB_RUN_ID="l40s-${SLURM_JOB_ID:-manual}"
 
 # bs 512 / lr 2.8e-3: 8x the local batch of 64, lr scaled by sqrt(8). ~36 GB of the 45 GB.
 # W&B auth comes from ~/.netrc (wandb login); add --no-wandb for an unlogged run.
 # --cpus-per-task is passed explicitly: srun does not reliably inherit it from sbatch
 # (Slurm 22.05+), and the loader workers would otherwise be pinned to one core.
+RUN_NAME="resnet18_l40s_${SLURM_JOB_ID:-manual}"
 srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" train/train_resnet_direct.py \
     --data-dir "$DATA_DIR" \
     --checkpoint-dir "$RUN_DIR" \
-    --name "resnet18_l40s_${SLURM_JOB_ID:-manual}" \
+    --name "$RUN_NAME" \
     --batch-size 512 \
     --lr 0.0028 \
     --epochs 96 \
@@ -80,10 +84,22 @@ srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" train/train_resnet_
     --val-num-workers 2 \
     --wandb-project multireflection
 
+# Offline alignment sweep on the best checkpoint, from every 0.1 deg grid position, using
+# the staged image bank. Takes under a minute. Results go next to the checkpoint and the
+# summary is attached to the W&B run above.
+echo "evaluating  : $RUN_DIR/${RUN_NAME}_best_model.pth"
+srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" utils/eval_batched.py \
+    --checkpoint "$RUN_DIR/${RUN_NAME}_best_model.pth" \
+    --data-dir "$DATA_DIR" \
+    --out-dir "$RUN_DIR/eval" \
+    --grid-step 0.1 \
+    --threshold 0.97 \
+    --wandb --wandb-project multireflection
+
 echo "=================================================================="
 echo "finished    : $(date)"
 echo "checkpoints : $RUN_DIR"
-ls -lh "$RUN_DIR" || true
+ls -lh "$RUN_DIR" "$RUN_DIR/eval" || true
 echo "=================================================================="
 
 # CRCD wrapper: appends the job's resource utilization. Must run after srun.
