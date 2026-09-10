@@ -175,8 +175,10 @@ uv run python train/train_resnet_direct.py --step-filter 4    # 0.04 deg grid in
 uv run python train/train_resnet_direct.py --help             # every augmentation knob
 ```
 
-Augmentation is brightness, contrast, Gaussian noise and random occlusion, each sampled per
-image. `--noise-min` makes the noise sigma itself per-image, uniform in `[min, --noise]`.
+Augmentation is brightness, contrast and Gaussian noise, each sampled per image, plus random
+occlusion boxes drawn once per batch and applied to every image in it. `--noise-min` makes
+the noise sigma itself per-image, uniform in `[min, --noise]`. Default 98 epochs, 14 full
+cosine cycles.
 Every run writes its split to `train_names.txt` / `val_names.txt` in the checkpoint
 directory; pass them back with `--train-keys-file` / `--val-keys-file` to reuse a split. Affine is implemented but off by default: the label *is* the position of the spot
 pattern, so a translation resembles a different mirror tilt.

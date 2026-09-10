@@ -173,7 +173,7 @@ This is an **estimate**, not a measurement — the only figures actually measure
 local RTX A2000, which reached 157 img/s and was power-limited at 67 W of 70 W.
 
 An L40S is several times that. At a guessed 600–900 img/s, one epoch over the 183,040-image
-train split takes 3.5–5 minutes, so 96 epochs plus validation lands somewhere around
+train split takes 3.5–5 minutes, so 98 epochs plus validation lands somewhere around
 **7–12 hours**. The 1-day request covers that with margin.
 
 The training script prints `img/s` every epoch, so the first epoch of the first run tells

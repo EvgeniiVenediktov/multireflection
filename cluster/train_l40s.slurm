@@ -37,7 +37,7 @@ DATA_ROOT="${DATA_ROOT:-/ix1/kchen/evv/multireflection}"
 DATA_TAR="$DATA_ROOT/data/dark512.tar.gz"
 RUN_DIR="$DATA_ROOT/runs/${SLURM_JOB_ID:-manual}"
 VENV_PY="${VENV_PY:-$PROJECT_DIR/.venv/bin/python}"
-EPOCHS="${EPOCHS:-96}"
+EPOCHS="${EPOCHS:-98}"
 START_CKPT="${START_CKPT:-}"        # absolute path to a state dict, empty = from scratch
 EXTRA_ARGS="${EXTRA_ARGS:-}"        # appended to the training command
 

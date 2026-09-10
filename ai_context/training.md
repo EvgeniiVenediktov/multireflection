@@ -13,7 +13,10 @@ decode. Throughput numbers are in the history section above.
   network sees the same [0, 1] float32 as before - only the storage dtype changed.
 - fp16 autocast, TF32 and channels_last on by default (`--no-amp` to disable).
 - `GpuAugment` implements brightness/contrast, affine, Gaussian noise and random occlusion
-  **per sample**. torchvision's v2 transforms sample parameters once per call, so applying
+  **per sample**, except occlusion, whose boxes are drawn once per batch and shared by every
+  image in it (since 2026-09-10; earlier runs, including the 3854472 best checkpoint and jobs
+  3866737 / 3866805, used per-image boxes). Default epochs 98 = 14 cosine cycles of 7 (was 96).
+  torchvision's v2 transforms sample parameters once per call, so applying
   them to a batched tensor would give every image in the batch the same jitter or the same
   rotation. Affine is wired up but is semantically risky here: the label is the position of
   the spot pattern, so a translation resembles a different mirror tilt. Ablate it.

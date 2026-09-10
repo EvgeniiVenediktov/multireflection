@@ -90,7 +90,7 @@ config = {
     "batch_size": 64,
     "lr": 0.001,
     "weight_decay": 0.001,
-    "epochs": 96,
+    "epochs": 98,                 # 14 full cosine cycles of 7
     "lr_scheduler_loop": 7,
     "lr_min": 0.00001,
 
@@ -128,8 +128,8 @@ config = {
     "affine_shear": 0.0,          # shear, +/- degrees
 
     # Random occlusion (cutout). Models dust or debris on the mirror surface.
-    "occlusion_prob": 0.5,        # probability a given box is applied, per image
-    "occlusion_count": 2,         # boxes attempted per image
+    "occlusion_prob": 0.5,        # probability a given box is applied, per batch
+    "occlusion_count": 2,         # boxes attempted per batch, shared by every image in it
     "occlusion_min": 0.15,        # box edge as a fraction of image size
     "occlusion_max": 0.40,
     "occlusion_value": 0.0,       # fill value in normalized units
@@ -258,11 +258,14 @@ class GpuAugment:
     Photometric jitter, affine warp, Gaussian noise and random occlusion, applied to a
     normalized float batch on the GPU.
 
-    Every stage draws its parameters PER IMAGE. torchvision's v2 transforms sample once per
-    CALL, so ColorJitter or RandomAffine applied to a batched tensor gives every image in
-    the batch the same brightness, or the same rotation. That is a silent loss of
-    augmentation diversity relative to the earlier per-sample CPU pipeline, which was
-    why these are written out by hand.
+    Photometric, noise and affine stages draw their parameters PER IMAGE. torchvision's v2
+    transforms sample once per CALL, so ColorJitter or RandomAffine applied to a batched
+    tensor gives every image in the batch the same brightness, or the same rotation. That
+    is a silent loss of augmentation diversity relative to the earlier per-sample CPU
+    pipeline, which was why these are written out by hand.
+
+    Occlusion is the exception: its boxes are drawn once PER BATCH and applied to every
+    image in it (decided 2026-09-10; runs before that used per-image boxes).
 
     Order: affine -> photometric (brightness/contrast, random order) -> noise -> occlusion.
     Occlusion goes last so the boxes are not blurred away or rescaled by the warp.
@@ -352,30 +355,17 @@ class GpuAugment:
         )
 
     def _occlude(self, x):
-        """Per-sample cutout boxes, vectorized over the batch."""
-        B, _, H, W = x.shape
-        dev, dt = x.device, x.dtype
-        rows = torch.arange(H, device=dev).view(1, H)
-        cols = torch.arange(W, device=dev).view(1, W)
-
+        """Cutout boxes drawn once per batch and applied to every image in it."""
+        _, _, H, W = x.shape
+        rng = random.Random()  # CPU draws; a handful of scalars per batch
         for _ in range(self.occlusion_count):
-            active = torch.rand(B, device=dev) < self.occlusion_prob
-
-            frac_h = torch.empty(B, device=dev, dtype=dt).uniform_(
-                self.occlusion_min, self.occlusion_max)
-            frac_w = torch.empty(B, device=dev, dtype=dt).uniform_(
-                self.occlusion_min, self.occlusion_max)
-            box_h = (frac_h * H).long().clamp_(1, H)
-            box_w = (frac_w * W).long().clamp_(1, W)
-
-            top = (torch.rand(B, device=dev) * (H - box_h + 1).to(dt)).long()
-            left = (torch.rand(B, device=dev) * (W - box_w + 1).to(dt)).long()
-
-            row_hit = (rows >= top.view(B, 1)) & (rows < (top + box_h).view(B, 1))
-            col_hit = (cols >= left.view(B, 1)) & (cols < (left + box_w).view(B, 1))
-            box = row_hit.unsqueeze(2) & col_hit.unsqueeze(1) & active.view(B, 1, 1)
-
-            x = x.masked_fill(box.unsqueeze(1), self.occlusion_value)
+            if rng.random() >= self.occlusion_prob:
+                continue
+            box_h = max(1, min(H, int(rng.uniform(self.occlusion_min, self.occlusion_max) * H)))
+            box_w = max(1, min(W, int(rng.uniform(self.occlusion_min, self.occlusion_max) * W)))
+            top = rng.randint(0, H - box_h)
+            left = rng.randint(0, W - box_w)
+            x[:, :, top:top + box_h, left:left + box_w] = self.occlusion_value
         return x
 
     # -- pipeline -----------------------------------------------------------
