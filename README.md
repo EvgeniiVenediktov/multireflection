@@ -158,6 +158,9 @@ uv export --no-hashes --no-dev --format requirements-txt -o requirements.txt
 
 ## Training
 
+`train/TRAINING_AND_EVALS.md` is the full handoff on training, offline evaluation and the
+cluster workflow, including the current best checkpoint and its recipe.
+
 `train/train_resnet_direct.py` builds the ResNet-18 and writes a plain state dict that loads
 directly into `TiltPredictor(model_type="ResNet18")` for deployment.
 

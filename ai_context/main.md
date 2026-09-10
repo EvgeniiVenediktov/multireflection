@@ -16,6 +16,14 @@ Result claimed in the paper/README: 100% alignment success over the full actuati
 3. **RL (PPO on a GPU ray-trace sim)** - later exploration, still exploratory.
    **RL is NOT a current concern.** Documented here only so it is not re-discovered from scratch.
 
+## Start here for training, evaluation and the cluster
+
+**`train/TRAINING_AND_EVALS.md`** is the handoff document: current best checkpoint, running
+jobs, data, the training script's defaults and their change dates, the CRCD job script and
+its knobs, the offline evaluation and robustness sweep, known issues and next steps. Read it
+before touching `train/`, `utils/eval_*.py` or `cluster/`. The per-module notes below
+(`training.md`, `alignment_loop.md`) are more detailed but not more current.
+
 ## Module map
 
 | Area | Files | Context file |

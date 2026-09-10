@@ -1,5 +1,8 @@
 # Deployed alignment loop and evaluation
 
+For the offline evaluation and robustness sweep, `train/TRAINING_AND_EVALS.md` is the
+current summary; this file holds per-module detail.
+
 All of `app/` runs **on the Raspberry Pi 4** and imports `mf_control.controller.MFController`
 (submodule, not checked out here). Nothing in `app/` is runnable on a dev machine without hardware.
 

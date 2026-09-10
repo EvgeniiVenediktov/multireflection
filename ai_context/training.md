@@ -1,5 +1,8 @@
 # Supervised training
 
+See `train/TRAINING_AND_EVALS.md` first; it is the current summary. This file holds
+per-module detail.
+
 Entry point: **`train/train_resnet_direct.py`**, the only training path. It reads the
 preprocessed JPEGs in the collection folder directly.
 
