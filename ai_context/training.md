@@ -26,6 +26,11 @@ decode. Throughput numbers are in the history section above.
   stored in the repository. `--no-wandb` disables it.
 - `--data-share` (fraction of the dataset, default 1.0) and `--step-filter` (1/2/4 = 0.01 /
   0.02 / 0.04 deg grid) make data-density ablations cheap. `--help` lists every knob.
+- `--noise-min` (default None): when set, the Gaussian noise sigma is drawn per image
+  uniformly in `[noise_min, --noise]` instead of being fixed at `--noise`.
+- Every run writes `train_names.txt` / `val_names.txt` into `--checkpoint-dir` (split is
+  deterministic from `--split-seed`, but the files make it explicit and let
+  `utils/eval_batched.py --starts-file` evaluate on held-out positions).
 
 ## History: the LMDB pipeline (removed 2026-09-10)
 

@@ -176,7 +176,9 @@ uv run python train/train_resnet_direct.py --help             # every augmentati
 ```
 
 Augmentation is brightness, contrast, Gaussian noise and random occlusion, each sampled per
-image. Affine is implemented but off by default: the label *is* the position of the spot
+image. `--noise-min` makes the noise sigma itself per-image, uniform in `[min, --noise]`.
+Every run writes its split to `train_names.txt` / `val_names.txt` in the checkpoint
+directory; pass them back with `--train-keys-file` / `--val-keys-file` to reuse a split. Affine is implemented but off by default: the label *is* the position of the spot
 pattern, so a translation resembles a different mirror tilt.
 
 ### Current best checkpoint
@@ -219,6 +221,7 @@ reads, a summary and the heatmaps. About twenty seconds for the full 0.1 degree 
 ```bash
 uv run python utils/eval_batched.py --checkpoint saved_models/real/<ckpt>.pth
 uv run python utils/eval_batched.py --grid-step 0.5 --threshold 0.97   # coarse
+uv run python utils/eval_batched.py --starts-file runs/<job>/val_names.txt  # held-out starts
 ```
 
 Starts are training positions (the validation split is a random 20% of the same folder), so
@@ -234,8 +237,10 @@ bash cluster/check_env.sh
 sbatch cluster/train_l40s.slurm
 ```
 
-The job trains, then runs the offline evaluation on the best checkpoint and attaches the
-summary and heatmaps to the same W&B run. Resource choices, storage layout and the staging
+The job trains, then runs the offline evaluation on the best checkpoint twice, from the
+0.1 degree grid and from the run's validation images, and attaches both summaries and
+heatmaps to the same W&B run. `START_CKPT`, `EPOCHS` and `EXTRA_ARGS` can be passed with
+`sbatch --export` to fine-tune, shorten, or change training flags. Resource choices, storage layout and the staging
 rationale are documented in [cluster/README.md](cluster/README.md).
 
 ## Repository Structure

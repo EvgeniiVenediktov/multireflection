@@ -161,6 +161,27 @@ class BatchedPredictor:
         return out
 
 
+def read_starts_file(path, bank):
+    """Start positions from a file of image names (x{X}_y{Y}.jpg) or 'x y' pairs."""
+    starts = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.endswith(".jpg"):
+                xs, ys = line[:-4].split("_y")
+                pos = (round(float(xs[1:]), 2), round(float(ys), 2))
+            else:
+                x, y = line.replace(",", " ").split()
+                pos = (round(float(x), 2), round(float(y), 2))
+            if pos in bank.files:
+                starts.append(pos)
+    if not starts:
+        raise RuntimeError(f"no usable start positions in {path}")
+    return sorted(set(starts))
+
+
 def build_grid(bank, step):
     xs = np.arange(X_TILT_START, bank.x_max + step / 2, step)
     ys = np.arange(Y_TILT_START, bank.y_max + step / 2, step)
@@ -184,8 +205,12 @@ def run(args):
     predictor = BatchedPredictor(args.checkpoint, args.batch_size, not args.no_fp16)
     print(f"Model: {args.checkpoint} on {predictor.device}, fp16={predictor.fp16}")
 
-    grid = build_grid(bank, args.grid_step)
-    print(f"Starts: {len(grid)} (grid step {args.grid_step})")
+    if args.starts_file:
+        grid = read_starts_file(args.starts_file, bank)
+        print(f"Starts: {len(grid)} (from {args.starts_file})")
+    else:
+        grid = build_grid(bank, args.grid_step)
+        print(f"Starts: {len(grid)} (grid step {args.grid_step})")
 
     out_dir = Path(args.out_dir) if args.out_dir else REPO_ROOT / "eval_results" / Path(args.checkpoint).stem
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -283,7 +308,8 @@ def run(args):
             "checkpoint": str(args.checkpoint),
             "data_dir": str(args.data_dir),
             "threshold": args.threshold,
-            "grid_step": args.grid_step,
+            "grid_step": None if args.starts_file else args.grid_step,
+            "starts_file": args.starts_file,
             "max_adj": args.max_adj,
             "batch_size": args.batch_size,
             "fp16": predictor.fp16,
@@ -320,7 +346,7 @@ def run(args):
     print(f"heatmaps          {', '.join(h.name for h in heatmaps)}")
 
     if args.wandb:
-        log_to_wandb(summary, out_dir, heatmaps, args.wandb_project)
+        log_to_wandb(summary, out_dir, heatmaps, args.wandb_project, args.wandb_prefix)
     return summary
 
 
@@ -366,7 +392,7 @@ def plot_heatmaps(grid, adj, err, ssim, out_dir):
     return paths
 
 
-def log_to_wandb(summary, out_dir, heatmaps, project):
+def log_to_wandb(summary, out_dir, heatmaps, project, prefix="eval"):
     import wandb
 
     run_id = os.environ.get("WANDB_RUN_ID")
@@ -374,19 +400,19 @@ def log_to_wandb(summary, out_dir, heatmaps, project):
                      name=None if run_id else f"eval_{Path(summary['settings']['checkpoint']).stem}",
                      job_type="eval")
     flat = {
-        "eval/n_starts": summary["n_starts"],
-        "eval/success_rate": summary["success_rate"],
-        "eval/adjustments_mean": summary["adjustments_converged"]["mean"],
-        "eval/adjustments_std": summary["adjustments_converged"]["std"],
-        "eval/final_ssim_mean": summary["final_ssim"]["mean"],
-        "eval/final_ssim_std": summary["final_ssim"]["std"],
-        "eval/final_angular_error_mean": summary["final_angular_error_deg"]["mean"],
-        "eval/final_angular_error_std": summary["final_angular_error_deg"]["std"],
-        "eval/grid_step": summary["settings"]["grid_step"],
-        "eval/threshold": summary["settings"]["threshold"],
+        f"{prefix}/n_starts": summary["n_starts"],
+        f"{prefix}/success_rate": summary["success_rate"],
+        f"{prefix}/adjustments_mean": summary["adjustments_converged"]["mean"],
+        f"{prefix}/adjustments_std": summary["adjustments_converged"]["std"],
+        f"{prefix}/final_ssim_mean": summary["final_ssim"]["mean"],
+        f"{prefix}/final_ssim_std": summary["final_ssim"]["std"],
+        f"{prefix}/final_angular_error_mean": summary["final_angular_error_deg"]["mean"],
+        f"{prefix}/final_angular_error_std": summary["final_angular_error_deg"]["std"],
+        f"{prefix}/grid_step": summary["settings"]["grid_step"],
+        f"{prefix}/threshold": summary["settings"]["threshold"],
     }
     run.summary.update(flat)
-    run.log({f"eval/{h.stem}": wandb.Image(str(h)) for h in heatmaps})
+    run.log({f"{prefix}/{h.stem}": wandb.Image(str(h)) for h in heatmaps})
     for name in ("summary.json", "trace.csv", "eval.log"):
         run.save(str(out_dir / name), base_path=str(out_dir), policy="now")
     print(f"W&B: summary written to run {run.id} ({run.url})")
@@ -398,6 +424,8 @@ def parse_args():
     p.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
     p.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     p.add_argument("--grid-step", type=float, default=0.1)
+    p.add_argument("--starts-file", default=None,
+                   help="start positions from a file of image names, e.g. a run's val_names.txt; overrides --grid-step")
     p.add_argument("--threshold", type=float, default=0.97)
     p.add_argument("--max-adj", type=int, default=EVAL_MAX_ADJ_NUMBER)
     p.add_argument("--batch-size", type=int, default=128)
@@ -407,6 +435,7 @@ def parse_args():
     p.add_argument("--wandb", action="store_true",
                    help="write the summary to W&B; resumes the run in WANDB_RUN_ID if set")
     p.add_argument("--wandb-project", default="multireflection")
+    p.add_argument("--wandb-prefix", default="eval", help="key prefix for the W&B summary, e.g. eval_val")
     return p.parse_args()
 
 

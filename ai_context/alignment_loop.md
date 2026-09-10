@@ -48,9 +48,11 @@ SSIM is memoized per position in a thread pool. Same update rule as `app/eval.py
 default, SSIM rounded to 2 decimals like `evaluate_position`. Outputs in
 `eval_results/<ckpt>/` (gitignored): `trace.csv` (every start at every step t, t=0
 included, with `ssim_raw` unrounded), `eval.log` (hardware format, `graph_eval.py` reads
-it), `summary.json`, `heatmap_{adjustments,angular_error,final_ssim}.png`. `--wandb`
-resumes the run in `WANDB_RUN_ID` and writes `eval/*` summary keys plus the images; the
-L40S job uses this. Starts are training positions, and time-to-align does not exist here.
+it), `summary.json`, `heatmap_{adjustments,angular_error,final_ssim}.png`. `--starts-file` replaces the grid with the positions listed in a file of image names, e.g.
+a run's `val_names.txt`, which is the only held-out evaluation available. `--wandb`
+resumes the run in `WANDB_RUN_ID` and writes `<prefix>/*` summary keys plus the images
+(`--wandb-prefix`, default `eval`); the L40S job runs both the grid (`eval/`) and the
+validation set (`eval_val/`). Starts are training positions, and time-to-align does not exist here.
 
 Result for `resnet18_l40s_3854472` (2026-09-10): 2320 starts, 100% converged,
 1.14 +- 0.35 adjustments, final SSIM 0.984 +- 0.007, angular error 0.027 +- 0.015 deg.

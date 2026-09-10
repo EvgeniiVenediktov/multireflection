@@ -8,6 +8,8 @@
 # Fine-tune from an existing checkpoint, fewer epochs (values are read from the environment):
 #   sbatch --export=ALL,START_CKPT=/ix1/kchen/evv/multireflection/runs/3854472/resnet18_l40s_3854472_best_model.pth,EPOCHS=49 \
 #       cluster/train_l40s.slurm
+# Extra flags for train/train_resnet_direct.py go in EXTRA_ARGS (word-split, so no spaces in values):
+#   sbatch --export=ALL,EXTRA_ARGS="--noise-min 0.0 --noise 0.2" cluster/train_l40s.slurm
 #
 # Monitor:  squeue -M gpu -u $USER      |  crc-job-stats <jobid>
 # Cancel:   scancel -M gpu <jobid>
@@ -37,6 +39,7 @@ RUN_DIR="$DATA_ROOT/runs/${SLURM_JOB_ID:-manual}"
 VENV_PY="${VENV_PY:-$PROJECT_DIR/.venv/bin/python}"
 EPOCHS="${EPOCHS:-96}"
 START_CKPT="${START_CKPT:-}"        # absolute path to a state dict, empty = from scratch
+EXTRA_ARGS="${EXTRA_ARGS:-}"        # appended to the training command
 
 # No modules: the venv carries its own CPython and CUDA runtime, and a cuda module would
 # shadow it through LD_LIBRARY_PATH. Slurm does not source ~/.bashrc, so purge explicitly.
@@ -96,11 +99,13 @@ srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" train/train_resnet_
     --epochs "$EPOCHS" \
     --num-workers 10 \
     --val-num-workers 2 \
-    --wandb-project multireflection
+    --wandb-project multireflection \
+    $EXTRA_ARGS
 
-# Offline alignment sweep on the best checkpoint, from every 0.1 deg grid position, using
-# the staged image bank. Takes under a minute. Results go next to the checkpoint and the
-# summary is attached to the W&B run above.
+# Offline alignment sweep on the best checkpoint, using the staged image bank: once from
+# every 0.1 deg grid position, once from every validation image (positions this run never
+# trained on). Results go next to the checkpoint; summaries are attached to the W&B run
+# above as eval/* and eval_val/*.
 echo "evaluating  : $RUN_DIR/${RUN_NAME}_best_model.pth"
 srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" utils/eval_batched.py \
     --checkpoint "$RUN_DIR/${RUN_NAME}_best_model.pth" \
@@ -109,11 +114,18 @@ srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" utils/eval_batched.
     --grid-step 0.1 \
     --threshold 0.97 \
     --wandb --wandb-project multireflection
+srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-12}" "$VENV_PY" utils/eval_batched.py \
+    --checkpoint "$RUN_DIR/${RUN_NAME}_best_model.pth" \
+    --data-dir "$DATA_DIR" \
+    --out-dir "$RUN_DIR/eval_val" \
+    --starts-file "$RUN_DIR/val_names.txt" \
+    --threshold 0.97 \
+    --wandb --wandb-project multireflection --wandb-prefix eval_val
 
 echo "=================================================================="
 echo "finished    : $(date)"
 echo "checkpoints : $RUN_DIR"
-ls -lh "$RUN_DIR" "$RUN_DIR/eval" || true
+ls -lh "$RUN_DIR" "$RUN_DIR/eval" "$RUN_DIR/eval_val" || true
 echo "=================================================================="
 
 # CRCD wrapper: appends the job's resource utilization. Must run after srun.

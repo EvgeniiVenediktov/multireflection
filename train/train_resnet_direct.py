@@ -114,6 +114,7 @@ config = {
     "jitter_brightness": 0.4,
     "jitter_contrast": 0.1,
     "noise_level": 0.1,
+    "noise_level_min": None,      # set to sample sigma per image in [min, noise_level]
 
     # Affine. OFF by default, for two reasons. Semantically, the label IS the position and
     # shape of the spot pattern, so a translation looks to the network exactly like a
@@ -267,13 +268,16 @@ class GpuAugment:
     Occlusion goes last so the boxes are not blurred away or rescaled by the warp.
     """
 
-    def __init__(self, brightness=0.0, contrast=0.0, noise_sigma=0.0,
+    def __init__(self, brightness=0.0, contrast=0.0, noise_sigma=0.0, noise_sigma_min=None,
                  affine_degrees=0.0, affine_translate=0.0, affine_scale=0.0,
                  affine_shear=0.0, occlusion_prob=0.0, occlusion_count=0,
                  occlusion_min=0.05, occlusion_max=0.2, occlusion_value=0.0):
         self.brightness = brightness
         self.contrast = contrast
         self.noise_sigma = noise_sigma
+        # None: every image gets noise_sigma. Otherwise sigma is drawn per image, uniformly
+        # in [noise_sigma_min, noise_sigma], so the network sees clean and noisy frames.
+        self.noise_sigma_min = noise_sigma_min
         self.affine_degrees = affine_degrees
         self.affine_translate = affine_translate
         self.affine_scale = affine_scale
@@ -390,7 +394,12 @@ class GpuAugment:
             x = op(x)
 
         if self.noise_sigma > 0:
-            x = (x + torch.randn_like(x) * self.noise_sigma).clamp_(0.0, 1.0)
+            if self.noise_sigma_min is not None and self.noise_sigma_min < self.noise_sigma:
+                sigma = torch.empty(x.shape[0], 1, 1, 1, device=x.device, dtype=x.dtype)
+                sigma.uniform_(self.noise_sigma_min, self.noise_sigma)
+            else:
+                sigma = self.noise_sigma
+            x = (x + torch.randn_like(x) * sigma).clamp_(0.0, 1.0)
 
         if self.uses_occlusion:
             x = self._occlude(x)
@@ -403,6 +412,7 @@ def make_gpu_augment(cfg: dict):
         brightness=cfg["jitter_brightness"],
         contrast=cfg["jitter_contrast"],
         noise_sigma=cfg["noise_level"],
+        noise_sigma_min=cfg["noise_level_min"],
         affine_degrees=cfg["affine_degrees"],
         affine_translate=cfg["affine_translate"],
         affine_scale=cfg["affine_scale"],
@@ -631,6 +641,14 @@ def main(cfg: dict) -> None:
     train_names, val_names = build_split(cfg)
     print(f"train: {len(train_names)} images, val: {len(val_names)} images "
           f"(step_filter={cfg['step_filter']}, data_share={cfg['data_share']})")
+    # Record the split next to the checkpoints, so later evaluations can be restricted to
+    # the images this run never trained on (utils/eval_batched.py --starts-file), and so a
+    # rerun can reuse it via --train-keys-file / --val-keys-file.
+    os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
+    for fname, names in (("train_names.txt", train_names), ("val_names.txt", val_names)):
+        with open(os.path.join(cfg["checkpoint_dir"], fname), "w") as f:
+            f.write("\n".join(names) + "\n")
+    print(f"split written to {cfg['checkpoint_dir']}/{{train,val}}_names.txt")
     if not train_names:
         raise RuntimeError(f"No images found under {cfg['data_dir']}")
 
@@ -689,7 +707,10 @@ def main(cfg: dict) -> None:
         print("augmentation: none")
     else:
         print(f"augmentation: brightness={augment.brightness} contrast={augment.contrast} "
-              f"noise={augment.noise_sigma} | affine deg={augment.affine_degrees} "
+              f"noise={augment.noise_sigma}"
+              + (f" (per-image in [{augment.noise_sigma_min}, {augment.noise_sigma}])"
+                 if augment.noise_sigma_min is not None else "")
+              + f" | affine deg={augment.affine_degrees} "
               f"translate={augment.affine_translate} scale={augment.affine_scale} "
               f"shear={augment.affine_shear} | occlusion p={augment.occlusion_prob} "
               f"n={augment.occlusion_count} size=[{augment.occlusion_min}, "
@@ -815,7 +836,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     aug = p.add_argument_group("augmentation (0 disables a stage)")
     aug.add_argument("--brightness", type=float, default=config["jitter_brightness"])
     aug.add_argument("--contrast", type=float, default=config["jitter_contrast"])
-    aug.add_argument("--noise", type=float, default=config["noise_level"])
+    aug.add_argument("--noise", type=float, default=config["noise_level"],
+                     help="Gaussian noise sigma in [0, 1] units (the upper bound if --noise-min is set)")
+    aug.add_argument("--noise-min", type=float, default=config["noise_level_min"],
+                     help="sample the noise sigma per image uniformly in [NOISE_MIN, --noise]")
     aug.add_argument("--affine-degrees", type=float, default=config["affine_degrees"])
     aug.add_argument("--affine-translate", type=float, default=config["affine_translate"],
                      help="max shift as a fraction of image size")
@@ -860,6 +884,7 @@ if __name__ == "__main__":
         "jitter_brightness": args.brightness,
         "jitter_contrast": args.contrast,
         "noise_level": args.noise,
+        "noise_level_min": args.noise_min,
         "affine_degrees": args.affine_degrees,
         "affine_translate": args.affine_translate,
         "affine_scale": args.affine_scale,

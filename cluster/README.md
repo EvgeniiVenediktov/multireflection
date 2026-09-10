@@ -39,9 +39,13 @@ tail -f logs/mfl-resnet18-<jobid>.out
 ```
 
 Checkpoints land in `/ix1/kchen/evv/multireflection/runs/<jobid>/`. After training the job
-runs `utils/eval_batched.py` on the best checkpoint against the staged image bank; the
-trace, log, summary and heatmaps land in `runs/<jobid>/eval/` and the summary metrics and
-heatmaps are attached to the training's W&B run (both stages share `WANDB_RUN_ID`).
+runs `utils/eval_batched.py` on the best checkpoint against the staged image bank, from the
+0.1 deg grid (`runs/<jobid>/eval/`) and from the run's validation images
+(`runs/<jobid>/eval_val/`, positions never trained on); summaries and heatmaps are attached
+to the training's W&B run as `eval/*` and `eval_val/*` (all stages share `WANDB_RUN_ID`).
+
+`sbatch --export=ALL,START_CKPT=<path>,EPOCHS=<n>,EXTRA_ARGS="<flags>"` fine-tunes from a
+checkpoint, changes the epoch count, or appends training flags (see the script header).
 
 ## Resource request, and why
 
