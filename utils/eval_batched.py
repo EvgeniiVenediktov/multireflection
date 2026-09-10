@@ -71,7 +71,7 @@ if str(REPO_ROOT) not in sys.path:
 from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, EVAL_MAX_ADJ_NUMBER  # noqa: E402
 from app.inference import resnet18, evaluate_position  # noqa: E402
 
-DEFAULT_CHECKPOINT = REPO_ROOT / "saved_models" / "real" / "resnet18_l40s_3854472_best_model.pth"
+DEFAULT_CHECKPOINT = REPO_ROOT / "saved_models" / "real" / "r512_occ05-20img_n10_e96_3854472.pth"
 DEFAULT_DATA_DIR = "/mnt/h/dark512"
 PERTURB_KEYS = ("brightness", "brightness_fixed", "contrast", "contrast_fixed", "noise", "noise_min",
                 "occlusion_count", "occlusion_min", "occlusion_max", "occlusion_prob", "perturb_ssim",
@@ -293,10 +293,11 @@ class Perturbation:
 
 
 class BatchedPredictor:
-    def __init__(self, checkpoint, batch_size, fp16, perturb=None):
+    def __init__(self, checkpoint, batch_size, fp16, perturb=None, model_resolution=None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.fp16 = bool(fp16 and self.device.type == "cuda")
         self.batch_size = batch_size
+        self.model_resolution = model_resolution
         self.model = resnet18(output_dim=2)
         state = torch.load(checkpoint, map_location=self.device, weights_only=False)
         self.model.load_state_dict(state, strict=True)
@@ -308,10 +309,11 @@ class BatchedPredictor:
 
     @torch.inference_mode()
     def predict(self, images, idx=None):
-        """images: list of uint8 (512, 512) arrays -> float32 array (N, 2) in degrees.
+        """images: list of uint8 (H, W) arrays -> float32 array (N, 2) in degrees.
 
         idx: trajectory index per image; when given and a perturbation is configured,
-        it is applied to the batch on the GPU before the model.
+        it is applied to the batch on the GPU before the model. With model_resolution the
+        (perturbed) frame is then area-downscaled to that size and quantized to 8 bit.
         """
         out = np.empty((len(images), 2), dtype=np.float32)
         for s in range(0, len(images), self.batch_size):
@@ -321,6 +323,13 @@ class BatchedPredictor:
             x = x.float().div_(255.0)
             if self.perturb is not None and idx is not None:
                 x = self.perturb.apply(x, idx[s:s + self.batch_size])
+            if self.model_resolution and x.shape[-1] != self.model_resolution:
+                # The perturbation acts on the camera frame; the device resizes it to the model input.
+                # A box average over an integer factor is cv2.INTER_AREA, the resize the banks were
+                # built with. Not interpolate(mode="area"): on this batch (channel stride 0) the
+                # adaptive pooling kernel returns the first image for every row (torch 2.14, CUDA).
+                x = torch.nn.functional.avg_pool2d(x, x.shape[-1] // self.model_resolution)
+                x = x.mul_(255.0).round_().div_(255.0)
             x = x.contiguous(memory_format=torch.channels_last)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.fp16):
                 y = self.model(x)
@@ -383,11 +392,15 @@ def run(args):
         grid = build_grid(bank, args.grid_step)
         starts_desc = f"Starts: {len(grid)} (grid step {args.grid_step})"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    H, W = bank.reference.shape
+    if args.model_resolution and (H != W or H % args.model_resolution):
+        raise SystemExit(f"--model-resolution {args.model_resolution} must divide the square bank size {H}x{W}")
     perturb = Perturbation(args, len(grid), bank.reference.shape, device)
     if not perturb.enabled:
         perturb = None
-    predictor = BatchedPredictor(args.checkpoint, args.batch_size, not args.no_fp16, perturb)
-    print(f"Model: {args.checkpoint} on {predictor.device}, fp16={predictor.fp16}")
+    predictor = BatchedPredictor(args.checkpoint, args.batch_size, not args.no_fp16, perturb, args.model_resolution)
+    print(f"Model: {args.checkpoint} on {predictor.device}, fp16={predictor.fp16}"
+          + (f", input {args.model_resolution} px" if args.model_resolution else ""))
     print(starts_desc)
     print(f"Perturbation: {perturb.describe() if perturb else 'none'}")
     perturb_ssim = perturb is not None and perturb.ssim
@@ -508,6 +521,7 @@ def run(args):
             "fp16": predictor.fp16,
             "workers": workers,
             "device": str(predictor.device),
+            **({"model_resolution": args.model_resolution} if args.model_resolution else {}),
             **perturb_settings,
         },
     }
@@ -630,6 +644,9 @@ def parse_args(argv=None):
     p.add_argument("--workers", type=int, default=None, help="thread pool size for decode+SSIM (default: cpu count)")
     p.add_argument("--out-dir", default=None, help="default: eval_results/<checkpoint stem>/")
     p.add_argument("--no-fp16", action="store_true", help="disable fp16 autocast on CUDA")
+    p.add_argument("--model-resolution", type=int, default=None,
+                   help="model input size in px: frames (after any perturbation) are area-downscaled to it; "
+                        "the SSIM stop test keeps the bank's resolution")
     p.add_argument("--wandb", action="store_true",
                    help="write the summary to W&B; resumes the run in WANDB_RUN_ID if set")
     p.add_argument("--wandb-project", default="multireflection")

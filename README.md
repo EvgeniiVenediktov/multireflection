@@ -189,11 +189,13 @@ pattern, so a translation resembles a different mirror tilt.
 
 ### Current best checkpoint
 
-`resnet18_l40s_3854472_best_model.pth`, trained on 2026-09-09 by CRCD job 3854472 on one
-L40S (6.3 h). W&B run: [resnet18_l40s_3854472](https://wandb.ai/e-venediktov-university-of-pittsburgh/multireflection/runs/93o4zgri).
+`r512_occ05-20img_n10_e96_3854472.pth`, trained on 2026-09-09 by CRCD job 3854472 on one
+L40S (6.3 h). W&B run: [r512_occ05-20img_n10_e96_3854472](https://wandb.ai/e-venediktov-university-of-pittsburgh/multireflection/runs/93o4zgri).
 Best epoch 93 of 96, validation MSE 6.5e-5 on normalized labels. The checkpoint lives at
-`/ix1/kchen/evv/multireflection/runs/3854472/` on the cluster and in `saved_models/real/`
-locally (not tracked).
+`/ix1/kchen/evv/multireflection/runs/r512_occ05-20img_n10_e96_3854472/` on the cluster and in
+`saved_models/real/` locally (not tracked). Run names follow
+`r<resolution>[_ft]_occ<box edge %><img|batch>_n<noise sigma x100>_e<epochs>_<job>`, see
+`train/TRAINING_AND_EVALS.md`.
 
 | | |
 |---|---|
@@ -238,6 +240,10 @@ friends perturb the frames the model sees (brightness, contrast and occlusion bo
 fixed per trajectory, noise is redrawn per step); the SSIM stop test still uses the clean
 frame unless `--perturb-ssim`. `utils/eval_sweep.py` runs a fixed list of such conditions
 on one checkpoint and writes a comparison table (`sweep.md`), optionally to W&B.
+`--model-resolution N` area-downscales the (perturbed) 512 px frame to a smaller model's
+input, so models of every input size are compared on the same frames and the same SSIM stop
+test; `cluster/eval_sweep_l40s.slurm` runs the sweep on the cluster and
+`utils/eval_compare.py` merges several models' `sweep.csv` into one table.
 
 ### On the Pitt CRCD cluster
 

@@ -60,7 +60,7 @@ It is empty in the working tree; anything importing it only runs on the Raspberr
 
 ## Current best checkpoint
 
-`resnet18_l40s_3854472_best_model.pth` (job 3854472, 2026-09-09, W&B run 93o4zgri). Recipe and
+`r512_occ05-20img_n10_e96_3854472.pth` (job 3854472, 2026-09-09, W&B run 93o4zgri). Recipe and
 offline-eval numbers are in the README under "Current best checkpoint". Trained with cutout
 0.05 to 0.20; the script default is now 0.15 to 0.40.
 

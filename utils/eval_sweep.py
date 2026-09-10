@@ -4,16 +4,20 @@ Runs the closed-loop replay (eval_batched.run, imported, not shelled out) for on
 checkpoint under each condition and writes one comparison table. Conditions, in order:
 
     clean
-    noise_0.05, noise_0.10, noise_0.20       additive Gaussian sigma, re-drawn per step
-    brightness_0.6 .. brightness_1.4         fixed brightness factor
+    noise_0.02 .. noise_0.30                 additive Gaussian sigma, re-drawn per step
+    brightness_0.4 .. brightness_1.6         fixed brightness factor
     contrast_0.9, contrast_1.1               fixed contrast factor (GpuAugment's 0.1 extremes)
     occlusion_1, occlusion_2                 1 or 2 boxes per trajectory, edge 0.15 to 0.40
+    occlusion_1x10 .. occlusion_2x50         1 or 2 boxes of a fixed edge, 10 to 50% of the image
     combined                                 noise 0.1 + brightness 0.4 + contrast 0.1 +
                                              2 boxes: the training augmentation at eval
+    combined_harsh                           noise 0.2 + brightness 0.6 + 2 boxes of edge 30%
 
 Each condition writes its normal eval outputs to <out-dir>/<condition>/; the sweep writes
 sweep.csv and sweep.md next to them. adjustments_* are over converged starts (the same
 quantity eval_batched reports to W&B), the angular error columns are over all starts.
+To compare models of different input sizes on the same frames, run every one on the 512 px
+bank with --model-resolution set to the model's size.
 """
 
 import argparse
@@ -29,23 +33,21 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils import eval_batched  # noqa: E402
 
+def _boxes(count, lo, hi):
+    return ["--occlusion-count", str(count), "--occlusion-min", lo, "--occlusion-max", hi, "--occlusion-prob", "1.0"]
+
+
 CONDITIONS = [
     ("clean", []),
-    ("noise_0.05", ["--noise", "0.05"]),
-    ("noise_0.10", ["--noise", "0.10"]),
-    ("noise_0.20", ["--noise", "0.20"]),
-    ("brightness_0.6", ["--brightness-fixed", "0.6"]),
-    ("brightness_0.8", ["--brightness-fixed", "0.8"]),
-    ("brightness_1.2", ["--brightness-fixed", "1.2"]),
-    ("brightness_1.4", ["--brightness-fixed", "1.4"]),
+    *[(f"noise_{s}", ["--noise", s]) for s in ("0.02", "0.05", "0.10", "0.15", "0.20", "0.30")],
+    *[(f"brightness_{f}", ["--brightness-fixed", f]) for f in ("0.4", "0.6", "0.8", "1.2", "1.4", "1.6")],
     ("contrast_0.9", ["--contrast-fixed", "0.9"]),
     ("contrast_1.1", ["--contrast-fixed", "1.1"]),
-    ("occlusion_1", ["--occlusion-count", "1", "--occlusion-min", "0.15", "--occlusion-max", "0.40",
-                     "--occlusion-prob", "1.0"]),
-    ("occlusion_2", ["--occlusion-count", "2", "--occlusion-min", "0.15", "--occlusion-max", "0.40",
-                     "--occlusion-prob", "1.0"]),
-    ("combined", ["--noise", "0.1", "--brightness", "0.4", "--contrast", "0.1", "--occlusion-count", "2",
-                  "--occlusion-min", "0.15", "--occlusion-max", "0.40", "--occlusion-prob", "1.0"]),
+    ("occlusion_1", _boxes(1, "0.15", "0.40")),
+    ("occlusion_2", _boxes(2, "0.15", "0.40")),
+    *[(f"occlusion_{n}x{e}", _boxes(n, f"0.{e}", f"0.{e}")) for n in (1, 2) for e in ("10", "20", "30", "40", "50")],
+    ("combined", ["--noise", "0.1", "--brightness", "0.4", "--contrast", "0.1", *_boxes(2, "0.15", "0.40")]),
+    ("combined_harsh", ["--noise", "0.2", "--brightness-fixed", "0.6", *_boxes(2, "0.30", "0.30")]),
 ]
 
 COLUMNS = ["condition", "starts", "success_rate", "adjustments_mean", "adjustments_std", "adjustments_max",
@@ -123,6 +125,8 @@ def parse_args():
                    help="passed through: SSIM stop test on the perturbed frame (ignored for clean)")
     p.add_argument("--perturb-seed", type=int, default=0)
     p.add_argument("--no-fp16", action="store_true")
+    p.add_argument("--model-resolution", type=int, default=None,
+                   help="passed through: area-downscale the (perturbed) frames to the model's input size")
     p.add_argument("--wandb", action="store_true", help="log the table to W&B; resumes the run in WANDB_RUN_ID if set")
     p.add_argument("--wandb-project", default="multireflection")
     p.add_argument("--wandb-prefix", default="sweep")
@@ -148,6 +152,8 @@ def main():
         common += ["--workers", str(args.workers)]
     if args.no_fp16:
         common.append("--no-fp16")
+    if args.model_resolution:
+        common += ["--model-resolution", str(args.model_resolution)]
 
     rows = []
     t0 = time.perf_counter()

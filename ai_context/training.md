@@ -17,8 +17,9 @@ decode. Throughput numbers are in the history section above.
 - fp16 autocast, TF32 and channels_last on by default (`--no-amp` to disable).
 - `GpuAugment` implements brightness/contrast, affine, Gaussian noise and random occlusion
   **per sample**, except occlusion, whose boxes are drawn once per batch and shared by every
-  image in it (since 2026-09-10; earlier runs, including the 3854472 best checkpoint and jobs
-  3866737 / 3866805, used per-image boxes). Default epochs 98 = 14 cosine cycles of 7 (was 96).
+  image in it (since 2026-09-10; earlier runs, r512_occ05-20img_n10_e96_3854472,
+  r512_ft_occ15-40img_n10_e49_3866737 and r512_occ15-40img_n00-20_e96_3866805, used per-image
+  boxes, hence `img` in their names; later runs have `batch`). Default epochs 98 = 14 cosine cycles of 7 (was 96).
   torchvision's v2 transforms sample parameters once per call, so applying
   them to a batched tensor would give every image in the batch the same jitter or the same
   rotation. Affine is wired up but is semantically risky here: the label is the position of
@@ -33,7 +34,7 @@ decode. Throughput numbers are in the history section above.
 - `--data-share` (fraction of the dataset, default 1.0) and `--step-filter` (1/2/4 = 0.01 /
   0.02 / 0.04 deg grid) make data-density ablations cheap. `--help` lists every knob.
 - Noise: sigma drawn per image uniformly in `[--noise-min, --noise]`, defaults 0.0 and 0.2
-  since 2026-09-10 (before: fixed 0.1; job 3866805 was the first run with the range).
+  since 2026-09-10 (before: fixed 0.1; r512_occ15-40img_n00-20_e96_3866805 was the first run with the range).
   `--noise-min` unset (None) gives a fixed sigma.
 - `--resolution N` (default None = `TRAINING_IMAGE_RESOLUTION`, 512): square input size; the
   loader resizes images of any other size. Used with the `dark256` bank (dark512 resized

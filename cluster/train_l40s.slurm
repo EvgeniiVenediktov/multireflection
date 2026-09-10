@@ -6,7 +6,7 @@
 #   sbatch cluster/train_l40s.slurm
 #
 # Fine-tune from an existing checkpoint, fewer epochs (values are read from the environment):
-#   sbatch --export=ALL,START_CKPT=/ix1/kchen/evv/multireflection/runs/3854472/resnet18_l40s_3854472_best_model.pth,EPOCHS=49 \
+#   sbatch --export=ALL,START_CKPT=/ix1/kchen/evv/multireflection/runs/r512_occ05-20img_n10_e96_3854472/r512_occ05-20img_n10_e96_3854472.pth,EPOCHS=49 \
 #       cluster/train_l40s.slurm
 # Extra flags for train/train_resnet_direct.py go in EXTRA_ARGS (word-split, so no spaces in values):
 #   sbatch --export=ALL,EXTRA_ARGS="--noise-min 0.0 --noise 0.2" cluster/train_l40s.slurm

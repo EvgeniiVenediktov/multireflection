@@ -12,20 +12,29 @@ pattern and regresses the mirror tilt (x, y) in degrees. The deployed loop moves
 by the negated prediction and stops when the SSIM against the reference image reaches a
 threshold. Training is supervised regression on the collected image bank.
 
-**Current best 512 px checkpoint:** `resnet18_l40s_3854472_best_model.pth`, CRCD job
+**Run names** (since 2026-09-10; checkpoints, run directories and W&B display names):
+`r<resolution>[_ft]_occ<box edge % min-max><img|batch>_n<noise sigma x100>_e<epochs>_<job>`.
+All runs so far use 2 boxes with p 0.5; `img` = boxes drawn per image, `batch` = drawn once
+per batch; `n00-20` = sigma per image in [0, 0.2]; `_ft` = fine-tuned; `local` = trained on
+the dev machine. Checkpoints are `<name>.pth` in `runs/<name>/` on the cluster and in
+`saved_models/real/` locally. Old names: `resnet18_l40s_<job>_best_model.pth` in `runs/<job>/`.
+
+**Current best 512 px checkpoint:** `r512_occ05-20img_n10_e96_3854472.pth`, CRCD job
 3854472, 2026-09-09, W&B run
-[resnet18_l40s_3854472](https://wandb.ai/e-venediktov-university-of-pittsburgh/multireflection/runs/93o4zgri).
+[r512_occ05-20img_n10_e96_3854472](https://wandb.ai/e-venediktov-university-of-pittsburgh/multireflection/runs/93o4zgri).
 Best epoch 93 of 96, val MSE 6.5e-5 on normalized labels. Offline sweep: 100% converged,
 1.14 adjustments, angular error 0.027 deg. Recipe in README "Current best checkpoint";
 it predates three default changes listed in section 3.
 
-**Runs on 2026-09-10** (all in `/ix1/kchen/evv/multireflection/runs/<job>/`):
+**Runs on 2026-09-10** (in `/ix1/kchen/evv/multireflection/runs/<name>/`; 3866805 stays in
+`runs/3866805/` under its old name until it finishes):
 
-| job | what | status at 17:25 EDT | best val MSE | offline eval (grid 0.1) |
+| run | what | status | best val MSE | offline eval (grid 0.1) |
 |---|---|---|---|---|
-| 3866737 | fine-tune of 3854472, 49 epochs, cutout 0.15-0.40, per-image boxes, fixed noise 0.1 | finished | 7.0e-5 | 100%, 1.11 adj, 0.026 deg |
-| 3866805 | from scratch, 96 epochs, noise sigma per image in [0, 0.2], per-image boxes | epoch 57 of 96 | 3.3e-5 so far | pending |
-| 3867169 | from scratch on `dark256` at 256 px, 98 epochs, all current defaults | finished | 2.8e-5 | 100%, 1.03 adj, 0.011 deg; val set (45,760 starts): same |
+| r512_ft_occ15-40img_n10_e49_3866737 | fine-tune of r512_occ05-20img_n10_e96_3854472, cutout 0.15-0.40, fixed noise 0.1 | finished | 7.0e-5 | 100%, 1.11 adj, 0.026 deg |
+| r512_occ15-40img_n00-20_e96_3866805 | from scratch, noise sigma per image in [0, 0.2], cutout 0.15-0.40 | training, epoch 82 of 96 when written | 2.6e-5 so far | pending |
+| r256_occ15-40batch_n00-20_e98_3867169 | from scratch on `dark256` at 256 px, all current defaults | finished | 2.8e-5 | 100%, 1.03 adj, 0.011 deg; val set (45,760 starts): same |
+| r64_occ15-40batch_n00-20_e98_local | from scratch on `dark64` at 64 px on the local A2000, all current defaults, batch 512, lr 2.8e-3, 5 workers; 30 min at 10k img/s | finished | 4.1e-5 | see section 5 |
 
 The 256 px run is the standout: 4.5x the throughput (3496 vs 780 img/s), lower val loss,
 and less than half the angular error of the 512 px best. It has not been checked on
@@ -45,7 +54,13 @@ every job. The extracted `data/dark512/` directory on `/ix1` is a stale partial 
 
 **`dark256`.** Same files resized to 256x256 with `cv2.INTER_AREA`, JPEG quality 95, built
 on the login node by streaming `dark512.tar.gz` (`data/make_dark256.py`, `run_dark256.sh`
-next to it). `data/dark256.tar.gz`, 1.85 GB, 228,800 files. No local copy.
+next to it). `data/dark256.tar.gz`, 1.85 GB, 228,800 files. Local copy extracted from that
+archive at `/home/evv/data/dark256/`.
+
+**`dark128`, `dark64`.** Same recipe (INTER_AREA directly from the 512 px JPEG, quality 95),
+built locally in one pass over `/mnt/h/dark512` (6.5 min, 5 processes):
+`/home/evv/data/dark128/` (947 MB) and `/home/evv/data/dark64/` (902 MB), 228,800 files
+each. Not on the cluster.
 
 **Split.** `build_split` in `train/train_resnet_direct.py`: shuffle with `--split-seed`
 (default 0), last 20% (`--val-share`) is validation: 183,040 train, 45,760 val. Every run
@@ -89,10 +104,8 @@ occlusion):
 | occlusion (cutout) | 2 boxes, each with p 0.5, edges 0.15 to 0.40 of the image, fill 0, drawn once per batch and applied to every image in it | `--occlusion-*` | boxes per batch and 0.15-0.40 since 2026-09-10 (was per image, 0.05-0.20) |
 | affine | off | `--affine-*` | never on; a translation resembles a different tilt |
 
-Which run used what: 3854472 = fixed noise 0.1, per-image boxes 0.05-0.20, 96 epochs.
-3866737 = fixed noise 0.1, per-image boxes 0.15-0.40, 49 epochs. 3866805 = noise range
-[0, 0.2], per-image boxes 0.15-0.40, 96 epochs. 3867169 = all current defaults, 98 epochs.
-A rerun of 3854472 with today's defaults is a different recipe; reproduce it with
+The run names encode which recipe each run used (section 1). A rerun of
+r512_occ05-20img_n10_e96_3854472 with today's defaults is a different recipe; reproduce it with
 `--noise-min` unset, `--noise 0.1 --occlusion-min 0.05 --occlusion-max 0.20 --epochs 96`
 (per-batch occlusion cannot be switched back without editing `_occlude`).
 
@@ -136,7 +149,7 @@ via `sbatch --export=ALL,...`:
 
 ```bash
 sbatch cluster/train_l40s.slurm
-sbatch --export=ALL,START_CKPT=/ix1/kchen/evv/multireflection/runs/3854472/resnet18_l40s_3854472_best_model.pth,EPOCHS=49 cluster/train_l40s.slurm
+sbatch --export=ALL,START_CKPT=/ix1/kchen/evv/multireflection/runs/r512_occ05-20img_n10_e96_3854472/r512_occ05-20img_n10_e96_3854472.pth,EPOCHS=49 cluster/train_l40s.slurm
 sbatch --export=ALL,DATASET=dark256,EXTRA_ARGS="--resolution 256" cluster/train_l40s.slurm
 sbatch --export=ALL,EXTRA_ARGS="--noise-min 0.0 --noise 0.2 --lr 0.001" cluster/train_l40s.slurm
 ```
@@ -147,7 +160,18 @@ End to end: `module purge`; print torch and GPU info; copy the archive to `$SLUR
 `utils/eval_batched.py` on the best checkpoint from the 0.1 deg grid (`$RUN_DIR/eval/`,
 W&B keys `eval/*`) and from `val_names.txt` (`$RUN_DIR/eval_val/`, keys `eval_val/*`);
 `crc-job-stats`. `srun` gets `--cpus-per-task` explicitly because Slurm 22.05+ does not
-reliably propagate it and the loader workers would be pinned to one core.
+reliably propagate it and the loader workers would be pinned to one core. The job still
+names new runs `resnet18_l40s_<job>`; rename them to the section 1 scheme when they finish.
+
+**Sweep job `cluster/eval_sweep_l40s.slurm`.** 1 GPU, 16 CPUs, 64 GB, 3 h. Stages
+`dark512`, runs `utils/eval_sweep.py` on `CKPT` with `--model-resolution $MODEL_RES` and
+writes `<checkpoint dir>/sweep/`. Knobs: `CKPT` (required), `MODEL_RES` (512), `OUT_DIR`,
+`GRID_STEP` (0.1), `CONDITIONS`, `EXTRA_ARGS`.
+
+```bash
+R=/ix1/kchen/evv/multireflection/runs
+sbatch --export=ALL,CKPT=$R/r256_occ15-40batch_n00-20_e98_3867169/r256_occ15-40batch_n00-20_e98_3867169.pth,MODEL_RES=256 cluster/eval_sweep_l40s.slurm
+```
 
 **Runtime.** Staging 20 s (dark256) to 460 s (dark512 on a slow node). 512 px, batch 512:
 about 235 s per epoch at 780 img/s, GPU at 100% and 43 of 46 GB, so batch 512 is the ceiling
@@ -196,20 +220,49 @@ trajectory index) and kept for all its steps, since dust does not move between m
 Frames are quantized to 8 bit. The SSIM stop test uses the clean frame unless
 `--perturb-ssim`, which disables memoization and computes SSIM per trajectory and step.
 
-**`utils/eval_sweep.py`** runs 13 conditions on one checkpoint and writes `sweep.csv` /
-`sweep.md` (`--conditions` selects a subset, `--wandb` logs a table). Result for
-`resnet18_l40s_3854472`, 2320 starts each, clean-frame SSIM stop test:
+**`utils/eval_sweep.py`** runs 29 conditions on one checkpoint and writes `sweep.csv` /
+`sweep.md` (`--conditions` selects a subset, `--wandb` logs a table): clean; noise sigma
+0.02/0.05/0.10/0.15/0.20/0.30; brightness factor 0.4/0.6/0.8/1.2/1.4/1.6; contrast 0.9/1.1;
+1 or 2 boxes of random edge 0.15-0.40 (`occlusion_1/2`); 1 or 2 boxes of fixed edge
+10/20/30/40/50% (`occlusion_<n>x<edge>`, 1 to 25% of the area per box); `combined` (the
+training augmentation) and `combined_harsh` (noise 0.2, brightness 0.6, 2 boxes of 30%).
+Seed 0, so every model gets the same per-start draws. Clean-frame SSIM stop test.
 
-| condition | success | adjustments | angular error (deg) |
+**Comparing input sizes.** `eval_batched.py --model-resolution N` perturbs the 512 px frame,
+box-averages it by the integer factor 512/N (`avg_pool2d`, the same average as
+`cv2.INTER_AREA`) and re-quantizes to 8 bit; the SSIM stop test stays on the clean 512 px
+frame. Running every model on `dark512` this way gives identical frames, perturbations and
+stop test. `utils/eval_compare.py LABEL=path/sweep.csv ...` merges the per-model tables.
+Checked locally on the clean 0.1 grid: r256 on `dark512` with `--model-resolution 256` gives
+100% / 1.02 / 0.012 deg against 100% / 1.03 / 0.011 on `dark256`; r64 gives 100% / 1.05 /
+0.016 against 100% / 1.10 / 0.014 on `dark64` (remaining differences: JPEG re-encoding of
+the small banks, and the stop test on the 512 frame instead of the small one).
+
+Earlier 13-condition results, each model on its own bank (3854472 and 3866737 on `dark512`,
+3867169 on `dark256`), 2320 starts on the 0.1 deg grid. Each cell is success / mean
+adjustments (converged starts) / mean angular error in deg (all starts).
+
+| condition | r512_occ05-20img_n10_e96_3854472 | r512_ft_occ15-40img_n10_e49_3866737 | r256_occ15-40batch_n00-20_e98_3867169 |
 |---|---|---|---|
-| clean | 100% | 1.14 | 0.027 |
-| noise 0.05 / 0.10 / 0.20 | 100% / 100% / 100% | 1.05 / 1.03 / 2.14 | 0.023 / 0.018 / 0.047 |
-| brightness 0.6 / 0.8 / 1.2 / 1.4 | 100% | 1.42 / 1.22 / 1.11 / 1.09 | 0.037 / 0.028 / 0.027 / 0.026 |
-| contrast 0.9 / 1.1 | 100% | 1.09 / 1.20 | 0.024 / 0.028 |
-| occlusion 1 box / 2 boxes | 93.0% / 82.1% | 1.34 / 1.53 (max 9) | 0.042 / 0.065 (max 0.79) |
-| combined (training augmentation at eval) | 89.4% | 1.47 (max 10) | 0.050 |
+| clean | 100% / 1.14 / 0.027 | 100% / 1.11 / 0.026 | 100% / 1.03 / 0.011 |
+| noise 0.05 | 100% / 1.05 / 0.023 | 100% / 1.04 / 0.016 | 100% / 1.04 / 0.011 |
+| noise 0.10 | 100% / 1.03 / 0.018 | 100% / 1.02 / 0.010 | 100% / 1.05 / 0.012 |
+| noise 0.20 | 100% / 2.14 / 0.047 | 100% / 1.72 / 0.038 | 100% / 1.08 / 0.015 |
+| brightness 0.6 | 100% / 1.42 / 0.037 | 100% / 1.98 (max 7) / 0.055 | 100% / 1.04 / 0.013 |
+| brightness 0.8 | 100% / 1.22 / 0.028 | 100% / 1.22 / 0.033 | 100% / 1.03 / 0.011 |
+| brightness 1.2 | 100% / 1.11 / 0.027 | 100% / 1.07 / 0.022 | 100% / 1.03 / 0.011 |
+| brightness 1.4 | 100% / 1.09 / 0.026 | 100% / 1.06 / 0.021 | 100% / 1.03 / 0.012 |
+| contrast 0.9 | 100% / 1.09 / 0.024 | 100% / 1.10 / 0.025 | 100% / 1.03 / 0.011 |
+| contrast 1.1 | 100% / 1.20 / 0.028 | 100% / 1.11 / 0.026 | 100% / 1.03 / 0.011 |
+| occlusion 1 box | 93.0% / 1.34 / 0.042 | 99.7% / 1.16 / 0.030 | 100% / 1.05 / 0.015 |
+| occlusion 2 boxes | 82.1% / 1.53 (max 9) / 0.065 (max 0.79) | 98.3% / 1.23 (max 8) / 0.036 (max 0.46) | 99.8% / 1.09 (max 3) / 0.018 (max 0.09) |
+| combined (training augmentation at eval) | 89.4% / 1.47 (max 10) / 0.050 | 99.96% / 1.06 (max 9) / 0.019 | 99.9% / 1.13 (max 8) / 0.019 |
 
-Occlusion is what breaks the loop; light noise, brightness and contrast are absorbed. With
+For 3854472 occlusion is what breaks the loop; light noise, brightness and contrast are
+absorbed. Fine-tuning with the larger boxes (3866737) recovers most of it (2 boxes 82.1% to
+98.3%, combined 89.4% to 99.96%) at the cost of brightness 0.6 (1.42 to 1.98 adjustments).
+The 256 px model is flat across every condition, including noise 0.20 and brightness 0.6,
+with the per-batch occlusion recipe; resolution and recipe are confounded. With
 `--perturb-ssim`, noise sigma 0.1 alone pins the SSIM near 0.1, so the stop test never
 fires although the final error stays small: SSIM is too noise-sensitive to serve as a
 convergence test on noisy frames, which is relevant for the hardware too.
@@ -232,6 +285,11 @@ convergence test on noisy frames, which is relevant for the hardware too.
   `TiltPredictor` on the Pi still preprocesses to 512; deploying a 256 model needs the
   resize in `config.py` / `app/` changed to match.
 - `--compile` is untested on the L40S.
+- `torch.nn.functional.interpolate(mode="area")` (adaptive average pooling) on CUDA, torch
+  2.14, returns the first image for every row when the batch was built as
+  `torch.from_numpy(np.stack(images)[:, None])` (channel stride 0; `.contiguous()` and
+  `.clone()` keep it). `avg_pool2d` is correct. Use it, or check per-image outputs, before
+  any batched area resize.
 - `utils/graph_eval.py` writes to `./graphs/eval/<log path minus .log>...png` relative to
   the working directory, so run it from inside the results directory or the nested path
   fails. `eval_batched.py` writes its own heatmaps, so this only matters for the hardware

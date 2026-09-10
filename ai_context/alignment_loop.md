@@ -57,7 +57,7 @@ resumes the run in `WANDB_RUN_ID` and writes `<prefix>/*` summary keys plus the 
 (`--wandb-prefix`, default `eval`); the L40S job runs both the grid (`eval/`) and the
 validation set (`eval_val/`). Starts are training positions, and time-to-align does not exist here.
 
-Result for `resnet18_l40s_3854472` (2026-09-10): 2320 starts, 100% converged,
+Result for `r512_occ05-20img_n10_e96_3854472` (2026-09-10): 2320 starts, 100% converged,
 1.14 +- 0.35 adjustments, final SSIM 0.984 +- 0.007, angular error 0.027 +- 0.015 deg.
 
 ### Perturbation evals
@@ -70,11 +70,17 @@ per trajectory and kept for all its steps; noise is redrawn per step; frames are
 to 8 bit. The SSIM stop test uses the clean frame unless `--perturb-ssim` (then SSIM is
 per (trajectory, step), not memoized; note SSIM is so noise-sensitive that noise 0.1 alone
 keeps it near 0.1, so the loop never "converges" even though the final error is small).
-`utils/eval_sweep.py` runs 13 conditions (clean, noise 0.05/0.1/0.2, brightness
-0.6/0.8/1.2/1.4, contrast 0.9/1.1, occlusion 1/2 boxes, combined) and writes
+`--model-resolution N` area-downscales the (perturbed) frame to the model's input size and
+re-quantizes it; the SSIM stop test stays on the bank's frame. Run every model on dark512
+with it to compare input sizes on identical frames and stop test.
+`utils/eval_sweep.py` runs 29 conditions (clean, noise 0.02/0.05/0.1/0.15/0.2/0.3,
+brightness 0.4/0.6/0.8/1.2/1.4/1.6, contrast 0.9/1.1, occlusion 1/2 boxes of random edge
+0.15-0.40, 1/2 boxes of fixed edge 10/20/30/40/50%, combined, combined_harsh) and writes
 `sweep.csv` / `sweep.md`; `--conditions` selects a subset, `--wandb` logs a table.
+`utils/eval_compare.py` merges several `sweep.csv` into one table;
+`cluster/eval_sweep_l40s.slurm` runs one checkpoint's sweep on an L40S.
 
-Sweep of `resnet18_l40s_3854472` (2026-09-10, 0.1 grid): noise up to 0.1, any brightness
+Sweep of `r512_occ05-20img_n10_e96_3854472` (2026-09-10, 0.1 grid, 13-condition version): noise up to 0.1, any brightness
 0.6 to 1.4 and contrast 0.9 to 1.1 stay at 100% success; noise 0.2 doubles the adjustments;
 occlusion is what breaks the loop: 93% success with one box, 82% with two, 89% for the
 combined training-style augmentation.
