@@ -20,9 +20,9 @@ Result claimed in the paper/README: 100% alignment success over the full actuati
 
 | Area | Files | Context file |
 |---|---|---|
-| Data: collection, preprocessing, LMDB, splits, eval logs | `data_process/`, `config.py` | [data_sources.md](data_sources.md) |
-| Models: architectures, inference wrapper | `app/inference.py`, `train/cnn_train.py` | [model.md](model.md) |
-| Supervised training: datasets, loop, sweeps | `train/`, `model_real.ipynb` | [training.md](training.md) |
+| Data: collection, preprocessing, eval logs | `data_process/`, `config.py` | [data_sources.md](data_sources.md) |
+| Models: architectures, inference wrapper | `app/inference.py`, `train/train_resnet_direct.py` | [model.md](model.md) |
+| Supervised training: dataset, loop, augmentation | `train/train_resnet_direct.py` | [training.md](training.md) |
 | Deployed closed loop + evaluation harness | `app/`, `utils/graph_eval.py` | [alignment_loop.md](alignment_loop.md) |
 | Ray-trace simulator + parameter/stability search | `simulation/` | [simulation.md](simulation.md) |
 | RL (PPO, GRU policy, vectorized env) - dormant | `herriott_env.py`, `policy.py`, `train_rl.py`, `config_sampler.py` | [rl.md](rl.md) |
@@ -34,9 +34,9 @@ pyproject.toml          dependencies and extras, managed with uv (uv.lock is com
 requirements.txt        generated from uv.lock, for environments without uv (the Pi)
 config.py               global constants for data collection / inference / eval
 app/                    on-device: inference, closed-loop alignment, eval sweep
-data_process/           data collection, image preprocessing, LMDB build
-train/                  supervised training script + notebooks + wandb sweep
-utils/                  eval-log plotting, misc helpers
+data_process/           data collection, image preprocessing
+train/                  supervised training script (train_resnet_direct.py) + two old notebooks
+utils/                  offline evaluation sweep, eval-log plotting
 simulation/             GPU ray-trace sim, stability search, interactive viewers
 graphs/                 figures used by README and paper
 hardware_design/        BOM
@@ -49,6 +49,12 @@ mf_control/             git submodule - motor + camera driver (MFController), NO
 `mf_control` is an external submodule providing `MFController`
 (`start`, `capture_image`, `set_tilt_x/y`, `get_x_tilt/get_y_tilt`, `get_frame_position`, `close`).
 It is empty in the working tree; anything importing it only runs on the Raspberry Pi.
+
+## Current best checkpoint
+
+`resnet18_l40s_3854472_best_model.pth` (job 3854472, 2026-09-09, W&B run 93o4zgri). Recipe and
+offline-eval numbers are in the README under "Current best checkpoint". Trained with cutout
+0.05 to 0.20; the script default is now 0.15 to 0.40.
 
 ## Cluster (Pitt CRCD)
 
@@ -70,17 +76,14 @@ use the `gpu` cluster for test jobs too. Resource rationale and storage notes:
 - `config.py:INFERENCE_MODEL_TYPE = "SimpleFC"` while `INFERENCE_MODEL_FILE_NAME` names a
   resnet18 checkpoint. One of the two is stale.
 - `config.py:SIMILARITY_INDEX_THRESHOLD = 0.95`; paper, README and `utils/graph_eval.py` use 0.97.
-- `train/cnn_train.py` contains a hardcoded W&B API key. Should be rotated / moved to env.
-  `train/train_resnet_direct.py` reads `WANDB_API_KEY` from the environment instead.
 
 ## Environment
 
-Managed with **uv**; `uv.lock` is committed. `uv sync` gives the core set, `--extra lmdb`
-adds the legacy LMDB pipeline, `--extra zemax` the Windows OpticStudio path, `--extra
-notebooks` Jupyter. Run things with `uv run python <script>`.
+Managed with **uv**; `uv.lock` is committed. `uv sync` gives the core set, `--extra zemax`
+the Windows OpticStudio path, `--extra notebooks` Jupyter. Run things with
+`uv run python <script>`.
 
-Removed as unnecessary during the uv transition: `scikit-learn` (was pulled in for a single
-`train_test_split` call, now a four-line stdlib shuffle in `prepare_lmdb.py`),
-`torchsummary` (unmaintained since 2018, replaced by `torchinfo`), and dead `msgpack` /
-`lz4` imports in `cnn_train.py`. `lmdb`, `msgpack`, `lz4` and `torchinfo` moved to the
-`lmdb` extra; `pillow` and `pythonnet` to `zemax`.
+Removed as unnecessary during the uv transition: `scikit-learn` (a single `train_test_split`
+call) and `torchsummary`; `pillow` and `pythonnet` moved to `zemax`. The `lmdb` extra
+(`lmdb`, `msgpack`, `lz4`, `torchinfo`) went away with the LMDB pipeline on 2026-09-10
+(see [training.md](training.md)).

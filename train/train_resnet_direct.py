@@ -1,7 +1,7 @@
 """
 train_resnet_direct.py - ResNet-18 tilt regression, reading JPEGs straight from disk.
 
-Alternative to cnn_train.py, which reads float32 tensors out of an LMDB. The images in
+The images in
 DATA_DIR are already fully preprocessed by collect_real_data.py (512x512, grayscale,
 circular-masked, blurred), so nothing has to happen at load time except a JPEG decode.
 
@@ -12,6 +12,9 @@ Design notes:
   - The network still sees exactly the same [0, 1] float32 input it always did.
   - fp16 autocast, TF32 and channels_last are on by default (measured on an RTX A2000,
     torch 2.14 + CUDA 13: 73 img/s fp32 -> 200 img/s with all three). Disable with --no-amp.
+  - --compile runs the model through torch.compile (Inductor). Off by default: the first
+    epoch is slower while it compiles, so it only pays off on long runs. Checkpoints are
+    saved from the underlying module, so they load exactly as uncompiled ones do.
   - Augmentation is brightness/contrast, Gaussian noise and random occlusion, all
     per-sample on the GPU. See GpuAugment for why torchvision's v2 transforms are not
     used. Affine is implemented but off by default: it costs ~7% throughput and teaches
@@ -103,9 +106,10 @@ config = {
     "use_amp": True,
     "use_tf32": True,
     "use_channels_last": True,
+    "use_compile": False,
 
     # GPU-side augmentation, applied after the /255 conversion so the magnitudes below
-    # are in [0, 1] units and match what cnn_train.py used. Set any value to 0 to disable
+    # are in [0, 1] units and match the earlier LMDB pipeline (removed 2026-09-10). Set any value to 0 to disable
     # that stage.
     "jitter_brightness": 0.4,
     "jitter_contrast": 0.1,
@@ -125,8 +129,8 @@ config = {
     # Random occlusion (cutout). Models dust or debris on the mirror surface.
     "occlusion_prob": 0.5,        # probability a given box is applied, per image
     "occlusion_count": 2,         # boxes attempted per image
-    "occlusion_min": 0.05,        # box edge as a fraction of image size
-    "occlusion_max": 0.20,
+    "occlusion_min": 0.15,        # box edge as a fraction of image size
+    "occlusion_max": 0.40,
     "occlusion_value": 0.0,       # fill value in normalized units
 
     "checkpoint_dir": "./saved_models/real",
@@ -134,7 +138,7 @@ config = {
 
     "use_wandb": True,
     "wandb_project": "multireflection",
-    "wandb_log_samples": 8,       # augmented images logged once at the first epoch
+    "wandb_log_samples": 15,      # raw + augmented images logged once at the first epoch
 
     "seed": 0,
 }
@@ -256,7 +260,7 @@ class GpuAugment:
     Every stage draws its parameters PER IMAGE. torchvision's v2 transforms sample once per
     CALL, so ColorJitter or RandomAffine applied to a batched tensor gives every image in
     the batch the same brightness, or the same rotation. That is a silent loss of
-    augmentation diversity relative to the per-sample CPU pipeline in cnn_train.py, which is
+    augmentation diversity relative to the earlier per-sample CPU pipeline, which was
     why these are written out by hand.
 
     Order: affine -> photometric (brightness/contrast, random order) -> noise -> occlusion.
@@ -412,6 +416,17 @@ def make_gpu_augment(cfg: dict):
     active = (aug.brightness or aug.contrast or aug.noise_sigma
               or aug.uses_affine or aug.uses_occlusion)
     return aug if active else None
+
+
+def display_stretch(image: torch.Tensor) -> "np.ndarray":
+    """(H,W) float in [0,1] -> uint8 for viewing: 99.5th percentile to white, gamma 0.5.
+
+    Display only. The dataset is mostly black with a few bright spots, so the linear image
+    looks empty on a monitor.
+    """
+    x = image.detach().float().clamp(0, 1)
+    hi = torch.quantile(x.flatten(), 0.995).clamp(min=1e-3)
+    return (x.div(hi).clamp(0, 1).sqrt() * 255).round().to(torch.uint8).cpu().numpy()
 
 
 def to_float_and_augment(images, device, augment, channels_last: bool):
@@ -656,6 +671,13 @@ def main(cfg: dict) -> None:
         model.load_state_dict(state)
         print(f"resumed from {cfg['starting_checkpoint']}")
 
+    # Keep a handle on the plain module: torch.compile wraps it, and the wrapper's
+    # state_dict keys carry an _orig_mod. prefix that TiltPredictor would not accept.
+    base_model = model
+    if cfg["use_compile"]:
+        model = torch.compile(model)
+        print("torch.compile: on (the first epoch includes compilation time)")
+
     optimizer = optim.AdamW(model.parameters(), cfg["lr"], weight_decay=cfg["weight_decay"])
     criterion = nn.MSELoss()
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -683,21 +705,34 @@ def main(cfg: dict) -> None:
                   "or pass --no-wandb to train without logging.")
         run = wandb.init(project=cfg["wandb_project"], name=cfg["experiment_name"],
                          config=cfg, resume="allow")
-        run.watch(model, log="all", log_freq=200)
+        run.watch(base_model, log="all", log_freq=200)
         run.summary["train_images"] = len(train_dataset)
         run.summary["val_images"] = len(val_dataset)
         run.summary["x_span"] = X_SPAN
         run.summary["y_span"] = Y_SPAN
 
-        # One look at what the network is actually being fed, post-augmentation.
+        # One look at what the network is actually being fed, post-augmentation. The
+        # images are dark (mean ~8/255, spots near 255), so the linear image is nearly
+        # black on screen. Log it stretched for display; the network still gets linear.
+        # Samples are drawn at random across the whole training split so they cover
+        # different tilt positions rather than neighbouring files.
         n_samples = min(cfg["wandb_log_samples"], len(train_dataset))
         if n_samples > 0:
-            raw = torch.stack([train_dataset[i][0] for i in range(n_samples)])
+            picks = sorted(random.Random(cfg["seed"]).sample(range(len(train_dataset)), n_samples),
+                           key=lambda i: train_dataset.names[i])
+            raw = torch.stack([train_dataset[i][0] for i in picks])
             shown = to_float_and_augment(raw, device, augment, cfg["use_channels_last"])
-            run.log({"augmented_samples": [
-                wandb.Image(shown[i].float().cpu(), caption=train_dataset.names[i])
-                for i in range(n_samples)
-            ]}, step=0)
+            run.log({
+                "input_samples": [
+                    wandb.Image(display_stretch(raw[k, 0].float().div(255)),
+                                caption=train_dataset.names[i])
+                    for k, i in enumerate(picks)
+                ],
+                "augmented_samples": [
+                    wandb.Image(display_stretch(shown[k, 0]), caption=train_dataset.names[i])
+                    for k, i in enumerate(picks)
+                ],
+            }, step=0)
 
     best_loss = float("inf")
     ckpt_name = cfg["experiment_name"] + "_best_model.pth"
@@ -719,7 +754,7 @@ def main(cfg: dict) -> None:
 
         if val_loss < best_loss:
             best_loss = val_loss
-            save_model(model, ckpt_name, cfg["checkpoint_dir"])
+            save_model(base_model, ckpt_name, cfg["checkpoint_dir"])
 
         print(f"Epoch {epoch + 1}/{cfg['epochs']}, Train Loss: {train_loss:.6f}, "
               f"Val Loss: {val_loss:.6f}, Best: {best_loss:.6f}, "
@@ -774,6 +809,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     opt.add_argument("--starting-checkpoint", default=config["starting_checkpoint"])
     opt.add_argument("--no-amp", action="store_true",
                      help="disable fp16 autocast and channels_last (both on by default)")
+    opt.add_argument("--compile", action="store_true",
+                     help="torch.compile the model; first epoch is slower while it compiles")
 
     aug = p.add_argument_group("augmentation (0 disables a stage)")
     aug.add_argument("--brightness", type=float, default=config["jitter_brightness"])
@@ -834,6 +871,7 @@ if __name__ == "__main__":
 
         "wandb_project": args.wandb_project,
         "use_wandb": not args.no_wandb,
+        "use_compile": args.compile,
     })
 
     if args.no_amp:

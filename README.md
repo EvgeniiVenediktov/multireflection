@@ -114,7 +114,6 @@ Then create the environment from the lockfile:
 
 ```bash
 uv sync                      # core: training, inference, simulation, analysis
-uv sync --extra lmdb         # adds the legacy LMDB pipeline
 uv sync --all-extras         # everything, including notebooks
 ```
 
@@ -129,9 +128,8 @@ uv run python utils/graph_eval.py eval.log 0.97
 
 | Extra | Adds | Needed for |
 |---|---|---|
-| `lmdb` | `lmdb`, `msgpack`, `lz4`, `torchinfo` | `data_process/prepare_lmdb.py`, `train/cnn_train.py` |
 | `zemax` | `pythonnet`, `pillow` | `data_process/generate_simulated_data.py` (Windows + OpticStudio only) |
-| `notebooks` | `ipykernel`, `jupyterlab` | `model_real.ipynb`, `train/experiments/*.ipynb` |
+| `notebooks` | `ipykernel`, `jupyterlab` | `train/experiments/*.ipynb` |
 
 ### PyTorch and CUDA
 
@@ -160,10 +158,10 @@ uv export --no-hashes --no-dev --format requirements-txt -o requirements.txt
 
 ## Training
 
-Both training scripts build the same ResNet-18 and write plain state dicts, so their
-checkpoints load directly into `TiltPredictor(model_type="ResNet18")` for deployment.
+`train/train_resnet_direct.py` builds the ResNet-18 and writes a plain state dict that loads
+directly into `TiltPredictor(model_type="ResNet18")` for deployment.
 
-### `train/train_resnet_direct.py` (current)
+### `train/train_resnet_direct.py`
 
 Reads the preprocessed JPEGs straight from the collection directory. Workers return uint8
 and the `/255` conversion plus every augmentation run batched on the GPU, so nothing carries
@@ -181,10 +179,47 @@ Augmentation is brightness, contrast, Gaussian noise and random occlusion, each 
 image. Affine is implemented but off by default: the label *is* the position of the spot
 pattern, so a translation resembles a different mirror tilt.
 
-### `train/cnn_train.py` (earlier)
+### Current best checkpoint
 
-The original pipeline, reading float32 tensors from an LMDB built by
-`data_process/prepare_lmdb.py`. Needs the `lmdb` extra. Kept for reproducing earlier runs.
+`resnet18_l40s_3854472_best_model.pth`, trained on 2026-09-09 by CRCD job 3854472 on one
+L40S (6.3 h). W&B run: [resnet18_l40s_3854472](https://wandb.ai/e-venediktov-university-of-pittsburgh/multireflection/runs/93o4zgri).
+Best epoch 93 of 96, validation MSE 6.5e-5 on normalized labels. The checkpoint lives at
+`/ix1/kchen/evv/multireflection/runs/3854472/` on the cluster and in `saved_models/real/`
+locally (not tracked).
+
+| | |
+|---|---|
+| data | full `dark512`, 0.01 deg grid, 183,040 train / 45,760 val (random 20%, seed 0) |
+| batch size, lr | 512, 2.8e-3 (1e-3 at 64, scaled by sqrt of the batch ratio) |
+| optimizer | AdamW, weight decay 1e-3 |
+| schedule | CosineAnnealingWarmRestarts, T_0 = 7 epochs, eta_min 1e-5, 96 epochs |
+| precision | fp16 autocast, TF32, channels_last |
+| augmentation | brightness 0.4, contrast 0.1, Gaussian noise 0.1, cutout p 0.5 x 2 boxes of 0.05 to 0.20 of the image; affine off |
+| loader | 10 workers, prefetch 4, uint8 to the GPU |
+
+Note the cutout range: the script default has since been raised to 0.15 to 0.40, so a rerun
+with defaults is not the same recipe. Reproduce with
+`--batch-size 512 --lr 0.0028 --occlusion-min 0.05 --occlusion-max 0.20`.
+
+Offline sweep (`utils/eval_batched.py`, threshold 0.97, cap 10 adjustments, starts on a
+0.1 deg grid, 2320 starts): 100% converged, 1.14 +- 0.35 adjustments (max 2), final SSIM
+0.984 +- 0.007, final angular error 0.027 +- 0.015 deg (max 0.085).
+
+### Offline evaluation
+
+`utils/eval_batched.py` replays the paper's alignment sweep (Algorithm 2) on the collected
+image bank instead of the hardware: every start on a grid is stepped through the closed
+loop, with the model run in GPU batches and the dataset used as the position-to-image
+lookup. It writes a per-step trace, a log in the hardware format that `utils/graph_eval.py`
+reads, a summary and the heatmaps. About twenty seconds for the full 0.1 degree grid.
+
+```bash
+uv run python utils/eval_batched.py --checkpoint saved_models/real/<ckpt>.pth
+uv run python utils/eval_batched.py --grid-step 0.5 --threshold 0.97   # coarse
+```
+
+Starts are training positions (the validation split is a random 20% of the same folder), so
+this measures closed-loop behaviour on seen data. Time-to-align does not exist offline.
 
 ### On the Pitt CRCD cluster
 
@@ -196,8 +231,9 @@ bash cluster/check_env.sh
 sbatch cluster/train_l40s.slurm
 ```
 
-Resource choices, storage layout and the staging rationale are documented in
-[cluster/README.md](cluster/README.md).
+The job trains, then runs the offline evaluation on the best checkpoint and attaches the
+summary and heatmaps to the same W&B run. Resource choices, storage layout and the staging
+rationale are documented in [cluster/README.md](cluster/README.md).
 
 ## Repository Structure
 
@@ -205,10 +241,10 @@ Resource choices, storage layout and the staging rationale are documented in
 |---|---|
 | `config.py` | actuation range, model selection, evaluation grid |
 | `app/` | runs on the Raspberry Pi: inference, closed-loop alignment, evaluation sweep |
-| `data_process/` | data collection, image preprocessing, LMDB packing |
+| `data_process/` | data collection, image preprocessing |
 | `train/` | training scripts and experiment notebooks |
 | `cluster/` | Pitt CRCD job scripts |
-| `utils/` | evaluation-log parsing and plotting |
+| `utils/` | offline evaluation sweep, evaluation-log parsing and plotting |
 | `simulation/` | GPU ray-trace simulator, stability search, interactive viewers |
 | `herriott_env.py`, `policy.py`, `train_rl.py`, `config_sampler.py` | reinforcement-learning exploration, currently dormant |
 | `ai_context/` | condensed per-module notes on the codebase |
