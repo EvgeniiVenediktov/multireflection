@@ -44,8 +44,11 @@ runs `utils/eval_batched.py` on the best checkpoint against the staged image ban
 (`runs/<jobid>/eval_val/`, positions never trained on); summaries and heatmaps are attached
 to the training's W&B run as `eval/*` and `eval_val/*` (all stages share `WANDB_RUN_ID`).
 
-`sbatch --export=ALL,START_CKPT=<path>,EPOCHS=<n>,EXTRA_ARGS="<flags>"` fine-tunes from a
-checkpoint, changes the epoch count, or appends training flags (see the script header).
+`sbatch --export=ALL,START_CKPT=<path>,EPOCHS=<n>,EXTRA_ARGS="<flags>",DATASET=<name>`
+fine-tunes from a checkpoint, changes the epoch count, appends training flags, or stages a
+different bank (`data/<name>.tar.gz`, e.g. `dark256` with `EXTRA_ARGS="--resolution 256"`).
+See the script header. The eval stages always use the 0.1 deg grid and the run's validation
+images.
 
 ## Resource request, and why
 

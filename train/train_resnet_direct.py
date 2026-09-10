@@ -83,6 +83,7 @@ config = {
     # Fraction of the (already step-filtered) dataset to use. 1.0 = everything.
     # Applied with split_seed, so the same share is reproducible across runs.
     "data_share": 1.0,
+    "resolution": None,           # square input size; None = TRAINING_IMAGE_RESOLUTION from config.py
 
     # Throughput is flat from bs=16 to bs=128 (153-159 img/s) because the GPU is
     # power-limited, so this is chosen for headroom rather than speed: 3.9 GiB peak on a
@@ -113,8 +114,8 @@ config = {
     # that stage.
     "jitter_brightness": 0.4,
     "jitter_contrast": 0.1,
-    "noise_level": 0.1,
-    "noise_level_min": None,      # set to sample sigma per image in [min, noise_level]
+    "noise_level": 0.2,           # upper bound of the per-image sigma range
+    "noise_level_min": 0.0,       # None = fixed sigma noise_level for every image
 
     # Affine. OFF by default, for two reasons. Semantically, the label IS the position and
     # shape of the spot pattern, so a translation looks to the network exactly like a
@@ -642,7 +643,10 @@ def main(cfg: dict) -> None:
     if not train_names:
         raise RuntimeError(f"No images found under {cfg['data_dir']}")
 
-    resolution = tuple(TRAINING_IMAGE_RESOLUTION)
+    # Images that are not already this size are resized by the loader, so a 256 px bank
+    # trains at 256 only if --resolution 256 is given, otherwise it is upsampled to 512.
+    resolution = (cfg["resolution"], cfg["resolution"]) if cfg["resolution"] else tuple(TRAINING_IMAGE_RESOLUTION)
+    print(f"input resolution: {resolution[0]}x{resolution[1]}")
     train_dataset = DirectImageDataset(cfg["data_dir"], train_names, resolution)
     val_dataset = DirectImageDataset(cfg["data_dir"], val_names, resolution)
 
@@ -803,6 +807,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help="1 = all images, 2 = 0.02 deg grid, 4 = 0.04 deg grid")
     data.add_argument("--val-share", type=float, default=config["val_share"])
     data.add_argument("--split-seed", type=int, default=config["split_seed"])
+    data.add_argument("--resolution", type=int, default=config["resolution"],
+                      help="square input size in px; images of another size are resized by the loader "
+                           "(default: TRAINING_IMAGE_RESOLUTION in config.py)")
     data.add_argument("--train-keys-file", default=config["train_keys_file"])
     data.add_argument("--val-keys-file", default=config["val_keys_file"])
 
@@ -858,6 +865,7 @@ if __name__ == "__main__":
         "step_filter": args.step_filter,
         "val_share": args.val_share,
         "split_seed": args.split_seed,
+        "resolution": args.resolution,
         "train_keys_file": args.train_keys_file,
         "val_keys_file": args.val_keys_file,
 

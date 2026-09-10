@@ -29,8 +29,12 @@ decode. Throughput numbers are in the history section above.
   stored in the repository. `--no-wandb` disables it.
 - `--data-share` (fraction of the dataset, default 1.0) and `--step-filter` (1/2/4 = 0.01 /
   0.02 / 0.04 deg grid) make data-density ablations cheap. `--help` lists every knob.
-- `--noise-min` (default None): when set, the Gaussian noise sigma is drawn per image
-  uniformly in `[noise_min, --noise]` instead of being fixed at `--noise`.
+- Noise: sigma drawn per image uniformly in `[--noise-min, --noise]`, defaults 0.0 and 0.2
+  since 2026-09-10 (before: fixed 0.1; job 3866805 was the first run with the range).
+  `--noise-min` unset (None) gives a fixed sigma.
+- `--resolution N` (default None = `TRAINING_IMAGE_RESOLUTION`, 512): square input size; the
+  loader resizes images of any other size. Used with the `dark256` bank (dark512 resized
+  with INTER_AREA on the cluster login node, `/ix1/kchen/evv/multireflection/data/dark256.tar.gz`).
 - Every run writes `train_names.txt` / `val_names.txt` into `--checkpoint-dir` (split is
   deterministic from `--split-seed`, but the files make it explicit and let
   `utils/eval_batched.py --starts-file` evaluate on held-out positions).

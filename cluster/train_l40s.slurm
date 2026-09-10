@@ -10,6 +10,8 @@
 #       cluster/train_l40s.slurm
 # Extra flags for train/train_resnet_direct.py go in EXTRA_ARGS (word-split, so no spaces in values):
 #   sbatch --export=ALL,EXTRA_ARGS="--noise-min 0.0 --noise 0.2" cluster/train_l40s.slurm
+# Another image bank (an archive $DATA_ROOT/data/<DATASET>.tar.gz that extracts to <DATASET>/):
+#   sbatch --export=ALL,DATASET=dark256,EXTRA_ARGS="--resolution 256" cluster/train_l40s.slurm
 #
 # Monitor:  squeue -M gpu -u $USER      |  crc-job-stats <jobid>
 # Cancel:   scancel -M gpu <jobid>
@@ -34,7 +36,8 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/ihome/kchen/evv13/multireflection}"
 DATA_ROOT="${DATA_ROOT:-/ix1/kchen/evv/multireflection}"
-DATA_TAR="$DATA_ROOT/data/dark512.tar.gz"
+DATASET="${DATASET:-dark512}"
+DATA_TAR="$DATA_ROOT/data/$DATASET.tar.gz"
 RUN_DIR="$DATA_ROOT/runs/${SLURM_JOB_ID:-manual}"
 VENV_PY="${VENV_PY:-$PROJECT_DIR/.venv/bin/python}"
 EPOCHS="${EPOCHS:-98}"
@@ -67,7 +70,7 @@ t0=$(date +%s)
 cp "$DATA_TAR" "$STAGE/"
 tar -xzf "$STAGE/$(basename "$DATA_TAR")" -C "$STAGE"
 rm -f "$STAGE/$(basename "$DATA_TAR")"
-DATA_DIR="$STAGE/dark512"
+DATA_DIR="$STAGE/$DATASET"
 echo "staged $(ls "$DATA_DIR" | wc -l) files in $(( $(date +%s) - t0 ))s"
 df -h "$STAGE" | tail -1
 
@@ -82,6 +85,9 @@ export WANDB_RUN_ID="l40s-${SLURM_JOB_ID:-manual}"
 # --cpus-per-task is passed explicitly: srun does not reliably inherit it from sbatch
 # (Slurm 22.05+), and the loader workers would otherwise be pinned to one core.
 RUN_NAME="resnet18_l40s_${SLURM_JOB_ID:-manual}"
+if [ "$DATASET" != dark512 ]; then
+    RUN_NAME="resnet18_l40s_${DATASET}_${SLURM_JOB_ID:-manual}"
+fi
 START_ARGS=()
 if [ -n "$START_CKPT" ]; then
     [ -f "$START_CKPT" ] || { echo "no checkpoint at $START_CKPT"; exit 1; }
