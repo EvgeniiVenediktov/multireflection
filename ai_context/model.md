@@ -4,8 +4,11 @@ Task: image (1x512x512, grayscale, circular-masked, [0,1]) -> 2 floats, the norm
 (x_tilt, y_tilt) of the current mirror pose. The alignment controller moves by the *negated*
 prediction, so the network effectively predicts the correction.
 
-Architectures are defined **twice**: `app/inference.py` (deployment copy) and
-`train/cnn_train.py` (training copy). They are not shared; keep them in sync when editing.
+The ResNet is defined **twice**: `app/inference.py` (deployment copy) and
+`train/train_resnet_direct.py` (training copy, `BasicBlock` / `ResNet` / `resnet18` only).
+They are not shared; keep them in sync when editing. `SimpleFC` and the experimental
+architectures exist only in `app/inference.py`; their training code was in the removed LMDB
+pipeline (git history before 2026-09-10).
 
 ## Deployed candidates (paper Table 1)
 
@@ -20,20 +23,23 @@ Architectures are defined **twice**: `app/inference.py` (deployment copy) and
 
 ResNet-18 was selected for deployment (12x smaller memory footprint).
 
-### `SimpleFC` - `app/inference.py:89`, `train/cnn_train.py:570`
+### `SimpleFC` - `app/inference.py:89`
 Flattened 512*512 -> 1024 -> 256 -> 32 -> 2, each hidden layer BatchNorm1d + ReLU.
 Requires `flatten_data=True` in the dataset (or `.flatten()` in `TiltPredictor.predict`).
 
-### `ResNet` / `resnet18` - `app/inference.py:279,345`, `train/cnn_train.py:434,500`
+### `ResNet` / `resnet18` - `app/inference.py:279,345`, `train/train_resnet_direct.py:485,544`
 Hand-written ResNet (`BasicBlock` / `Bottleneck`), first conv takes **1 channel**, head is
-`Linear(512, 2)`. Factories for 18/34/50/101/152 exist; only 18 is used.
+`Linear(512, 2)`. Factories for 18/34/50/101/152 exist in `app/inference.py`; only 18 is
+used, and the training copy defines only `BasicBlock` and `resnet18`.
 Kaiming init on convs, constant init on BN.
 
 ## Experimental architectures (not deployed)
 
-- `ConfigCNN` - `train/cnn_train.py:526`. CNN built from the `conv_config` list of dicts
-  (out_channels / kernel_size / stride / padding, huge first kernels: 149, 31, 7) plus a
-  2-layer FC head sized from `size_after_conv`. Used for the wandb sweeps.
+- `ConfigCNN` - lived only in the removed LMDB pipeline (`train/cnn_train.py`,
+  `train/experiments/wandb_sweep.py`, git history before 2026-09-10). CNN built from a
+  `conv_config` list of dicts (out_channels / kernel_size / stride / padding, huge first
+  kernels: 149, 31, 7) plus a 2-layer FC head sized from `size_after_conv`. Used for the
+  wandb sweeps; no code in the tree defines it any more.
 - `GradientMagnitude` + `GradientSimpleFC` - `app/inference.py:24,67`. Learn on Sobel gradient
   magnitude (Gaussian blur -> Sobel -> per-image min-max normalize) instead of raw pixels.
 - `CLAHEGradTransform` - `app/inference.py:175`. OpenCV CLAHE + blur + Sobel preprocessing,
@@ -50,8 +56,8 @@ Kaiming init on convs, constant init on BN.
 - `predict(img, scale_predictions=True)`: optional preprocessing transform, `float()/255`,
   per-type reshaping, forward under `no_grad`, then de-normalizes
   `pred_x * (X_TILT_STOP - X_TILT_START) + X_TILT_START` (same for y).
-  Note the `/255` here - LMDB tensors are already normalized at build time, so training and
-  inference normalization paths differ; inputs at inference come from OpenCV uint8 images.
+  The `/255` matches training: `train/train_resnet_direct.py` loads uint8 JPEGs and divides
+  by 255 on the GPU, and inputs at inference come from OpenCV uint8 images.
 - Model choice is driven by `config.py:INFERENCE_MODEL_FILE_NAME` / `INFERENCE_MODEL_TYPE`
   (currently inconsistent - see [main.md](main.md)).
 

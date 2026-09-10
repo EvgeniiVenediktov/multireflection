@@ -21,22 +21,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Legacy LMDB pipeline: data_process/prepare_lmdb.py and train/cnn_train.py.
-# train/train_resnet_direct.py reads JPEGs straight from disk and needs none of this.
-lmdb = [
-    "lmdb>=1.6",
-    "msgpack>=1.1",
-    "lz4>=4.4",
-    "torchinfo>=1.8",
-]
 # Zemax OpticStudio data generation, data_process/generate_simulated_data.py.
 # Windows only: pythonnet needs the .NET runtime and the ZOS-API DLLs.
 zemax = [
     "pythonnet>=3.0",
     "pillow>=11.1",
 ]
-# model_real.ipynb and train/experiments/*.ipynb. Those notebooks are historical and also
-# import the "lmdb" extra.
+# train/experiments/*.ipynb. Historical notebooks (synthetic-data model, scratch tests).
 notebooks = [
     "ipykernel>=6.29",
     "jupyterlab>=4.3",

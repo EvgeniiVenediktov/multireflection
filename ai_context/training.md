@@ -1,88 +1,13 @@
 # Supervised training
 
-Entry point: **`train/cnn_train.py`** (a jupytext-style `# %%` script; the notebooks in
-`train/experiments/` and the root `model_real.ipynb` are earlier snapshots of the same flow).
-Everything is driven by the `config` dict at `train/cnn_train.py:53`.
-
-## Config keys that matter
-
-- `data_folder` - path to the LMDB directory (e.g. `/mnt/h/black_512_0_001step_tensor.lmdb`).
-- `dataset_type` - `LMDBImageDataset` (lazy) or `InMemoryLMDBImageDataset` (caching).
-  Note: the `match` at `:308` compares against `"InMemoryImageDataset"`, which does not equal the
-  class name used in the config - the in-memory branch is effectively unreachable as written.
-- `dataset_train_keys_fname` / `dataset_val_keys_fname` - key-list files *inside* the LMDB dir,
-  produced by `write_split_keys` (see [data_sources.md](data_sources.md)).
-- `dataset_config_flatten` - `True` for `SimpleFC`, `False` for CNN/ResNet.
-- `batch_size` 400, `lr` 1e-3, `epochs` 96, `lr_scheduler_loop` 7, `use_amp` False.
-- Augmentation toggles: `use_jitter_transform` (brightness 0.4 / contrast 0.1),
-  `use_noise_transform` (Gaussian sigma 0.1), `use_grayscale_transform`,
-  `use_clahegrad_transform`, `use_high_pass_transform`.
-- `starting_checkpoint_fname` / `checkpoint_folder` for warm starts.
-- The whole dict is logged to W&B as the run config, and the run is named `experiment_name`.
-
-## Datasets
-
-`LMDBImageDataset` (`:201`) - lazy. Reads the key file, parses labels from the keys, opens the
-LMDB lazily in each worker (`open_lmdb` on first `__getitem__`, so it is fork-safe), decodes
-`torch.save` bytes to a float32 `(1,H,W)` tensor, applies transforms, optionally flattens, then
-normalizes the label to [0,1].
-
-`InMemoryLMDBImageDataset` (`:101`) - same, but caches every decoded tensor in `self.images` and
-tracks `loaded_indexes`. Labels are precomputed in `__init__`. Opens the LMDB txn in the parent
-process, so it does not survive `num_workers > 0` cleanly.
-
-DataLoaders (`:319`): train `shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=4,
-persistent_workers=True`; val `num_workers=4, shuffle=False`.
-
-## Augmentation
-
-`torchvision.transforms.v2`, composed at `:288`, applied inside `__getitem__`:
-`ColorJitter(brightness, contrast)` then `GaussianNoise(sigma)`. Validation gets an empty/None
-compose unless grayscale conversion is enabled. Order matters - jitter before noise.
-
-## Loop - `train/cnn_train.py:627` `train()`
-
-- Loss `nn.MSELoss` on the normalized 2-vector; optimizer `AdamW(lr, weight_decay=1e-3)`;
-  scheduler `CosineAnnealingWarmRestarts(T_0=lr_scheduler_loop, eta_min=1e-5)`.
-- `GradScaler` is instantiated and used, but `autocast(..., enabled=False)` - AMP is wired up and
-  disabled; the scaler is a no-op passthrough.
-- Per epoch: train pass, val pass under `inference_mode`, `scheduler.step()`,
-  checkpoint on best val loss to `./saved_models/real/<experiment_name>_best_model.pth`.
-- W&B logs train/val loss, their logs, LR, best loss, and a 0.8/0.2 weighted total.
-- `torch.manual_seed(0)` at import; split randomness lives in the key files, not here.
-
-Checkpoint naming convention (see `config.py`):
-`resnet18_001step_BS_avid-sweep-4406_DarkOnly512_lmdb_50bs_0001lr_aug+_best_model.pth`
-= architecture, data step, sweep name, dataset, storage, batch size, LR, augmentation on.
-
-## Hyperparameter sweeps - `train/experiments/wandb_sweep.py`
-
-Standalone sweep agent. Key difference from `cnn_train.py`: it loads the **entire split onto the
-GPU once** (`load_dataset_to_gpu`) and keeps it in a module-level `_DATA_CACHE`, so sweep trials
-skip all I/O. Sweeps searched `ConfigCNN` conv stacks; the winning run name (`avid-sweep-4406`)
-is embedded in the deployed checkpoint filename.
-
-## Notebooks
-
-`model_real.ipynb` (root) and `train/experiments/*.ipynb` - historical: MLP-era training,
-processing experiments, synthetic-data model, dog/conv scratch tests. Useful only as provenance;
-`train/cnn_train.py` supersedes them.
-
-## Gotchas
-
-- Imports assume the repo root is on `sys.path` (`from preprocess_images import ...`,
-  `from config import ...`) - run from the project root.
-- Label normalization constants (`/5.7`, `/4`) are hardcoded in three places; changing the
-  actuation range silently invalidates old checkpoints.
-- Hardcoded W&B API key at `train/cnn_train.py` (`wandb.login(key=...)`) - rotate it.
+Entry point: **`train/train_resnet_direct.py`**, the only training path. It reads the
+preprocessed JPEGs in the collection folder directly.
 
 ## Direct-from-disk training - `train/train_resnet_direct.py`
 
-Alternative to `cnn_train.py` that skips the LMDB entirely. Measured on an RTX A2000: the
-float32 LMDB delivers 96.5 img/s with 8 workers (its ceiling), while the JPEG folder gives
-468 img/s cold and 1975 img/s once the 4.83 GB dataset is in page cache. The model itself
-does 73 img/s in fp32 and 200 img/s with fp16 autocast + TF32 + channels_last, so the LMDB
-path caps throughput as soon as AMP is enabled.
+Reads the JPEGs in `DATA_DIR` (already 512x512 grayscale, masked and blurred by
+`collect_real_data.py`) with `DirectImageDataset`; the only per-sample work is the JPEG
+decode. Throughput numbers are in the history section above.
 
 - Workers return **uint8**; `/255` and every augmentation run batched on the GPU. The
   network sees the same [0, 1] float32 as before - only the storage dtype changed.
@@ -92,11 +17,53 @@ path caps throughput as soon as AMP is enabled.
   them to a batched tensor would give every image in the batch the same jitter or the same
   rotation. Affine is wired up but is semantically risky here: the label is the position of
   the spot pattern, so a translation resembles a different mirror tilt. Ablate it.
-- Label normalization derives from `X/Y_TILT_START/STOP` in `config.py` instead of the
-  hardcoded 5.7 / 4, so it cannot drift from what `app/inference.py` de-normalizes with.
+- Label normalization derives from `X/Y_TILT_START/STOP` in `config.py` (`imname_to_target`
+  parses the `x{..}_y{..}.jpg` filename), so it cannot drift from what `app/inference.py`
+  de-normalizes with.
 - Checkpoints are plain state dicts, verified to load into
   `TiltPredictor(model_type="ResNet18")` with `strict=True`.
 - W&B logging is on by default and reads `WANDB_API_KEY` from the environment; no key is
   stored in the repository. `--no-wandb` disables it.
 - `--data-share` (fraction of the dataset, default 1.0) and `--step-filter` (1/2/4 = 0.01 /
   0.02 / 0.04 deg grid) make data-density ablations cheap. `--help` lists every knob.
+
+## History: the LMDB pipeline (removed 2026-09-10)
+
+The original pipeline packed the JPEGs into an LMDB of float32 tensors
+(`data_process/prepare_lmdb.py`) and trained from it (`train/cnn_train.py`, a jupytext-style
+`# %%` script, plus the sweep agent `train/experiments/wandb_sweep.py` and the notebooks
+`model_real.ipynb`, `train/experiments/{model_real,model_real copy,train_model,conv,dog,
+processing_experiments}.ipynb`). The LMDB archives were deleted in September 2026 and the
+code and notebooks were removed from the tree on 2026-09-10; all of it is in git history
+before that date. Things worth knowing from that era:
+
+- The deployed checkpoint, `resnet18_001step_BS_avid-sweep-4406_DarkOnly512_lmdb_50bs_0001lr_aug+_best_model.pth`
+  (see `config.py`), was produced by it. Naming convention: architecture, data step, sweep
+  name, dataset, storage (`lmdb`), batch size, LR, augmentation on.
+- Sweeps searched `ConfigCNN` conv stacks; the winning run name (`avid-sweep-4406`) is
+  embedded in that checkpoint filename. `ConfigCNN` itself was defined only in the removed
+  files.
+- Loss `nn.MSELoss` on the normalized 2-vector, `AdamW(lr=1e-3, weight_decay=1e-3)`,
+  `CosineAnnealingWarmRestarts(T_0=7, eta_min=1e-5)`, batch 400, 96 epochs; augmentation was
+  `ColorJitter(brightness 0.4, contrast 0.1)` then `GaussianNoise(sigma 0.1)` per sample on the
+  CPU. `train_resnet_direct.py` keeps the same loss/optimizer family and moves augmentation to
+  the GPU.
+- Label normalization was hardcoded as `/5.7` and `/4`; the direct script derives it from
+  `config.py` instead (see below).
+- The LMDB path was also the throughput bottleneck. Measured on an RTX A2000: the float32 LMDB
+  delivered 96.5 img/s with 8 workers (its ceiling), while the JPEG folder gives 468 img/s
+  cold and 1975 img/s once the 4.83 GB dataset is in page cache. The model itself does
+  73 img/s in fp32 and 200 img/s with fp16 autocast + TF32 + channels_last, so the LMDB path
+  capped throughput as soon as AMP was enabled.
+
+## Notebooks
+
+`train/experiments/synthetic_model.ipynb` (Zemax synthetic-data model) and
+`train/experiments/test.ipynb` (scratch) are the notebooks that remain; historical only.
+
+## Gotchas
+
+- Imports assume the repo root is on `sys.path` (`from preprocess_images import ...`,
+  `from config import ...`) - run from the project root.
+- Changing the actuation range (`X/Y_TILT_START/STOP` in `config.py`) silently invalidates old
+  checkpoints, since both training labels and inference de-normalization derive from it.

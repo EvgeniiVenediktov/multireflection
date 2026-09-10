@@ -98,7 +98,7 @@ inspection.
 - The env re-simulates the entire bounce cascade on every step even though `env_params` are fixed
   for the episode; a warm start from the previous trajectory is possible.
 - No replay/dataset abstraction at all - rollouts live only in the preallocated buffers. If
-  off-policy methods or offline pretraining on the real dataset are wanted, an LMDB-backed loader
-  like the supervised one ([training.md](training.md)) would be the natural bridge, and would also
-  be the vehicle for the planned encoder swap.
+  off-policy methods or offline pretraining on the real dataset are wanted, a JPEG-folder loader
+  like the supervised one (`DirectImageDataset` in [training.md](training.md)) would be the natural
+  bridge, and would also be the vehicle for the planned encoder swap.
 - Reward is bounce-count only; path length and exit-through-hole are computed but unused.
