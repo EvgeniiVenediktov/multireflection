@@ -57,6 +57,25 @@ validation set (`eval_val/`). Starts are training positions, and time-to-align d
 Result for `resnet18_l40s_3854472` (2026-09-10): 2320 starts, 100% converged,
 1.14 +- 0.35 adjustments, final SSIM 0.984 +- 0.007, angular error 0.027 +- 0.015 deg.
 
+### Perturbation evals
+
+`eval_batched.py` can perturb the frames the model sees (same definitions and units as
+`GpuAugment`): `--brightness B` / `--brightness-fixed F`, `--contrast C` /
+`--contrast-fixed F`, `--noise S` (+ `--noise-min`), `--occlusion-count N` with
+`--occlusion-min/max/prob`, `--perturb-seed`. Brightness, contrast and boxes are drawn once
+per trajectory and kept for all its steps; noise is redrawn per step; frames are quantized
+to 8 bit. The SSIM stop test uses the clean frame unless `--perturb-ssim` (then SSIM is
+per (trajectory, step), not memoized; note SSIM is so noise-sensitive that noise 0.1 alone
+keeps it near 0.1, so the loop never "converges" even though the final error is small).
+`utils/eval_sweep.py` runs 13 conditions (clean, noise 0.05/0.1/0.2, brightness
+0.6/0.8/1.2/1.4, contrast 0.9/1.1, occlusion 1/2 boxes, combined) and writes
+`sweep.csv` / `sweep.md`; `--conditions` selects a subset, `--wandb` logs a table.
+
+Sweep of `resnet18_l40s_3854472` (2026-09-10, 0.1 grid): noise up to 0.1, any brightness
+0.6 to 1.4 and contrast 0.9 to 1.1 stay at 100% success; noise 0.2 doubles the adjustments;
+occlusion is what breaks the loop: 93% success with one box, 82% with two, 89% for the
+combined training-style augmentation.
+
 ## Log analysis - `utils/graph_eval.py`
 
 `python utils/graph_eval.py [eval.log] [threshold=0.97]`. Groups lines by origin, finds the first

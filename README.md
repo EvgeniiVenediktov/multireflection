@@ -230,6 +230,12 @@ uv run python utils/eval_batched.py --starts-file runs/<job>/val_names.txt  # he
 Starts are training positions (the validation split is a random 20% of the same folder), so
 this measures closed-loop behaviour on seen data. Time-to-align does not exist offline.
 
+Robustness: `--brightness-fixed`, `--contrast-fixed`, `--noise`, `--occlusion-count` and
+friends perturb the frames the model sees (brightness, contrast and occlusion boxes are
+fixed per trajectory, noise is redrawn per step); the SSIM stop test still uses the clean
+frame unless `--perturb-ssim`. `utils/eval_sweep.py` runs a fixed list of such conditions
+on one checkpoint and writes a comparison table (`sweep.md`), optionally to W&B.
+
 ### On the Pitt CRCD cluster
 
 ```bash
