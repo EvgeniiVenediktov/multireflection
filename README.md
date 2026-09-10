@@ -201,9 +201,12 @@ Note the cutout range: the script default has since been raised to 0.15 to 0.40,
 with defaults is not the same recipe. Reproduce with
 `--batch-size 512 --lr 0.0028 --occlusion-min 0.05 --occlusion-max 0.20`.
 
-Offline sweep (`utils/eval_batched.py`, threshold 0.97, cap 10 adjustments, starts on a
-0.1 deg grid, 2320 starts): 100% converged, 1.14 +- 0.35 adjustments (max 2), final SSIM
-0.984 +- 0.007, final angular error 0.027 +- 0.015 deg (max 0.085).
+Offline sweep (`utils/eval_batched.py`, threshold 0.97, cap 10 adjustments):
+
+| start grid | starts | converged | adjustments | final SSIM | final angular error |
+|---|---|---|---|---|---|
+| 0.1 deg | 2320 | 100% | 1.14 +- 0.35 (max 2) | 0.984 +- 0.007 | 0.027 +- 0.015 deg (max 0.085) |
+| 0.05 deg | 9200 | 100% | 1.14 +- 0.35 (max 2) | 0.984 +- 0.007 | 0.027 +- 0.015 deg (max 0.085) |
 
 ### Offline evaluation
 
