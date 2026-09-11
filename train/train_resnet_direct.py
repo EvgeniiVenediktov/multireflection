@@ -861,6 +861,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     opt.add_argument("--checkpoint-dir", default=config["checkpoint_dir"],
                      help="where best_model.pth is written; use persistent storage on a cluster")
     opt.add_argument("--starting-checkpoint", default=config["starting_checkpoint"])
+    opt.add_argument("--seed", type=int, default=config["seed"],
+                     help="torch/random/numpy seed: weight init, shuffling, photometric and noise draws "
+                          "(the data split has its own --split-seed; occlusion boxes are unseeded)")
     opt.add_argument("--no-amp", action="store_true",
                      help="disable fp16 autocast and channels_last (both on by default)")
     opt.add_argument("--compile", action="store_true",
@@ -906,6 +909,7 @@ if __name__ == "__main__":
         "step_filter": args.step_filter,
         "val_share": args.val_share,
         "split_seed": args.split_seed,
+        "seed": args.seed,
         "resolution": args.resolution,
         "train_keys_file": args.train_keys_file,
         "val_keys_file": args.val_keys_file,

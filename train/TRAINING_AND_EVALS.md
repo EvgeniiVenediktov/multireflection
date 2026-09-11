@@ -13,7 +13,8 @@ deployed loop moves the mirror by the negated prediction and stops when the SSIM
 reference image reaches a threshold. Training is supervised regression on the collected image bank.
 
 **Run names** (since 2026-09-10; checkpoints, run directories and W&B display names):
-`r<resolution>[_ft]_occ<box edge % min-max><img|batch>_n<noise sigma x100>_e<epochs>_<job>`.
+`r<resolution>[_ft]_occ<box edge % min-max><img|batch>_n<noise sigma x100>_e<epochs>[_s<seed>]_<job>`
+(`_s<seed>` only when `--seed` is not 0).
 All runs so far use 2 boxes with p 0.5; `img` = boxes drawn per image, `batch` = drawn once
 per batch; `-rot90-bri50` = boxes rotated in [-90, 90] deg and white with p 0.5 (absent =
 axis-aligned black boxes); `n00-20` = sigma per image in [0, 0.2]; `_ft` = fine-tuned;
