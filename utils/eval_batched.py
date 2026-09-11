@@ -157,8 +157,9 @@ class Perturbation:
 
     Brightness factor, contrast factor, noise sigma and occlusion boxes are drawn once
     per trajectory from numpy's default_rng seeded with (seed, trajectory index); the
-    noise values come from a torch generator seeded with `seed` and are re-drawn every
-    time apply() is called. Order: brightness -> contrast -> noise -> occlusion -> 8 bit
+    noise field of a trajectory at step t comes from a torch generator seeded with
+    (seed, trajectory index, t), so every model sees the same boxes, factors and noise at the
+    same start and step regardless of batch composition. Order: brightness -> contrast -> noise -> occlusion -> 8 bit
     quantization (GpuAugment shuffles brightness/contrast; here the order is fixed).
     """
 
@@ -275,16 +276,24 @@ class Perturbation:
             return "none"
         return "; ".join(parts) + f"; seed {self.seed}; SSIM on {'perturbed' if self.ssim else 'clean'} image"
 
-    def apply(self, x, idx):
-        """x: float (B, 1, H, W) in [0, 1] on self.device; idx: trajectory index per row."""
-        idx = torch.as_tensor(idx, device=self.device, dtype=torch.long)
+    def apply(self, x, idx, steps=None):
+        """x: float (B, 1, H, W) in [0, 1] on self.device; idx: trajectory index per row;
+        steps: step (adjustment) number per row, default 0."""
+        idx_list = [int(i) for i in idx]
+        steps = [0] * len(idx_list) if steps is None else [int(t) for t in steps]
+        idx = torch.as_tensor(idx_list, device=self.device, dtype=torch.long)
         if self.use_brightness:
             x = (x * self.bright[idx].view(-1, 1, 1, 1)).clamp_(0.0, 1.0)
         if self.use_contrast:
             mean = x.mean(dim=(1, 2, 3), keepdim=True)
             x = ((x - mean) * self.contr[idx].view(-1, 1, 1, 1) + mean).clamp_(0.0, 1.0)
         if self.use_noise:
-            noise = torch.randn(x.shape, generator=self.gen, device=self.device, dtype=x.dtype)
+            # One noise field per (trajectory, step), seeded from (seed, index, step): every model
+            # gets the same noise at the same start and step, whatever the batch composition
+            noise = torch.empty_like(x)
+            for k, (i, t) in enumerate(zip(idx_list, steps)):
+                self.gen.manual_seed((self.seed * 1_000_003 + i) * 10_007 + t)
+                noise[k].normal_(generator=self.gen)
             x = (x + noise * self.sigma[idx].view(-1, 1, 1, 1)).clamp_(0.0, 1.0)
         if self.use_occlusion and not (self.occlusion_angle or self.occlusion_bright_prob):
             H, W = x.shape[-2:]
@@ -315,13 +324,13 @@ class Perturbation:
         return x.mul_(255.0).round_().div_(255.0)
 
     @torch.inference_mode()
-    def render(self, images, idx, batch_size):
+    def render(self, images, idx, batch_size, steps=None):
         """Perturbed uint8 frames (list of (H, W) arrays) for uint8 images of the trajectories idx."""
         out = []
         for s in range(0, len(images), batch_size):
             chunk = images[s:s + batch_size]
             x = torch.from_numpy(np.stack(chunk)[:, None]).to(self.device).float().div_(255.0)
-            x = self.apply(x, idx[s:s + batch_size])
+            x = self.apply(x, idx[s:s + batch_size], None if steps is None else steps[s:s + batch_size])
             out.extend(x.mul_(255.0).round_().to(torch.uint8).cpu().numpy()[:, 0])
         return out
 
@@ -342,11 +351,11 @@ class BatchedPredictor:
         self.seconds = 0.0
 
     @torch.inference_mode()
-    def predict(self, images, idx=None):
+    def predict(self, images, idx=None, steps=None):
         """images: list of uint8 (H, W) arrays -> float32 array (N, 2) in degrees.
 
-        idx: trajectory index per image; when given and a perturbation is configured,
-        it is applied to the batch on the GPU before the model. With model_resolution the
+        idx: trajectory index per image, steps: its step number (default 0); when idx is given
+        and a perturbation is configured, it is applied to the batch on the GPU before the model. With model_resolution the
         (perturbed) frame is then area-downscaled to that size and quantized to 8 bit.
         """
         out = np.empty((len(images), 2), dtype=np.float32)
@@ -356,7 +365,8 @@ class BatchedPredictor:
             x = torch.from_numpy(np.stack(chunk)[:, None]).to(self.device, non_blocking=True)
             x = x.float().div_(255.0)
             if self.perturb is not None and idx is not None:
-                x = self.perturb.apply(x, idx[s:s + self.batch_size])
+                x = self.perturb.apply(x, idx[s:s + self.batch_size],
+                                       None if steps is None else steps[s:s + self.batch_size])
             if self.model_resolution and x.shape[-1] != self.model_resolution:
                 # The perturbation acts on the camera frame; the device resizes it to the model input.
                 # A box average over an integer factor is cv2.INTER_AREA, the resize the banks were
@@ -461,7 +471,8 @@ def run(args):
             if perturb_ssim:
                 # 2. the frame of this step is perturbed once and shared by the SSIM test
                 # and the model, so SSIM is per (trajectory, step) and cannot be memoized
-                frames = perturb.render([bank.images[pos[i]] for i in active], active, args.batch_size)
+                frames = perturb.render([bank.images[pos[i]] for i in active], active, args.batch_size,
+                                        [adj[i] for i in active])
                 frame_of = dict(zip(active, frames))
                 raw_of = dict(zip(active, bank.ssim_of(frames)))
             else:
@@ -490,7 +501,7 @@ def run(args):
             if not active:
                 break
             # 3. predict for the whole active batch (frames already perturbed when perturb_ssim)
-            preds = predictor.predict(images, None if perturb_ssim else active)
+            preds = predictor.predict(images, None if perturb_ssim else active, [adj[i] for i in active])
             # 4. move
             for k, i in enumerate(active):
                 px, py = float(preds[k, 0]), float(preds[k, 1])

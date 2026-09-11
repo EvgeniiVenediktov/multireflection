@@ -79,6 +79,10 @@ rm -f "$STAGE/$(basename "$DATA_TAR")"
 DATA_DIR="$STAGE/dark512"
 echo "staged $(ls "$DATA_DIR" | wc -l) files in $(( $(date +%s) - t0 ))s"
 
+# fp32 by default: fp16 kernels vary with batch size (up to ~0.003 deg per prediction); FP16=1 for speed
+FP_ARGS=(--no-fp16)
+[ "${FP16:-0}" = 1 ] && FP_ARGS=()
+
 srun --cpus-per-task="$CPUS" "$VENV_PY" holdout/eval_test.py \
     --checkpoint "$CKPT" \
     --data-dir "$DATA_DIR" \
@@ -86,6 +90,7 @@ srun --cpus-per-task="$CPUS" "$VENV_PY" holdout/eval_test.py \
     --split "$SPLIT" \
     --workers "$CPUS" \
     --out-dir "$OUT_DIR" \
+    "${FP_ARGS[@]}" \
     $EXTRA_ARGS
 
 if [ "$CLOSED_LOOP" = "1" ]; then
@@ -99,6 +104,7 @@ if [ "$CLOSED_LOOP" = "1" ]; then
             --starts-file "$ORIGINS" \
             --workers "$CPUS" \
             --out-dir "$OUT_DIR/closed_loop/$c" \
+            "${FP_ARGS[@]}" \
             $FLAGS --perturb-seed 0
     done
 fi

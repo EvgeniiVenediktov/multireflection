@@ -66,6 +66,10 @@ echo "staged $(ls "$DATA_DIR" | wc -l) files in $(( $(date +%s) - t0 ))s"
 
 COND_ARGS=()
 [ -n "$CONDITIONS" ] && COND_ARGS=(--conditions "$CONDITIONS")
+# fp32 by default: fp16 kernels vary with batch size (up to ~0.003 deg per prediction), enough to
+# flip the 0.01 deg position rounding now and then; FP16=1 for speed
+FP_ARGS=(--no-fp16)
+[ "${FP16:-0}" = 1 ] && FP_ARGS=()
 srun --cpus-per-task="$CPUS" "$VENV_PY" utils/eval_sweep.py \
     --checkpoint "$CKPT" \
     --data-dir "$DATA_DIR" \
@@ -73,6 +77,7 @@ srun --cpus-per-task="$CPUS" "$VENV_PY" utils/eval_sweep.py \
     --grid-step "$GRID_STEP" \
     --workers "$CPUS" \
     --out-dir "$OUT_DIR" \
+    "${FP_ARGS[@]}" \
     "${COND_ARGS[@]}" \
     $EXTRA_ARGS
 
