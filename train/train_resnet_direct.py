@@ -38,6 +38,7 @@ import time
 import math
 import random
 import argparse
+import json
 
 import cv2
 import numpy as np
@@ -140,6 +141,7 @@ config = {
 
     "checkpoint_dir": "./saved_models/real",
     "starting_checkpoint": None,
+    "save_last": False,           # also save the final-epoch weights (<name>_last_model.pth)
 
     "use_wandb": True,
     "wandb_project": "multireflection",
@@ -786,6 +788,7 @@ def main(cfg: dict) -> None:
             }, step=0)
 
     best_loss = float("inf")
+    best_epoch = 0  # 1-based epoch whose weights are in the best-model checkpoint
     ckpt_name = cfg["experiment_name"] + "_best_model.pth"
 
     for epoch in range(cfg["epochs"]):
@@ -805,6 +808,7 @@ def main(cfg: dict) -> None:
 
         if val_loss < best_loss:
             best_loss = val_loss
+            best_epoch = epoch + 1
             save_model(base_model, ckpt_name, cfg["checkpoint_dir"])
 
         print(f"Epoch {epoch + 1}/{cfg['epochs']}, Train Loss: {train_loss:.6f}, "
@@ -817,15 +821,26 @@ def main(cfg: dict) -> None:
                 "Val Loss": val_loss,
                 "LR": last_lr,
                 "best_loss": best_loss,
+                "best_epoch": best_epoch,
                 "log_train_loss": math.log(train_loss) if train_loss > 0 else 0.0,
                 "log_val_loss": math.log(val_loss) if val_loss > 0 else 0.0,
                 "epoch_seconds": elapsed,
                 "train_img_per_s": throughput,
             }, step=epoch)
 
-    print("Best loss:", best_loss)
+    if cfg["save_last"]:
+        save_model(base_model, cfg["experiment_name"] + "_last_model.pth", cfg["checkpoint_dir"])
+    print("Best loss:", best_loss, "at epoch", best_epoch)
     print("Saved to:", os.path.join(cfg["checkpoint_dir"], ckpt_name))
+    # Model selection record: which epoch the best-model checkpoint comes from
+    with open(os.path.join(cfg["checkpoint_dir"], "train_summary.json"), "w") as f:
+        json.dump({"best_epoch": best_epoch, "best_val_loss": best_loss, "epochs": cfg["epochs"],
+                   "seed": cfg["seed"], "split_seed": cfg["split_seed"],
+                   "train_keys_file": cfg["train_keys_file"], "val_keys_file": cfg["val_keys_file"],
+                   "n_train": len(train_dataset), "n_val": len(val_dataset),
+                   "last_model_saved": cfg["save_last"]}, f, indent=2)
     if run is not None:
+        run.summary.update({"best_epoch": best_epoch, "best_val_loss": best_loss})
         run.finish()
 
 
@@ -861,6 +876,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     opt.add_argument("--checkpoint-dir", default=config["checkpoint_dir"],
                      help="where best_model.pth is written; use persistent storage on a cluster")
     opt.add_argument("--starting-checkpoint", default=config["starting_checkpoint"])
+    opt.add_argument("--save-last", action="store_true",
+                     help="also save the final-epoch weights as <name>_last_model.pth (fixed-epoch runs)")
     opt.add_argument("--seed", type=int, default=config["seed"],
                      help="torch/random/numpy seed: weight init, shuffling, photometric and noise draws "
                           "(the data split has its own --split-seed; occlusion boxes are unseeded)")
@@ -910,6 +927,7 @@ if __name__ == "__main__":
         "val_share": args.val_share,
         "split_seed": args.split_seed,
         "seed": args.seed,
+        "save_last": args.save_last,
         "resolution": args.resolution,
         "train_keys_file": args.train_keys_file,
         "val_keys_file": args.val_keys_file,
