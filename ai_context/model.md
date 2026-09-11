@@ -50,8 +50,15 @@ Kaiming init on convs, constant init on BN.
 
 ## Inference wrapper - `app/inference.py:350` `TiltPredictor`
 
-- `TiltPredictor(model_fname, model_type)`; `model_type` selects the architecture via a `match`
-  (`SimpleFC`, `WideConv`, `GradientSimpleFC`, `CLAHEGradSimpleFC`, `CnnExtractor`, `ResNet18`).
+- `TiltPredictor(model_fname, model_type, input_resolution=INFERENCE_INPUT_RESOLUTION)`;
+  `model_type` selects the architecture via a `match` (`SimpleFC`, `WideConv`,
+  `GradientSimpleFC`, `CLAHEGradSimpleFC`, `CnnExtractor`, `ResNet18`).
+- Any input resolution (ResNet18): `input_resolution` defaults to the `r<res>_` prefix of the
+  checkpoint name (`resolution_from_name`), else 512. `predict` accepts `(H, W)`,
+  `(B, H, W)` or `(B, 1, H, W)` frames of any size and resizes them to that size with
+  `cv2.INTER_AREA` (`resize_to_input`), the resize the dark256/128/64 banks were built with.
+  Callers keep passing the 512 px processed frame, which the SSIM test also uses. The legacy
+  types stay fixed at 512.
 - Loads `./saved_models/<fname>` state dict, `.eval()`, moves to CUDA if available (CPU on the Pi).
 - `predict(img, scale_predictions=True)`: optional preprocessing transform, `float()/255`,
   per-type reshaping, forward under `no_grad`, then de-normalizes

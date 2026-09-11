@@ -142,6 +142,7 @@ config = {
     "checkpoint_dir": "./saved_models/real",
     "starting_checkpoint": None,
     "save_last": False,           # also save the final-epoch weights (<name>_last_model.pth)
+    "split_tag": None,            # W&B name marker: "hold" (spatial hold-out TRAIN), "fullctl"; None = random split
 
     "use_wandb": True,
     "wandb_project": "multireflection",
@@ -429,6 +430,33 @@ class GpuAugment:
         if self.uses_occlusion:
             x = self._occlude(x)
         return x
+
+
+def run_display_name(cfg: dict) -> str:
+    """W&B display name, fixed when the job starts (train/TRAINING_AND_EVALS.md section 1):
+    r<res>[_ft]_occ<min-max>batch[-rot<angle>][-bri<p>]_n<noise>_e<epochs>[_<split tag>][_s<seed>]_<job>,
+    with <job> = SLURM_JOB_ID or "local". No split tag = random split."""
+    name = f"r{cfg['resolution'] or TRAINING_IMAGE_RESOLUTION[0]}"
+    if cfg["starting_checkpoint"]:
+        name += "_ft"
+    if cfg["occlusion_prob"] > 0 and cfg["occlusion_count"] > 0:
+        name += f"_occ{round(cfg['occlusion_min'] * 100):02d}-{round(cfg['occlusion_max'] * 100):02d}batch"
+        if cfg["occlusion_angle"]:
+            name += f"-rot{round(cfg['occlusion_angle'])}"
+        if cfg["occlusion_bright_prob"]:
+            name += f"-bri{round(cfg['occlusion_bright_prob'] * 100)}"
+    else:
+        name += "_occ0"
+    if cfg["noise_level_min"] is not None:
+        name += f"_n{round(cfg['noise_level_min'] * 100):02d}-{round(cfg['noise_level'] * 100):02d}"
+    else:
+        name += f"_n{round(cfg['noise_level'] * 100):02d}"
+    name += f"_e{cfg['epochs']}"
+    if cfg["split_tag"]:
+        name += f"_{cfg['split_tag']}"
+    if cfg["seed"]:
+        name += f"_s{cfg['seed']}"
+    return f"{name}_{os.environ.get('SLURM_JOB_ID', 'local')}"
 
 
 def make_gpu_augment(cfg: dict):
@@ -756,7 +784,7 @@ def main(cfg: dict) -> None:
         if not os.environ.get("WANDB_API_KEY"):
             print("WANDB_API_KEY is not set. Export it, run 'wandb login', "
                   "or pass --no-wandb to train without logging.")
-        run = wandb.init(project=cfg["wandb_project"], name=cfg["experiment_name"],
+        run = wandb.init(project=cfg["wandb_project"], name=run_display_name(cfg),
                          config=cfg, resume="allow")
         run.watch(base_model, log="all", log_freq=200)
         run.summary["train_images"] = len(train_dataset)
@@ -876,6 +904,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     opt.add_argument("--checkpoint-dir", default=config["checkpoint_dir"],
                      help="where best_model.pth is written; use persistent storage on a cluster")
     opt.add_argument("--starting-checkpoint", default=config["starting_checkpoint"])
+    opt.add_argument("--split-tag", choices=["hold", "fullctl"], default=config["split_tag"],
+                     help="marker in the W&B run name: hold = spatial hold-out TRAIN set, fullctl = its "
+                          "full-data control; omit for the random split")
     opt.add_argument("--save-last", action="store_true",
                      help="also save the final-epoch weights as <name>_last_model.pth (fixed-epoch runs)")
     opt.add_argument("--seed", type=int, default=config["seed"],
@@ -928,6 +959,7 @@ if __name__ == "__main__":
         "split_seed": args.split_seed,
         "seed": args.seed,
         "save_last": args.save_last,
+        "split_tag": args.split_tag,
         "resolution": args.resolution,
         "train_keys_file": args.train_keys_file,
         "val_keys_file": args.val_keys_file,

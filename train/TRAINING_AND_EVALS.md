@@ -14,7 +14,13 @@ reference image reaches a threshold. Training is supervised regression on the co
 
 **Run names** (since 2026-09-10; checkpoints, run directories and W&B display names):
 `r<resolution>[_ft]_occ<box edge % min-max><img|batch>_n<noise sigma x100>_e<epochs>[_s<seed>]_<job>`
-(`_s<seed>` only when `--seed` is not 0).
+(`_s<seed>` only when `--seed` is not 0). Split marker after the epochs: `_hold` = trained on the
+spatial hold-out TRAIN set (holdout/README.md), evaluated in `holdout_test/`; `_fullctl` = the
+full-data control of the hold-out study; no marker = the random 80/20 split (sweeps in `sweep/`).
+The W&B display name is built by the training script when the job starts
+(`run_display_name`; the split marker comes from `--split-tag hold|fullctl`). Run directories
+and checkpoints still start as `runs/<job>/resnet18_l40s_..._best_model.pth` and are renamed after
+their dependent eval jobs have finished.
 All runs so far use 2 boxes with p 0.5; `img` = boxes drawn per image, `batch` = drawn once
 per batch; `-rot90-bri50` = boxes rotated in [-90, 90] deg and white with p 0.5 (absent =
 axis-aligned black boxes); `n00-20` = sigma per image in [0, 0.2]; `_ft` = fine-tuned;
@@ -337,9 +343,10 @@ convergence test on noisy frames, which is relevant for the hardware too.
   default. Section 3 says how to reproduce its recipe.
 - All eval starts are seen positions (section 2). There is no held-out set off the
   training grid.
-- The 256, 128 and 64 px models have been evaluated only offline. `TiltPredictor` on the Pi
-  still preprocesses to 512; deploying one needs the resize in `config.py` / `app/` changed
-  to match (box average by the integer factor, as in `--model-resolution`).
+- The 256, 128 and 64 px models have been evaluated only offline. `TiltPredictor` takes
+  any of them: it reads the input size from the `r<res>_` checkpoint name (or
+  `config.py:INFERENCE_INPUT_RESOLUTION`) and area-resizes the 512 px processed frame to it;
+  set `INFERENCE_MODEL_TYPE = "ResNet18"` and the file name in `config.py` to deploy one.
 - One training seed per recipe. Differences of a few percent on the hardest occlusion
   conditions may be run-to-run variation.
 - `--compile` is untested on the L40S.

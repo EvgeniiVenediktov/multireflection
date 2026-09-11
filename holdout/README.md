@@ -29,11 +29,16 @@ clamped to 1.99; (0, 0) is TRAIN), `counts.json`, `split_map.png` (copy in this 
 
 ## Training and model selection
 
+Run names carry the split: `r<res>_..._e<epochs>_hold[_s<seed>]_<job>` for hole-trained runs,
+`..._e<epochs>_fullctl_<job>` for the full-data control; names without a marker are random-split runs.
+The W&B name carries this from the start: the submit scripts pass `--split-tag hold` / `fullctl` to
+the training script, which builds the display name (`run_display_name`).
+
 `train/train_resnet_direct.py --train-keys-file train_names.txt --val-keys-file val_names.txt`:
 trains on TRAIN, keeps the best-VAL checkpoint and records the selected epoch in
 `train_summary.json` and the W&B summary (`best_epoch`). TEST names are never passed to training.
 
-- `holdout/submit_64.sh` (on the cluster checkout): seeds 0, 1, 2 at 64 px on dark64 via
+- `holdout/submit_64.sh` (on the cluster checkout): one training seed (0) per resolution on dark<RES> via
   `cluster/train_l40s.slurm`, each followed by `cluster/holdout_test_l40s.slurm` (TEST evaluation
   and closed-loop replay). `RES` and `SEEDS` override.
 - `holdout/submit_control.sh`: the full-data control. Same recipe on TRAIN + VAL + TEST for a fixed

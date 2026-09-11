@@ -1,6 +1,6 @@
 #!/bin/bash
-# submit_64.sh - spatial hold-out pipeline on CRCD for one resolution (default 64 px): three
-# training seeds on TRAIN (model selection on VAL), each followed by the TEST-hole evaluation and
+# submit_64.sh - spatial hold-out pipeline on CRCD for one resolution (default 64 px): training on
+# TRAIN (model selection on VAL, seed 0; SEEDS="0 1 2" for more), each followed by the TEST-hole evaluation and
 # the offline closed-loop replay from the 108 origins (cluster/holdout_test_l40s.slurm).
 #
 #   cd /ihome/kchen/evv13/multireflection && bash holdout/submit_64.sh
@@ -19,7 +19,7 @@ D=/ix1/kchen/evv/multireflection/data
 R=/ix1/kchen/evv/multireflection/runs
 S=$D/holdout_split
 RES=${RES:-64}
-SEEDS=${SEEDS:-"0 1 2"}
+SEEDS=${SEEDS:-0}  # one training seed per configuration; the evaluations repeat over perturbation seeds
 SBATCH_ARGS=${SBATCH_ARGS:-}
 TRAIN_EXTRA=${TRAIN_EXTRA:-}
 # cluster/train_l40s.slurm names the run resnet18_l40s_<DATASET>_<job>, without the tag for dark512
@@ -30,7 +30,7 @@ done
 
 for seed in $SEEDS; do
     jid=$(sbatch --parsable $SBATCH_ARGS --job-name=hold-r$RES-s$seed \
-        --export=ALL,DATASET=dark$RES,EXTRA_ARGS="--resolution $RES --seed $seed --train-keys-file $S/train_names.txt --val-keys-file $S/val_names.txt $TRAIN_EXTRA" \
+        --export=ALL,DATASET=dark$RES,EXTRA_ARGS="--resolution $RES --seed $seed --split-tag hold --train-keys-file $S/train_names.txt --val-keys-file $S/val_names.txt $TRAIN_EXTRA" \
         cluster/train_l40s.slurm)
     jid=${jid%%;*}
     tid=$(sbatch --parsable --dependency=afterok:$jid --job-name=holdtest-r$RES-s$seed \

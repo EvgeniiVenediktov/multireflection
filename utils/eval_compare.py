@@ -37,7 +37,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("tables", nargs="+", help="LABEL=path/to/sweep.csv")
     p.add_argument("--out", default=None, help="also write the table to this file")
+    p.add_argument("--conditions", default=None, help="comma-separated rows to keep (default: all)")
+    p.add_argument("--quiet", action="store_true", help="with --out: write the file, print only its path")
     args = p.parse_args()
+    if args.quiet and not args.out:
+        p.error("--quiet needs --out")
 
     labels, tables = [], []
     for spec in args.tables:
@@ -50,14 +54,20 @@ def main():
     conditions = []
     for t in tables:
         conditions += [c for c in t if c not in conditions]
+    if args.conditions:
+        wanted = [c.strip() for c in args.conditions.split(",") if c.strip()]
+        conditions = [c for c in conditions if c in wanted]
 
     lines = ["| condition | " + " | ".join(labels) + " |", "|---|" + "---|" * len(labels)]
     for c in conditions:
         lines.append(f"| {c} | " + " | ".join(cell(t.get(c)) for t in tables) + " |")
     md = "\n".join(lines) + "\n"
-    print(md, end="")
     if args.out:
         Path(args.out).write_text(md)
+    if args.quiet:
+        print(f"{len(conditions)} rows x {len(labels)} models -> {args.out}")
+    else:
+        print(md, end="")
 
 
 if __name__ == "__main__":

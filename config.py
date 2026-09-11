@@ -30,6 +30,12 @@ INFERENCE_MODEL_TYPE = "SimpleFC"
 
 TRAINING_IMAGE_RESOLUTION = (512, 512)
 
+# Square model input size in px for TiltPredictor (ResNet18). None: parsed from a checkpoint
+# named r<res>_... (train/TRAINING_AND_EVALS.md), else TRAINING_IMAGE_RESOLUTION. The webcam
+# frame is still processed to DATA_COLLECTION_FINAL_RESOLUTION for the SSIM test; the
+# predictor area-resizes it to this size before the model.
+INFERENCE_INPUT_RESOLUTION = None
+
 SIMILARITY_INDEX_THRESHOLD = 0.95
 OPTIMUM_IMAGE_PATH_LIST = [#"/home/raspberry/projects/multireflection/data/color_dark_004/x0.00_y0.00.jpg", 
                            #"/home/raspberry/projects/multireflection/data/color_mainlight_004/x0.00_y0.00.jpg", 

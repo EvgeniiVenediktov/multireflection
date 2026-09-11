@@ -1,9 +1,12 @@
 # inference.py
+import os
+import re
 import torch
 import torch.nn as nn
 import numpy as np
 from numpy.typing import ArrayLike
-from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE
+from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE, \
+    INFERENCE_INPUT_RESOLUTION, TRAINING_IMAGE_RESOLUTION
 from skimage.metrics import structural_similarity as ssim
 import cv2
 
@@ -347,16 +350,26 @@ def resnet18(output_dim=2):
     return ResNet(BasicBlock, [2, 2, 2, 2], output_dim=output_dim)
 
 
+def resolution_from_name(model_fname: str) -> int | None:
+    """Input size encoded in a checkpoint named r<res>_..., e.g. real/r128_occ15-40batch-..._3870308.pth."""
+    m = re.match(r"r(\d+)_", os.path.basename(model_fname))
+    return int(m.group(1)) if m else None
+
+
 class TiltPredictor:
-    
+
     def load_model(self, model:torch.nn.Module, fname="best_model.pth", path="./saved_models/") -> nn.Module:
         model.load_state_dict(torch.load(path+fname, weights_only=False, map_location=self.DEVICE))
         return model
-    
-    def __init__(self, model_fname:str, model_type:str):
+
+    def __init__(self, model_fname:str, model_type:str, input_resolution:int | None = INFERENCE_INPUT_RESOLUTION):
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.DEVICE)
         self.preprocessing = None
+        # Square input size of the model (ResNet18 only; the legacy types are fixed at 512).
+        # Frames of any other size are resized to it in predict().
+        self.input_resolution = (input_resolution or resolution_from_name(model_fname)
+                                 or TRAINING_IMAGE_RESOLUTION[0])
 
         match model_type:
             case "SimpleFC":
@@ -378,7 +391,22 @@ class TiltPredictor:
         self.model = self.load_model(self.model, fname=model_fname)
         self.model.eval()
         self.model.to(self.DEVICE)
-    
+        if model_type == "ResNet18":
+            print(f"model input: {self.input_resolution}x{self.input_resolution} px")
+
+    def resize_to_input(self, img: np.ndarray) -> np.ndarray:
+        """(H, W), (B, H, W) or (B, 1, H, W) frames of any size -> (B, 1, r, r).
+
+        cv2.INTER_AREA is the resize the dark256/128/64 training banks were built with (from
+        the 512 px frame); for an integer factor it is a plain box average.
+        """
+        r = self.input_resolution
+        img = np.asarray(img)
+        frames = img.reshape(-1, *img.shape[-2:])
+        if frames.shape[-2:] != (r, r):
+            frames = np.stack([cv2.resize(f, (r, r), interpolation=cv2.INTER_AREA) for f in frames])
+        return frames[:, None]
+
     def predict(self, img:ArrayLike, scale_predictions=True) -> list[tuple[float]]:
         """
         Takes image \n
@@ -387,6 +415,8 @@ class TiltPredictor:
 
         if self.preprocessing is not None:
             img = self.preprocessing(img)
+        if self.model_type == "ResNet18":
+            img = self.resize_to_input(img)
         img = torch.from_numpy(img).float()/255
 
         if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:

@@ -11,7 +11,7 @@ All of `app/` runs **on the Raspberry Pi 4** and imports `mf_control.controller.
 ```
 load reference image(s) from OPTIMUM_IMAGE_PATH_LIST
 connect MFController(image_size=(1920, 1440))
-load TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)
+load TiltPredictor(INFERENCE_MODEL_FILE_NAME, INFERENCE_MODEL_TYPE)   # input size from the r<res>_ name
 loop:
     img  = process_image_from_webcam(controller.capture_image(), 512x512, grayscale)
     ssim = evaluate_position(img, references)
@@ -100,7 +100,7 @@ error (distance of the final position from zero). Produces the interpolated heat
 ## Relevant `config.py` knobs
 
 `SIMILARITY_INDEX_THRESHOLD`, `OPTIMUM_IMAGE_PATH_LIST` (absolute Pi paths),
-`INFERENCE_MODEL_FILE_NAME`, `INFERENCE_MODEL_TYPE`, `X/Y_TILT_START/STOP` (system range -
+`INFERENCE_MODEL_FILE_NAME`, `INFERENCE_MODEL_TYPE`, `INFERENCE_INPUT_RESOLUTION` (None = from the `r<res>_` checkpoint name), `X/Y_TILT_START/STOP` (system range -
 the physical actuation limits; the separate `DATA_COLLECTION_X/Y_TILT_STOP` only affect dataset
 collection and default to the system values),
 `DATA_COLLECTION_FINAL_RESOLUTION`, `DATA_COLLECTION_CVT_TO_GRAYSCALE`,

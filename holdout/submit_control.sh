@@ -25,7 +25,7 @@ TAG="dark${RES}_"; [ "$RES" = 512 ] && TAG=""
 [ "$(wc -l < "$S/all_names.txt")" -eq 228800 ] || { echo "all_names.txt is not 228800 lines"; exit 1; }
 
 jid=$(sbatch --parsable $SBATCH_ARGS --job-name=holdctl-r$RES-e$EPOCHS \
-    --export=ALL,DATASET=dark$RES,EPOCHS=$EPOCHS,EXTRA_ARGS="--resolution $RES --seed $SEED --save-last --train-keys-file $S/all_names.txt --val-keys-file $S/val_names.txt $TRAIN_EXTRA" \
+    --export=ALL,DATASET=dark$RES,EPOCHS=$EPOCHS,EXTRA_ARGS="--resolution $RES --seed $SEED --save-last --split-tag fullctl --train-keys-file $S/all_names.txt --val-keys-file $S/val_names.txt $TRAIN_EXTRA" \
     cluster/train_l40s.slurm)
 jid=${jid%%;*}
 tid=$(sbatch --parsable --dependency=afterok:$jid --job-name=holdctltest-r$RES \
