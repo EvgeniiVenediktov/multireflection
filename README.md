@@ -180,9 +180,10 @@ uv run python train/train_resnet_direct.py --help             # every augmentati
 
 Augmentation defaults, on for every run: brightness 0.4 and contrast 0.1 jitter per image,
 Gaussian noise with a per-image sigma uniform in [0, 0.2] (`--noise-min`, `--noise`), and
-two occlusion boxes of 0.15 to 0.40 of the image drawn once per batch and applied to every
-image in it, each rotated by an angle in [-90, 90] deg and white (glare) instead of black
-(dust) with probability 0.5 (`--occlusion-angle`, `--occlusion-bright-prob`). Default 98 epochs, 14 full cosine cycles. `--resolution 256` trains on a
+two occlusion boxes of 0.15 to 0.40 of the image drawn per image, each rotated by an angle in
+[-90, 90] deg and filled with a gray level uniform from black to saturated (`--occlusion-angle`,
+`--occlusion-fill-min/-max`; `--occlusion-per-batch` and `--occlusion-binary-fill` restore the
+earlier shared-per-batch, white-or-black boxes). Default 98 epochs, 14 full cosine cycles. `--resolution 256` trains on a
 256 px bank (the loader resizes anything that is not already that size).
 Every run writes its split to `train_names.txt` / `val_names.txt` in the checkpoint
 directory; pass them back with `--train-keys-file` / `--val-keys-file` to reuse a split. Affine is implemented but off by default: the label *is* the position of the spot

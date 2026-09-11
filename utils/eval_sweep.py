@@ -14,7 +14,11 @@ checkpoint under each condition and writes one comparison table. Conditions, in 
     occlusion_{1x30,2x30,2x50}_rotbright     rotated and white
     occlusion_2_mixed                        2 boxes, edge 0.15-0.40, rotated in [-90, 90], white with p 0.5:
                                              the training occlusion (every box applied) at eval
-    combined                                 noise 0.1 + brightness 0.4 + contrast 0.1 +
+    occlusion_2x30_fill                      2 boxes of 30%, gray fill uniform in [0, 1] per box
+    occlusion_{2x30,2x50}_rotfill            rotated in [-45, 45] deg and gray
+    occlusion_2_mixedfill                    2 boxes, edge 0.15-0.40, rotated in [-90, 90], gray in [0, 1]:
+                                             the gray-fill training occlusion (since 2026-09-11) at eval
+    combined                                noise 0.1 + brightness 0.4 + contrast 0.1 +
                                              2 boxes: the training augmentation at eval
     combined_harsh                           noise 0.2 + brightness 0.6 + 2 boxes of edge 30%
 
@@ -63,6 +67,10 @@ CONDITIONS = [
                           ("rotbright", ["--occlusion-angle", "45", "--occlusion-bright-prob", "1.0"]))
       for n, e in ((1, "30"), (2, "30"), (2, "50"))],
     ("occlusion_2_mixed", _boxes(2, "0.15", "0.40") + ["--occlusion-angle", "90", "--occlusion-bright-prob", "0.5"]),
+    ("occlusion_2x30_fill", _boxes(2, "0.30", "0.30") + ["--occlusion-fill-max", "1.0"]),
+    ("occlusion_2x30_rotfill", _boxes(2, "0.30", "0.30") + ["--occlusion-angle", "45", "--occlusion-fill-max", "1.0"]),
+    ("occlusion_2x50_rotfill", _boxes(2, "0.50", "0.50") + ["--occlusion-angle", "45", "--occlusion-fill-max", "1.0"]),
+    ("occlusion_2_mixedfill", _boxes(2, "0.15", "0.40") + ["--occlusion-angle", "90", "--occlusion-fill-max", "1.0"]),
     ("combined", ["--noise", "0.1", "--brightness", "0.4", "--contrast", "0.1", *_boxes(2, "0.15", "0.40")]),
     ("combined_harsh", ["--noise", "0.2", "--brightness-fixed", "0.6", *_boxes(2, "0.30", "0.30")]),
 ]

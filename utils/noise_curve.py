@@ -137,6 +137,22 @@ def aggregate(seed_rows):
     return rows
 
 
+def load_seed_rows(path):
+    """Rows of a noise_curve_seeds.csv written by this script, with numeric fields parsed."""
+    def parse(v):
+        if v in ("", "None", "nan"):
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return float(v)
+    with open(path, newline="") as f:
+        rows = [{k: parse(v) for k, v in r.items()} for r in csv.DictReader(f)]
+    for r in rows:
+        r["level"] = float(r["level"])
+    return rows
+
+
 def write_csv(rows, path, columns):
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=columns)
@@ -160,7 +176,7 @@ def plot(rows, label, out_path):
     fig, ax1 = plt.subplots()
     ax1.errorbar(levels, err, yerr=err_std, marker="o", color="tab:blue", capsize=3, label="final angular error")
     ax1.set_xlabel("noise sigma")
-    ax1.set_ylabel("final angular error (deg)", color="tab:blue")
+    ax1.set_ylabel("final angular error (°)", color="tab:blue")
     ax1.tick_params(axis="y", labelcolor="tab:blue")
 
     ax2 = ax1.twinx()
@@ -191,11 +207,14 @@ def parse_args(argv=None):
     p.add_argument("--out-dir", default=None, help="default: eval_results/<label>_noise_curve/")
     p.add_argument("--from-sweep", default=None,
                    help="path to an existing eval_sweep.py sweep_seeds.csv; no GPU run, reuses its clean/noise_* rows")
+    p.add_argument("--replot", default=None,
+                   help="path to an existing noise_curve_seeds.csv: rewrite noise_curve.csv/png from it, no GPU run "
+                        "(output next to it unless --out-dir)")
     args = p.parse_args(argv)
 
-    if args.from_sweep:
+    if args.from_sweep or args.replot:
         if not args.label:
-            p.error("--from-sweep needs --label")
+            p.error("--from-sweep and --replot need --label")
     else:
         if not args.checkpoint:
             p.error("--checkpoint is required unless --from-sweep is given")
@@ -221,11 +240,18 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    out_dir = Path(args.out_dir) if args.out_dir else REPO_ROOT / "eval_results" / f"{args.label}_noise_curve"
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    elif args.replot:
+        out_dir = Path(args.replot).parent
+    else:
+        out_dir = REPO_ROOT / "eval_results" / f"{args.label}_noise_curve"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.perf_counter()
-    if args.from_sweep:
+    if args.replot:
+        seed_rows = load_seed_rows(args.replot)
+    elif args.from_sweep:
         seed_rows = load_from_sweep(args.from_sweep)
         wanted = set(args.levels)
         seed_rows = [r for r in seed_rows if r["level"] in wanted] or seed_rows

@@ -131,13 +131,19 @@ config = {
     "affine_shear": 0.0,          # shear, +/- degrees
 
     # Random occlusion (cutout). Models dust or debris on the mirror surface.
-    "occlusion_prob": 0.5,        # probability a given box is applied, per batch
-    "occlusion_count": 2,         # boxes attempted per batch, shared by every image in it
+    "occlusion_prob": 0.5,        # probability a given box is applied
+    "occlusion_count": 2,         # boxes attempted per image (per batch with occlusion_per_batch)
+    "occlusion_per_batch": False,  # True: one set of boxes per batch, shared by every image (2026-09-10 recipe)
     "occlusion_min": 0.15,        # box edge as a fraction of image size
     "occlusion_max": 0.40,
     "occlusion_value": 0.0,       # fill value in normalized units
     "occlusion_angle": 90.0,      # each box rotated about its centre by an angle in [-A, A] deg
-    "occlusion_bright_prob": 0.5,  # probability a box is a bright patch (glare) instead of dark
+    # Fill: each box gets a gray level drawn uniformly in [occlusion_fill_min, occlusion_fill_max]
+    # (since 2026-09-11). occlusion_binary_fill restores the earlier black/white fill below.
+    "occlusion_fill_min": 0.0,
+    "occlusion_fill_max": 1.0,
+    "occlusion_binary_fill": False,
+    "occlusion_bright_prob": 0.5,  # binary fill only: probability a box is bright (glare) instead of dark
     "occlusion_bright_value": 1.0,
 
     "checkpoint_dir": "./saved_models/real",
@@ -284,9 +290,11 @@ class GpuAugment:
     is a silent loss of augmentation diversity relative to the earlier per-sample CPU
     pipeline, which was why these are written out by hand.
 
-    Occlusion is the exception: its boxes are drawn once PER BATCH and applied to every
-    image in it (decided 2026-09-10; runs before that used per-image boxes). Each box is
-    rotated by a random angle and is dark (dust) or bright (glare); both since 2026-09-10.
+    Occlusion boxes are drawn per image too. Runs of 2026-09-10 drew them once PER BATCH
+    (occlusion_per_batch=True); BatchNorm batch statistics could then cancel a box shared by the
+    whole batch in training, and those models failed on occlusion in eval mode. Each box is
+    rotated by a random angle (since 2026-09-10) and, since 2026-09-11, filled with a gray level
+    drawn uniformly per box (occlusion_binary_fill=True keeps the dark/bright choice).
 
     Order: affine -> photometric (brightness/contrast, random order) -> noise -> occlusion.
     Occlusion goes last so the boxes are not blurred away or rescaled by the warp.
@@ -296,7 +304,9 @@ class GpuAugment:
                  affine_degrees=0.0, affine_translate=0.0, affine_scale=0.0,
                  affine_shear=0.0, occlusion_prob=0.0, occlusion_count=0,
                  occlusion_min=0.05, occlusion_max=0.2, occlusion_value=0.0,
-                 occlusion_angle=0.0, occlusion_bright_prob=0.0, occlusion_bright_value=1.0):
+                 occlusion_angle=0.0, occlusion_bright_prob=0.0, occlusion_bright_value=1.0,
+                 occlusion_binary_fill=True, occlusion_fill_min=0.0, occlusion_fill_max=1.0,
+                 occlusion_per_batch=True):
         self.brightness = brightness
         self.contrast = contrast
         self.noise_sigma = noise_sigma
@@ -315,6 +325,10 @@ class GpuAugment:
         self.occlusion_angle = occlusion_angle
         self.occlusion_bright_prob = occlusion_bright_prob
         self.occlusion_bright_value = occlusion_bright_value
+        self.occlusion_binary_fill = occlusion_binary_fill
+        self.occlusion_fill_min = occlusion_fill_min
+        self.occlusion_fill_max = occlusion_fill_max
+        self.occlusion_per_batch = occlusion_per_batch
 
     @property
     def uses_affine(self) -> bool:
@@ -380,13 +394,51 @@ class GpuAugment:
         )
 
     def _occlude(self, x):
-        """Cutout boxes drawn once per batch and applied to every image in it.
+        """Cutout: occlusion_count boxes, each applied with occlusion_prob.
 
         Each box is placed as an axis-aligned rectangle, rotated about its centre by an
         angle in [-occlusion_angle, occlusion_angle] degrees (corners may leave the frame),
-        and filled with occlusion_bright_value with probability occlusion_bright_prob,
-        otherwise occlusion_value.
+        and filled with a gray level uniform in [occlusion_fill_min, occlusion_fill_max]; with
+        occlusion_binary_fill, occlusion_bright_value with probability occlusion_bright_prob,
+        otherwise occlusion_value. Everything is drawn independently per image (since
+        2026-09-11); occlusion_per_batch draws one set per batch for every image in it.
+        Same pixel-centre geometry as rotated_box_mask; a later box paints over an earlier one.
         """
+        if self.occlusion_per_batch:
+            return self._occlude_per_batch(x)
+        B, _, H, W = x.shape
+        dev = x.device
+        rows = torch.arange(H, device=dev, dtype=torch.float32).view(1, H, 1) + 0.5
+        cols = torch.arange(W, device=dev, dtype=torch.float32).view(1, 1, W) + 0.5
+
+        def draw(lo, hi):
+            return torch.empty(B, device=dev).uniform_(lo, hi)
+
+        for _ in range(self.occlusion_count):
+            applied = (torch.rand(B, device=dev) < self.occlusion_prob).view(B, 1, 1)
+            box_h = (draw(self.occlusion_min, self.occlusion_max) * H).floor_().clamp_(1, H)
+            box_w = (draw(self.occlusion_min, self.occlusion_max) * W).floor_().clamp_(1, W)
+            # Integer top/left uniform over the positions where the axis-aligned box fits
+            top = torch.minimum((torch.rand(B, device=dev) * (H - box_h + 1)).floor_(), H - box_h)
+            left = torch.minimum((torch.rand(B, device=dev) * (W - box_w + 1)).floor_(), W - box_w)
+            t = torch.deg2rad(draw(-self.occlusion_angle, self.occlusion_angle))
+            if self.occlusion_binary_fill:
+                fill = torch.full((B,), self.occlusion_value, device=dev)
+                fill[torch.rand(B, device=dev) < self.occlusion_bright_prob] = self.occlusion_bright_value
+            else:
+                fill = draw(self.occlusion_fill_min, self.occlusion_fill_max)
+            cos, sin = torch.cos(t).view(B, 1, 1), torch.sin(t).view(B, 1, 1)
+            dr = rows - (top + box_h / 2).view(B, 1, 1)  # (B, H, 1)
+            dc = cols - (left + box_w / 2).view(B, 1, 1)  # (B, 1, W)
+            # One (B, H, W) float temporary at a time
+            mask = (dc * cos + dr * sin).abs_() <= (box_w / 2).view(B, 1, 1)
+            mask &= (dr * cos - dc * sin).abs_() <= (box_h / 2).view(B, 1, 1)
+            mask &= applied
+            x = torch.where(mask.unsqueeze(1), fill.to(x.dtype).view(B, 1, 1, 1), x)
+        return x
+
+    def _occlude_per_batch(self, x):
+        """One set of boxes per batch, applied to every image in it (runs 2026-09-10 to 09-11)."""
         _, _, H, W = x.shape
         rng = random.Random()  # CPU draws; a handful of scalars per batch
         for _ in range(self.occlusion_count):
@@ -397,8 +449,11 @@ class GpuAugment:
             top = rng.randint(0, H - box_h)
             left = rng.randint(0, W - box_w)
             angle = rng.uniform(-self.occlusion_angle, self.occlusion_angle)
-            bright = rng.random() < self.occlusion_bright_prob
-            value = self.occlusion_bright_value if bright else self.occlusion_value
+            if self.occlusion_binary_fill:
+                bright = rng.random() < self.occlusion_bright_prob
+                value = self.occlusion_bright_value if bright else self.occlusion_value
+            else:
+                value = rng.uniform(self.occlusion_fill_min, self.occlusion_fill_max)
             if angle == 0.0:
                 x[:, :, top:top + box_h, left:left + box_w] = value
             else:
@@ -435,16 +490,22 @@ class GpuAugment:
 
 def run_display_name(cfg: dict) -> str:
     """W&B display name, fixed when the job starts (train/TRAINING_AND_EVALS.md section 1):
-    [mlp_]r<res>[_ft]_occ<min-max>batch[-rot<angle>][-bri<p>]_n<noise>_e<epochs>[_<split tag>][_s<seed>]_<job>,
-    with <job> = SLURM_JOB_ID or "local". No split tag = random split; mlp_ only for --arch mlp."""
+    [mlp_]r<res>[_ft]_occ<min-max><img|batch>[-rot<angle>][-fill<lo>-<hi>|-bri<p>]_n<noise>_e<epochs>[_<split tag>][_s<seed>]_<job>,
+    with <job> = SLURM_JOB_ID or "local". No split tag = random split; mlp_ only for --arch mlp.
+    -fill<lo>-<hi> = gray fill range in 0-255 levels; -bri<p> = binary fill (configs without
+    occlusion_binary_fill predate gray fill and count as binary; likewise a missing
+    occlusion_per_batch counts as per batch)."""
     name = ("mlp_" if cfg["arch"] == "mlp" else "") + f"r{cfg['resolution'] or TRAINING_IMAGE_RESOLUTION[0]}"
     if cfg["starting_checkpoint"]:
         name += "_ft"
     if cfg["occlusion_prob"] > 0 and cfg["occlusion_count"] > 0:
-        name += f"_occ{round(cfg['occlusion_min'] * 100):02d}-{round(cfg['occlusion_max'] * 100):02d}batch"
+        name += (f"_occ{round(cfg['occlusion_min'] * 100):02d}-{round(cfg['occlusion_max'] * 100):02d}"
+                 + ("batch" if cfg.get("occlusion_per_batch", True) else "img"))
         if cfg["occlusion_angle"]:
             name += f"-rot{round(cfg['occlusion_angle'])}"
-        if cfg["occlusion_bright_prob"]:
+        if not cfg.get("occlusion_binary_fill", True):
+            name += f"-fill{round(cfg['occlusion_fill_min'] * 255)}-{round(cfg['occlusion_fill_max'] * 255)}"
+        elif cfg["occlusion_bright_prob"]:
             name += f"-bri{round(cfg['occlusion_bright_prob'] * 100)}"
     else:
         name += "_occ0"
@@ -479,6 +540,10 @@ def make_gpu_augment(cfg: dict):
         occlusion_angle=cfg["occlusion_angle"],
         occlusion_bright_prob=cfg["occlusion_bright_prob"],
         occlusion_bright_value=cfg["occlusion_bright_value"],
+        occlusion_binary_fill=cfg.get("occlusion_binary_fill", True),
+        occlusion_fill_min=cfg.get("occlusion_fill_min", 0.0),
+        occlusion_fill_max=cfg.get("occlusion_fill_max", 1.0),
+        occlusion_per_batch=cfg.get("occlusion_per_batch", True),
     )
     active = (aug.brightness or aug.contrast or aug.noise_sigma
               or aug.uses_affine or aug.uses_occlusion)
@@ -805,10 +870,14 @@ def main(cfg: dict) -> None:
                  if augment.noise_sigma_min is not None else "")
               + f" | affine deg={augment.affine_degrees} "
               f"translate={augment.affine_translate} scale={augment.affine_scale} "
-              f"shear={augment.affine_shear} | occlusion p={augment.occlusion_prob} "
+              f"shear={augment.affine_shear} | occlusion "
+              f"{'per batch' if augment.occlusion_per_batch else 'per image'} p={augment.occlusion_prob} "
               f"n={augment.occlusion_count} size=[{augment.occlusion_min}, "
               f"{augment.occlusion_max}] angle=+-{augment.occlusion_angle} "
-              f"bright p={augment.occlusion_bright_prob} value={augment.occlusion_bright_value}")
+              + (f"fill binary: bright p={augment.occlusion_bright_prob} "
+                 f"value={augment.occlusion_bright_value} else {augment.occlusion_value}"
+                 if augment.occlusion_binary_fill else
+                 f"fill gray U[{augment.occlusion_fill_min}, {augment.occlusion_fill_max}]"))
 
     run = None
     if cfg["use_wandb"]:
@@ -972,8 +1041,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     aug.add_argument("--occlusion-angle", type=float, default=config["occlusion_angle"],
                      help="box rotation drawn in [-A, A] degrees; 0 keeps boxes axis-aligned")
     aug.add_argument("--occlusion-bright-prob", type=float, default=config["occlusion_bright_prob"],
-                     help="probability a box is filled with --occlusion-bright-value instead of black")
+                     help="with --occlusion-binary-fill: probability a box is filled with "
+                          "--occlusion-bright-value instead of black")
     aug.add_argument("--occlusion-bright-value", type=float, default=config["occlusion_bright_value"])
+    aug.add_argument("--occlusion-fill-min", type=float, default=config["occlusion_fill_min"],
+                     help="box fill drawn per box uniformly in [min, max] (0 = black, 1 = saturated)")
+    aug.add_argument("--occlusion-fill-max", type=float, default=config["occlusion_fill_max"])
+    aug.add_argument("--occlusion-binary-fill", action="store_true",
+                     help="previous fill: black, or --occlusion-bright-value with --occlusion-bright-prob")
+    aug.add_argument("--occlusion-per-batch", action="store_true",
+                     help="previous placement: one set of boxes per batch, shared by every image "
+                          "(off: boxes drawn per image)")
     aug.add_argument("--no-augment", action="store_true",
                      help="turn every augmentation stage off at once")
 
@@ -1026,6 +1104,10 @@ if __name__ == "__main__":
         "occlusion_angle": args.occlusion_angle,
         "occlusion_bright_prob": args.occlusion_bright_prob,
         "occlusion_bright_value": args.occlusion_bright_value,
+        "occlusion_fill_min": args.occlusion_fill_min,
+        "occlusion_fill_max": args.occlusion_fill_max,
+        "occlusion_binary_fill": args.occlusion_binary_fill,
+        "occlusion_per_batch": args.occlusion_per_batch,
 
         "wandb_project": args.wandb_project,
         "use_wandb": not args.no_wandb,

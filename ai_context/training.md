@@ -16,13 +16,17 @@ decode. Throughput numbers are in the history section above.
   network sees the same [0, 1] float32 as before - only the storage dtype changed.
 - fp16 autocast, TF32 and channels_last on by default (`--no-amp` to disable).
 - `GpuAugment` implements brightness/contrast, affine, Gaussian noise and random occlusion
-  **per sample**, except occlusion, whose boxes are drawn once per batch and shared by every
-  image in it (since 2026-09-10; earlier runs, r512_occ05-20img_n10_e96_3854472,
+  **per sample**, occlusion included since 2026-09-11 (a box shared by the batch is cancelled by
+  BatchNorm batch statistics, so such models failed on occlusion in eval mode;
+  `--occlusion-per-batch` restores it). On 2026-09-10 boxes were drawn once per batch and shared by every
+  image in it (earlier runs, r512_occ05-20img_n10_e96_3854472,
   r512_ft_occ15-40img_n10_e49_3866737 and r512_occ15-40img_n00-20_e96_3866805, used per-image
   boxes, hence `img` in their names; later runs have `batch`). Since 2026-09-10 each box is
   also rotated about its centre by an angle in [-90, 90] deg (`--occlusion-angle`) and is
   white (1.0, glare) with p 0.5 instead of black (`--occlusion-bright-prob/-value`);
-  `rotated_box_mask` is the shared geometry, and run names carry `-rot90-bri50`. Default epochs 98 = 14 cosine cycles of 7 (was 96).
+  `rotated_box_mask` is the shared geometry, and run names carry `-rot90-bri50`. Since 2026-09-11
+  the fill is a gray level uniform in [0, 1] per box (`--occlusion-fill-min/-max`, names
+  `-fill0-255`, with per-image boxes `_occ15-40img-rot90-fill0-255`); `--occlusion-binary-fill` restores white/black. Default epochs 98 = 14 cosine cycles of 7 (was 96).
   torchvision's v2 transforms sample parameters once per call, so applying
   them to a batched tensor would give every image in the batch the same jitter or the same
   rotation. Affine is wired up but is semantically risky here: the label is the position of

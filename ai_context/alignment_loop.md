@@ -76,7 +76,9 @@ with it to compare input sizes on identical frames and stop test.
 `--occlusion-angle A` rotates each box by an angle in [-A, A] deg and
 `--occlusion-bright-prob P` fills it white (`--occlusion-bright-value`) with probability P;
 their draws follow the box geometry, so older conditions are unchanged.
-`utils/eval_sweep.py` runs 39 conditions (clean, noise 0.02/0.05/0.1/0.15/0.2/0.3,
+`--occlusion-fill-max M` (with `--occlusion-fill-min`, default 0) fills each box with a gray
+level uniform in [min, M] instead, drawn after everything else (conditions `*_fill`, `*_rotfill`, `occlusion_2_mixedfill`).
+`utils/eval_sweep.py` runs 43 conditions (clean, noise 0.02/0.05/0.1/0.15/0.2/0.3,
 brightness 0.4/0.6/0.8/1.2/1.4/1.6, contrast 0.9/1.1, occlusion 1/2 boxes of random edge
 0.15-0.40, 1/2 boxes of fixed edge 10/20/30/40/50%, 1x30/2x30/2x50 bright, rotated and
 both, occlusion_2_mixed, combined, combined_harsh) and writes

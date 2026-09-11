@@ -166,8 +166,8 @@ def plot_split_map(grid, ix_min, ix_max, iy_min, iy_max, origins, title, out_pat
         handles.append(ax.scatter(ox, oy, s=8, c="black", marker="x", linewidths=0.8, label="origins"))
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
-    ax.set_xlabel("x (deg)")
-    ax.set_ylabel("y (deg)")
+    ax.set_xlabel("x (°)")
+    ax.set_ylabel("y (°)")
     top_legend(ax, handles)
     if title:
         ax.set_title(title, pad=18, fontsize=10)
@@ -209,7 +209,7 @@ def stats_text(stats, sep="\n"):
             parts.append(f"{name.upper()}: no starts")
             continue
         parts.append(f"{name.upper()}: n={s['starts']}  success={100 * s['success_rate']:.1f}%  "
-                      f"adj={s['adjustments_mean']:.2f}  err={s['final_angular_error_mean']:.3f} deg")
+                      f"adj={s['adjustments_mean']:.2f}  err={s['final_angular_error_mean']:.3f}°")
     return sep.join(parts)
 
 
@@ -253,8 +253,8 @@ def plot_metric_heatmap(finals, grid, ix_min, ix_max, iy_min, iy_max, field, lab
     if failed:
         handles.append(ax.scatter(*zip(*failed), marker="x", s=20, c=NOT_CONVERGED_COLOR, linewidths=1.1,
                                   label=f"not converged ({len(failed)})"))
-    ax.set_xlabel("X origin (deg)")
-    ax.set_ylabel("Y origin (deg)")
+    ax.set_xlabel("X origin (°)")
+    ax.set_ylabel("Y origin (°)")
     top_legend(ax, handles)
     if title:
         ax.set_title(title, pad=18, fontsize=10)
@@ -300,7 +300,7 @@ def main():
                         args.title, os.path.join(args.out_dir, "corrections_heatmap.png"))
 
     if args.also_error:
-        plot_metric_heatmap(finals, grid, ix_min, ix_max, iy_min, iy_max, "err", "Final angular error (deg)", False,
+        plot_metric_heatmap(finals, grid, ix_min, ix_max, iy_min, iy_max, "err", "Final angular error (°)", False,
                             args.title, os.path.join(args.out_dir, "angular_error_heatmap.png"))
 
     write_group_csv(stats, os.path.join(args.out_dir, "corrections_by_split.csv"))
