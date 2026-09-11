@@ -85,6 +85,7 @@ config = {
     # Applied with split_seed, so the same share is reproducible across runs.
     "data_share": 1.0,
     "resolution": None,           # square input size; None = TRAINING_IMAGE_RESOLUTION from config.py
+    "arch": "resnet18",           # "resnet18" or "mlp" (SimpleFC on the flattened resolution**2 input)
 
     # Throughput is flat from bs=16 to bs=128 (153-159 img/s) because the GPU is
     # power-limited, so this is chosen for headroom rather than speed: 3.9 GiB peak on a
@@ -434,9 +435,9 @@ class GpuAugment:
 
 def run_display_name(cfg: dict) -> str:
     """W&B display name, fixed when the job starts (train/TRAINING_AND_EVALS.md section 1):
-    r<res>[_ft]_occ<min-max>batch[-rot<angle>][-bri<p>]_n<noise>_e<epochs>[_<split tag>][_s<seed>]_<job>,
-    with <job> = SLURM_JOB_ID or "local". No split tag = random split."""
-    name = f"r{cfg['resolution'] or TRAINING_IMAGE_RESOLUTION[0]}"
+    [mlp_]r<res>[_ft]_occ<min-max>batch[-rot<angle>][-bri<p>]_n<noise>_e<epochs>[_<split tag>][_s<seed>]_<job>,
+    with <job> = SLURM_JOB_ID or "local". No split tag = random split; mlp_ only for --arch mlp."""
+    name = ("mlp_" if cfg["arch"] == "mlp" else "") + f"r{cfg['resolution'] or TRAINING_IMAGE_RESOLUTION[0]}"
     if cfg["starting_checkpoint"]:
         name += "_ft"
     if cfg["occlusion_prob"] > 0 and cfg["occlusion_count"] > 0:
@@ -612,6 +613,38 @@ def resnet18(output_dim=2):
     return ResNet(BasicBlock, [2, 2, 2, 2], output_dim=output_dim)
 
 
+class SimpleFC(nn.Module):
+    """MLP of the paper. Same module layout as app/inference.py:SimpleFC (state dict keys layers.*),
+    so checkpoints load there with strict=True. Edit both or neither."""
+
+    def __init__(self, in_features, out_features):
+        super(SimpleFC, self).__init__()
+        self.relu = nn.ReLU()
+        self.layers = nn.Sequential(
+            nn.Linear(in_features, 1024),
+            nn.BatchNorm1d(1024),
+            self.relu,
+            nn.Linear(1024, 256),
+            nn.BatchNorm1d(256),
+            self.relu,
+            nn.Linear(256, 32),
+            nn.BatchNorm1d(32),
+            self.relu,
+            nn.Linear(32, out_features),
+        )
+
+    def forward(self, x):
+        # (B, 1, r, r) -> (B, r*r); a no-op for already flat input.
+        return self.layers(x.flatten(1))
+
+
+def build_model(cfg: dict, output_dim=2) -> nn.Module:
+    if cfg["arch"] == "mlp":
+        r = cfg["resolution"] or TRAINING_IMAGE_RESOLUTION[0]
+        return SimpleFC(r * r, output_dim)
+    return resnet18(output_dim=output_dim)
+
+
 # ---------------------------------------------------------------------------
 # Train / validate
 # ---------------------------------------------------------------------------
@@ -736,7 +769,8 @@ def main(cfg: dict) -> None:
     print(f"loaders: batch_size={cfg['batch_size']}, "
           f"train workers={cfg['num_workers']}, val workers={cfg['val_num_workers']}")
 
-    model = resnet18(output_dim=2).to(device)
+    model = build_model(cfg).to(device)
+    print(f"arch: {cfg['arch']}, {sum(p.numel() for p in model.parameters()):,} parameters")
     if cfg["use_channels_last"]:
         model = model.to(memory_format=torch.channels_last)
 
@@ -862,7 +896,7 @@ def main(cfg: dict) -> None:
     print("Saved to:", os.path.join(cfg["checkpoint_dir"], ckpt_name))
     # Model selection record: which epoch the best-model checkpoint comes from
     with open(os.path.join(cfg["checkpoint_dir"], "train_summary.json"), "w") as f:
-        json.dump({"best_epoch": best_epoch, "best_val_loss": best_loss, "epochs": cfg["epochs"],
+        json.dump({"arch": cfg["arch"], "best_epoch": best_epoch, "best_val_loss": best_loss, "epochs": cfg["epochs"],
                    "seed": cfg["seed"], "split_seed": cfg["split_seed"],
                    "train_keys_file": cfg["train_keys_file"], "val_keys_file": cfg["val_keys_file"],
                    "n_train": len(train_dataset), "n_val": len(val_dataset),
@@ -889,6 +923,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     data.add_argument("--resolution", type=int, default=config["resolution"],
                       help="square input size in px; images of another size are resized by the loader "
                            "(default: TRAINING_IMAGE_RESOLUTION in config.py)")
+    data.add_argument("--arch", choices=["resnet18", "mlp"], default=config["arch"],
+                      help="mlp = SimpleFC on the flattened resolution**2 input")
     data.add_argument("--train-keys-file", default=config["train_keys_file"])
     data.add_argument("--val-keys-file", default=config["val_keys_file"])
 
@@ -961,6 +997,7 @@ if __name__ == "__main__":
         "save_last": args.save_last,
         "split_tag": args.split_tag,
         "resolution": args.resolution,
+        "arch": args.arch,
         "train_keys_file": args.train_keys_file,
         "val_keys_file": args.val_keys_file,
 

@@ -106,8 +106,9 @@ class SimpleFC(nn.Module):
             nn.Linear(32, out_features),
         )
     def forward(self, x):
-        return self.layers.forward(x)
-    
+        # (B, in_features) or (B, 1, r, r); flatten(1) is a no-op for already flat input.
+        return self.layers(x.flatten(1))
+
 
 class WideConv(nn.Module):
     def __init__(self):
@@ -351,9 +352,27 @@ def resnet18(output_dim=2):
 
 
 def resolution_from_name(model_fname: str) -> int | None:
-    """Input size encoded in a checkpoint named r<res>_..., e.g. real/r128_occ15-40batch-..._3870308.pth."""
-    m = re.match(r"r(\d+)_", os.path.basename(model_fname))
+    """Input size encoded in a checkpoint named [mlp_]r<res>_..., e.g. real/r128_occ15-40batch-..._3870308.pth."""
+    m = re.match(r"(?:mlp_)?r(\d+)_", os.path.basename(model_fname))
     return int(m.group(1)) if m else None
+
+
+def model_from_state_dict(state: dict, output_dim=2) -> tuple[nn.Module, str, int | None]:
+    """Build the architecture a state dict belongs to and load it (strict).
+
+    Keys layers.* -> SimpleFC (arch "mlp", in_features from layers.0.weight), else resnet18 (arch "resnet18").
+    Returns (model, arch, input_resolution); input_resolution is sqrt(in_features) for a square MLP input,
+    None for the ResNet (any input size).
+    """
+    if any(k.startswith("layers.") for k in state):
+        in_features = state["layers.0.weight"].shape[1]
+        model, arch = SimpleFC(in_features, output_dim), "mlp"
+        r = int(round(in_features ** 0.5))
+        resolution = r if r * r == in_features else None
+    else:
+        model, arch, resolution = resnet18(output_dim=output_dim), "resnet18", None
+    model.load_state_dict(state, strict=True)
+    return model, arch, resolution
 
 
 class TiltPredictor:
@@ -366,14 +385,14 @@ class TiltPredictor:
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.DEVICE)
         self.preprocessing = None
-        # Square input size of the model (ResNet18 only; the legacy types are fixed at 512).
-        # Frames of any other size are resized to it in predict().
+        # Square input size of the model (ResNet18 and SimpleFC; the other legacy types are fixed at 512).
+        # Frames of any other size are resized to it in predict(). Legacy SimpleFC checkpoints: 512.
         self.input_resolution = (input_resolution or resolution_from_name(model_fname)
                                  or TRAINING_IMAGE_RESOLUTION[0])
 
         match model_type:
             case "SimpleFC":
-                self.model = SimpleFC(512*512, 2)
+                self.model = SimpleFC(self.input_resolution ** 2, 2)
             case "WideConv":
                 self.model = WideConv()
             case "GradientSimpleFC":
@@ -391,7 +410,7 @@ class TiltPredictor:
         self.model = self.load_model(self.model, fname=model_fname)
         self.model.eval()
         self.model.to(self.DEVICE)
-        if model_type == "ResNet18":
+        if model_type in ("ResNet18", "SimpleFC"):
             print(f"model input: {self.input_resolution}x{self.input_resolution} px")
 
     def resize_to_input(self, img: np.ndarray) -> np.ndarray:
@@ -415,12 +434,12 @@ class TiltPredictor:
 
         if self.preprocessing is not None:
             img = self.preprocessing(img)
-        if self.model_type == "ResNet18":
-            img = self.resize_to_input(img)
+        if self.model_type in ("ResNet18", "SimpleFC"):
+            img = self.resize_to_input(img)  # (B, 1, r, r); SimpleFC flattens to (B, r*r) in forward
         img = torch.from_numpy(img).float()/255
 
-        if self.model_type in ["SimpleFC", "CLAHEGradSimpleFC"]:
-            img = img.flatten()
+        if self.model_type == "CLAHEGradSimpleFC":
+            img = img.reshape(-1, 512 * 512)
 
         if self.model_type in ["CnnExtractor"]:
             img = img.permute(2, 0, 1).unsqueeze(0)

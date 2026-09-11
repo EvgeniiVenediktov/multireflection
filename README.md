@@ -246,6 +246,12 @@ input, so models of every input size are compared on the same frames and the sam
 test; `cluster/eval_sweep_l40s.slurm` runs the sweep on the cluster and
 `utils/eval_compare.py` merges several models' `sweep.csv` into one table.
 
+`utils/noise_curve.py` plots one model's final mean angular error against Gaussian noise
+sigma (`--levels`, default 0 to 0.40), each level run once per `--perturb-seeds` (default
+0,1,2), and writes `noise_curve.csv`/`.png` with success rate on a secondary axis.
+`--from-sweep sweep_seeds.csv` reuses an existing `eval_sweep.py` output's clean/noise_* rows
+instead of running anything; `cluster/noise_curve_l40s.slurm` runs it on the cluster.
+
 ### On the Pitt CRCD cluster
 
 ```bash

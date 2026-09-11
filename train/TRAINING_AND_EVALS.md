@@ -14,7 +14,8 @@ reference image reaches a threshold. Training is supervised regression on the co
 
 **Run names** (since 2026-09-10; checkpoints, run directories and W&B display names):
 `r<resolution>[_ft]_occ<box edge % min-max><img|batch>_n<noise sigma x100>_e<epochs>[_s<seed>]_<job>`
-(`_s<seed>` only when `--seed` is not 0). Split marker after the epochs: `_hold` = trained on the
+(`_s<seed>` only when `--seed` is not 0). MLP runs (`--arch mlp`) carry an `mlp_` prefix
+(`mlp_r128_...`); ResNet-18 names have none. Split marker after the epochs: `_hold` = trained on the
 spatial hold-out TRAIN set (holdout/README.md), evaluated in `holdout_test/`; `_fullctl` = the
 full-data control of the hold-out study; no marker = the random 80/20 split (sweeps in `sweep/`).
 The W&B display name is built by the training script when the job starts

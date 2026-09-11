@@ -31,6 +31,7 @@ clamped to 1.99; (0, 0) is TRAIN), `counts.json`, `split_map.png` (copy in this 
 
 Run names carry the split: `r<res>_..._e<epochs>_hold[_s<seed>]_<job>` for hole-trained runs,
 `..._e<epochs>_fullctl_<job>` for the full-data control; names without a marker are random-split runs.
+MLP runs (`--arch mlp`) prefix the name with `mlp_`, e.g. `mlp_r128_..._e98_hold_<job>`.
 The W&B name carries this from the start: the submit scripts pass `--split-tag hold` / `fullctl` to
 the training script, which builds the display name (`run_display_name`).
 
@@ -97,3 +98,14 @@ Local smoke numbers (r64 checkpoint trained on all positions, so only a code che
 load TEST 4 s, 27k images/s, TRAIN load 17 s, NN search 12 s. On 300 TEST samples the 512 -> 64 path
 and the native 64 px bank give the same clean mean error (0.0239 deg). cv2 INTER_AREA and
 avg_pool2d + rounding differ by at most one gray level on about 1.4 percent of pixels.
+
+## Heatmaps
+
+`holdout/heatmaps.py --split split.csv --trace <eval_batched trace.csv over a start grid> [--origins
+closed_loop_origins.txt] --title "<run name>" --out-dir <dir> [--also-error]` overlays the spatial
+split on a closed-loop replay: `split_map.png` (train/val/test over the grid), `corrections_heatmap.png`
+(adjustments per start, TEST/VAL hole outlines, non-converged starts marked red, and a
+train/val/test stats box), optionally `angular_error_heatmap.png`, and `corrections_by_split.csv`.
+A start's group is the split of its own position, not of its trajectory. For a random-split
+checkpoint pass the same split.csv for reference and say so in `--title` (holes were not excluded
+from its training).

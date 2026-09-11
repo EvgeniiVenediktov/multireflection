@@ -69,7 +69,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from config import X_TILT_START, X_TILT_STOP, Y_TILT_START, Y_TILT_STOP, EVAL_MAX_ADJ_NUMBER  # noqa: E402
-from app.inference import resnet18, evaluate_position  # noqa: E402
+from app.inference import model_from_state_dict, evaluate_position  # noqa: E402
 
 DEFAULT_CHECKPOINT = REPO_ROOT / "saved_models" / "real" / "r512_occ05-20img_n10_e96_3854472.pth"
 DEFAULT_DATA_DIR = "/mnt/h/dark512"
@@ -341,9 +341,12 @@ class BatchedPredictor:
         self.fp16 = bool(fp16 and self.device.type == "cuda")
         self.batch_size = batch_size
         self.model_resolution = model_resolution
-        self.model = resnet18(output_dim=2)
         state = torch.load(checkpoint, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(state, strict=True)
+        self.model, self.arch, _ = model_from_state_dict(state)  # strict load; the MLP flattens internally
+        if self.arch == "mlp" and model_resolution:
+            in_features = state["layers.0.weight"].shape[1]
+            assert model_resolution ** 2 == in_features, \
+                f"model_resolution {model_resolution} does not match the MLP input ({in_features} features)"
         self.model.eval().to(self.device)
         self.model = self.model.to(memory_format=torch.channels_last)
         self.perturb = perturb
@@ -443,7 +446,7 @@ def run(args):
     if not perturb.enabled:
         perturb = None
     predictor = BatchedPredictor(args.checkpoint, args.batch_size, not args.no_fp16, perturb, args.model_resolution)
-    print(f"Model: {args.checkpoint} on {predictor.device}, fp16={predictor.fp16}"
+    print(f"Model: {args.checkpoint} ({predictor.arch}) on {predictor.device}, fp16={predictor.fp16}"
           + (f", input {args.model_resolution} px" if args.model_resolution else ""))
     print(starts_desc)
     print(f"Perturbation: {perturb.describe() if perturb else 'none'}")
