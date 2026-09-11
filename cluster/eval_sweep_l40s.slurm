@@ -11,6 +11,8 @@
 # --model-resolution), so models of different input sizes see the same frames.
 # Knobs: CKPT (required), MODEL_RES (512), OUT_DIR (<checkpoint dir>/sweep), GRID_STEP (0.1),
 # CONDITIONS (comma-separated subset, default all), EXTRA_ARGS (appended, word-split).
+# Perturbed conditions run for perturbation seeds 0,1,2 (eval_sweep.py default); for one
+# seed pass EXTRA_ARGS=--perturb-seeds=0.
 
 #SBATCH --job-name=mfl-sweep
 #SBATCH --cluster=gpu

@@ -18,9 +18,13 @@ checkpoint under each condition and writes one comparison table. Conditions, in 
                                              2 boxes: the training augmentation at eval
     combined_harsh                           noise 0.2 + brightness 0.6 + 2 boxes of edge 30%
 
-Each condition writes its normal eval outputs to <out-dir>/<condition>/; the sweep writes
-sweep.csv and sweep.md next to them. adjustments_* are over converged starts (the same
-quantity eval_batched reports to W&B), the angular error columns are over all starts.
+Every condition with a perturbation runs once per perturbation seed (--perturb-seeds,
+default 0,1,2: different box positions, brightness/contrast draws and noise); clean has
+nothing random and runs once. Each run writes its normal eval outputs to
+<out-dir>/<condition>/seed<k>/. The sweep writes sweep_seeds.csv (one row per condition and
+seed) and sweep.csv / sweep.md (one row per condition: mean over seeds, *_std = standard
+deviation over seeds, max = max over seeds). adjustments_* are over converged starts (the
+same quantity eval_batched reports to W&B), the angular error columns are over all starts.
 To compare models of different input sizes on the same frames, run every one on the 512 px
 bank with --model-resolution set to the model's size.
 """
@@ -31,6 +35,8 @@ import os
 import sys
 import time
 from pathlib import Path
+
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -61,9 +67,12 @@ CONDITIONS = [
     ("combined_harsh", ["--noise", "0.2", "--brightness-fixed", "0.6", *_boxes(2, "0.30", "0.30")]),
 ]
 
-COLUMNS = ["condition", "starts", "success_rate", "adjustments_mean", "adjustments_std", "adjustments_max",
-           "final_ssim_mean", "final_angular_error_mean", "final_angular_error_std", "final_angular_error_max",
-           "wall_s"]
+SEED_COLUMNS = ["condition", "seed", "starts", "success_rate", "adjustments_mean", "adjustments_std",
+                "adjustments_max", "final_ssim_mean", "final_angular_error_mean", "final_angular_error_std",
+                "final_angular_error_max", "wall_s"]
+COLUMNS = ["condition", "seeds", "starts", "success_rate", "success_rate_std", "adjustments_mean",
+           "adjustments_mean_std", "adjustments_max", "final_ssim_mean", "final_angular_error_mean",
+           "final_angular_error_mean_std", "final_angular_error_max", "wall_s"]
 
 
 def row_from_summary(name, summary):
@@ -84,6 +93,40 @@ def row_from_summary(name, summary):
     }
 
 
+def aggregate(name, runs):
+    """One row for a condition from its per-seed rows: mean, std and max over the seeds."""
+    def values(key):
+        return np.array([r[key] for r in runs if r[key] is not None], dtype=np.float64)
+
+    def mean(key):
+        v = values(key)
+        return float(v.mean()) if len(v) else None
+
+    def std(key):
+        v = values(key)
+        return float(v.std()) if len(v) > 1 else None
+
+    def vmax(key):
+        v = values(key)
+        return float(v.max()) if len(v) else None
+
+    return {
+        "condition": name,
+        "seeds": len(runs),
+        "starts": runs[0]["starts"],
+        "success_rate": mean("success_rate"),
+        "success_rate_std": std("success_rate"),
+        "adjustments_mean": mean("adjustments_mean"),
+        "adjustments_mean_std": std("adjustments_mean"),
+        "adjustments_max": vmax("adjustments_max"),
+        "final_ssim_mean": mean("final_ssim_mean"),
+        "final_angular_error_mean": mean("final_angular_error_mean"),
+        "final_angular_error_mean_std": std("final_angular_error_mean"),
+        "final_angular_error_max": vmax("final_angular_error_max"),
+        "wall_s": float(values("wall_s").sum()),
+    }
+
+
 def fmt(v):
     if v is None:
         return "n/a"
@@ -92,12 +135,17 @@ def fmt(v):
     return str(v)
 
 
-def write_table(rows, out_dir):
-    with open(out_dir / "sweep.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS)
+def write_csv(rows, path, columns):
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=columns)
         w.writeheader()
         w.writerows(rows)
-    md = ["| " + " | ".join(COLUMNS) + " |", "|" + "|".join("---" for _ in COLUMNS) + "|"]
+
+
+def write_table(rows, seed_rows, out_dir):
+    write_csv(seed_rows, out_dir / "sweep_seeds.csv", SEED_COLUMNS)
+    write_csv(rows, out_dir / "sweep.csv", COLUMNS)
+    md =["| " + " | ".join(COLUMNS) + " |", "|" + "|".join("---" for _ in COLUMNS) + "|"]
     for r in rows:
         md.append("| " + " | ".join(fmt(r[c]) for c in COLUMNS) + " |")
     (out_dir / "sweep.md").write_text("\n".join(md) + "\n")
@@ -134,7 +182,8 @@ def parse_args():
                    help="comma-separated subset of: " + ", ".join(names))
     p.add_argument("--perturb-ssim", action="store_true",
                    help="passed through: SSIM stop test on the perturbed frame (ignored for clean)")
-    p.add_argument("--perturb-seed", type=int, default=0)
+    p.add_argument("--perturb-seeds", default="0,1,2",
+                   help="comma-separated perturbation seeds; every perturbed condition runs once per seed")
     p.add_argument("--no-fp16", action="store_true")
     p.add_argument("--model-resolution", type=int, default=None,
                    help="passed through: area-downscale the (perturbed) frames to the model's input size")
@@ -142,6 +191,12 @@ def parse_args():
     p.add_argument("--wandb-project", default="multireflection")
     p.add_argument("--wandb-prefix", default="sweep")
     args = p.parse_args()
+    try:
+        args.perturb_seeds = [int(s) for s in args.perturb_seeds.split(",") if s.strip()]
+    except ValueError:
+        p.error("--perturb-seeds must be comma-separated integers")
+    if not args.perturb_seeds:
+        p.error("--perturb-seeds needs at least one seed")
     if args.conditions:
         wanted = [c.strip() for c in args.conditions.split(",") if c.strip()]
         unknown = [c for c in wanted if c not in names]
@@ -158,7 +213,7 @@ def main():
     out_dir = Path(args.out_dir) if args.out_dir else REPO_ROOT / "eval_results" / f"{Path(args.checkpoint).stem}_sweep"
     out_dir.mkdir(parents=True, exist_ok=True)
     common = ["--checkpoint", args.checkpoint, "--data-dir", args.data_dir, "--grid-step", str(args.grid_step),
-              "--batch-size", str(args.batch_size), "--perturb-seed", str(args.perturb_seed)]
+              "--batch-size", str(args.batch_size)]
     if args.workers is not None:
         common += ["--workers", str(args.workers)]
     if args.no_fp16:
@@ -166,20 +221,26 @@ def main():
     if args.model_resolution:
         common += ["--model-resolution", str(args.model_resolution)]
 
-    rows = []
+    rows, seed_rows = [], []
     t0 = time.perf_counter()
     for name, flags in CONDITIONS:
         if name not in args.conditions:
             continue
-        argv = common + flags + ["--out-dir", str(out_dir / name)]
-        if args.perturb_ssim and flags:
-            argv.append("--perturb-ssim")
-        print(f"\n===== condition: {name} =====")
-        summary = eval_batched.run(eval_batched.parse_args(argv))
-        rows.append(row_from_summary(name, summary))
-        write_table(rows, out_dir)  # partial table survives an interrupted sweep
-    md = write_table(rows, out_dir)
-    print(f"\nsweep of {len(rows)} conditions in {time.perf_counter() - t0:.0f} s -> {out_dir}\n")
+        # Without a perturbation nothing is random, so one run stands for every seed
+        seeds = args.perturb_seeds if flags else args.perturb_seeds[:1]
+        runs = []
+        for seed in seeds:
+            argv = common + flags + ["--perturb-seed", str(seed), "--out-dir", str(out_dir / name / f"seed{seed}")]
+            if args.perturb_ssim and flags:
+                argv.append("--perturb-ssim")
+            print(f"\n===== condition: {name}, perturbation seed {seed} =====")
+            summary = eval_batched.run(eval_batched.parse_args(argv))
+            runs.append({"seed": seed, **row_from_summary(name, summary)})
+        seed_rows += runs
+        rows.append(aggregate(name, runs))
+        write_table(rows, seed_rows, out_dir)  # partial tables survive an interrupted sweep
+    md = write_table(rows, seed_rows, out_dir)
+    print(f"\nsweep of {len(rows)} conditions x seeds {args.perturb_seeds} in {time.perf_counter() - t0:.0f} s -> {out_dir}\n")
     print(md)
     if args.wandb:
         log_to_wandb(rows, args.checkpoint, args.wandb_project, args.wandb_prefix)

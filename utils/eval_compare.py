@@ -4,7 +4,8 @@
 
 One row per condition, in the order of the first table (conditions only present in later
 tables are appended), one column per model. Each cell is success rate / mean adjustments
-over converged starts / mean final angular error in degrees over all starts.
+over converged starts / mean final angular error in degrees over all starts; for a
+multi-seed sweep, success and error carry +- the standard deviation over perturbation seeds.
 """
 
 import argparse
@@ -21,10 +22,15 @@ def cell(row):
     if row is None:
         return "-"
     success = float(row["success_rate"])
-    rate = "100%" if success == 1.0 else f"{100 * success:.2f}%"
+    err = float(row["final_angular_error_mean"])
     adj = row["adjustments_mean"]
     adj = f"{float(adj):.2f}" if adj not in ("", "None", "n/a") else "n/a"
-    return f"{rate} / {adj} / {float(row['final_angular_error_mean']):.3f}"
+    if int(row.get("seeds") or 1) > 1:
+        # mean +- standard deviation over perturbation seeds (utils/eval_sweep.py --perturb-seeds)
+        rate = f"{100 * success:.2f}±{100 * float(row['success_rate_std']):.2f}%"
+        return f"{rate} / {adj} / {err:.3f}±{float(row['final_angular_error_mean_std']):.3f}"
+    rate = "100%" if success == 1.0 else f"{100 * success:.2f}%"
+    return f"{rate} / {adj} / {err:.3f}"
 
 
 def main():
