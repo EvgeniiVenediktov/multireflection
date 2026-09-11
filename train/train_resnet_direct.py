@@ -282,7 +282,7 @@ class GpuAugment:
 
     Occlusion is the exception: its boxes are drawn once PER BATCH and applied to every
     image in it (decided 2026-09-10; runs before that used per-image boxes). Each box is
-    rotated by a random angle and is dark (dust) or bright (glare); both since 2026-09-11.
+    rotated by a random angle and is dark (dust) or bright (glare); both since 2026-09-10.
 
     Order: affine -> photometric (brightness/contrast, random order) -> noise -> occlusion.
     Occlusion goes last so the boxes are not blurred away or rescaled by the warp.

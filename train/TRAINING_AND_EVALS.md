@@ -7,10 +7,10 @@ where prose disagrees. Per-module detail lives in `ai_context/training.md` and
 
 ## 1. Purpose and status
 
-The model takes a 512x512 (or 256x256) grayscale camera image of the Herriott cell spot
-pattern and regresses the mirror tilt (x, y) in degrees. The deployed loop moves the mirror
-by the negated prediction and stops when the SSIM against the reference image reaches a
-threshold. Training is supervised regression on the collected image bank.
+The model takes a 512x512 grayscale camera image of the Herriott cell spot pattern (or its
+256, 128 or 64 px box-averaged version) and regresses the mirror tilt (x, y) in degrees. The
+deployed loop moves the mirror by the negated prediction and stops when the SSIM against the
+reference image reaches a threshold. Training is supervised regression on the collected image bank.
 
 **Run names** (since 2026-09-10; checkpoints, run directories and W&B display names):
 `r<resolution>[_ft]_occ<box edge % min-max><img|batch>_n<noise sigma x100>_e<epochs>_<job>`.
@@ -27,21 +27,25 @@ Best epoch 93 of 96, val MSE 6.5e-5 on normalized labels. Offline sweep: 100% co
 1.14 adjustments, angular error 0.027 deg. Recipe in README "Current best checkpoint";
 it predates three default changes listed in section 3.
 
-**Runs on 2026-09-10** (in `/ix1/kchen/evv/multireflection/runs/<name>/`; 3866805 stays in
-`runs/3866805/` under its old name until it finishes):
+**Runs on 2026-09-10** (in `/ix1/kchen/evv/multireflection/runs/<name>/`):
 
 | run | what | status | best val MSE | offline eval (grid 0.1) |
 |---|---|---|---|---|
 | r512_ft_occ15-40img_n10_e49_3866737 | fine-tune of r512_occ05-20img_n10_e96_3854472, cutout 0.15-0.40, fixed noise 0.1 | finished | 7.0e-5 | 100%, 1.11 adj, 0.026 deg |
-| r512_occ15-40img_n00-20_e96_3866805 | from scratch, noise sigma per image in [0, 0.2], cutout 0.15-0.40 | training, epoch 82 of 96 when written | 2.6e-5 so far | pending |
-| r256_occ15-40batch_n00-20_e98_3867169 | from scratch on `dark256` at 256 px, all current defaults | finished | 2.8e-5 | 100%, 1.03 adj, 0.011 deg; val set (45,760 starts): same |
-| r64_occ15-40batch_n00-20_e98_local | from scratch on `dark64` at 64 px on the local A2000, all current defaults, batch 512, lr 2.8e-3, 5 workers; 30 min at 10k img/s | finished | 4.1e-5 | see section 5 |
+| r512_occ15-40img_n00-20_e96_3866805 | from scratch, noise sigma per image in [0, 0.2], cutout 0.15-0.40 | finished, 6.5 h | 2.4e-5 | val set (45,760 starts): 100%, 1.02 adj, 0.011 deg |
+| r256_occ15-40batch_n00-20_e98_3867169 | from scratch on `dark256` at 256 px, defaults of that afternoon (axis-aligned black boxes) | finished | 2.8e-5 | 100%, 1.03 adj, 0.011 deg; val set (45,760 starts): same |
+| r64_occ15-40batch_n00-20_e98_local | from scratch on `dark64` at 64 px on the local A2000, defaults of that afternoon, batch 512, lr 2.8e-3, 5 workers; 30 min at 10k img/s | finished | 4.1e-5 | see section 5 |
+| r256_occ15-40batch-rot90-bri50_n00-20_e98_3870306 | from scratch on `dark256`, all current defaults including rotated and bright boxes; 88 min at 3.5k img/s | finished | 3.0e-5 | 100%, 1.03 adj, 0.012 deg; val set: 100%, 1.04, 0.011 |
+| r128_occ15-40batch-rot90-bri50_n00-20_e98_3870308 | the same on `dark128`; 21 min at 15k img/s | finished | 3.2e-5 | 100%, 1.05 adj, 0.011 deg; val set: 100%, 1.04, 0.011 |
+| r64_occ15-40batch-rot90-bri50_n00-20_e98_3870310 | the same on `dark64`; 8 min at 46k img/s | finished | 4.8e-5 | 100%, 1.16 adj, 0.017 deg; val set: 100%, 1.15, 0.017 |
 
-The 256 px run is the standout: 4.5x the throughput (3496 vs 780 img/s), lower val loss,
-and less than half the angular error of the 512 px best. It has not been checked on
-hardware, and its eval ran against the 256 px bank, so its SSIM values are not directly
-comparable to the 512 px ones. Job 3866737 has no `eval_val/`; it was submitted before that
-stage existed.
+The offline eval column uses each run's own bank (the job's eval stage); section 5 compares
+all models on the same 512 px frames.
+
+Section 5 has the comparison and findings: the 512 px failures came from the recipe, bright
+boxes in training are what make glare survivable, and 128 px is the strongest of the
+rot90-bri50 runs. None of the small-input models has been checked on hardware. Job 3866737
+has no `eval_val/`; it was submitted before that stage existed.
 
 ## 2. Data
 
@@ -61,7 +65,7 @@ archive at `/home/evv/data/dark256/`.
 **`dark128`, `dark64`.** Same recipe (INTER_AREA directly from the 512 px JPEG, quality 95),
 built locally in one pass over `/mnt/h/dark512` (6.5 min, 5 processes):
 `/home/evv/data/dark128/` (947 MB) and `/home/evv/data/dark64/` (902 MB), 228,800 files
-each. Not on the cluster.
+each. Archives on the cluster: `data/dark128.tar.gz` (642 MB), `data/dark64.tar.gz` (259 MB).
 
 **Split.** `build_split` in `train/train_resnet_direct.py`: shuffle with `--split-seed`
 (default 0), last 20% (`--val-share`) is validation: 183,040 train, 45,760 val. Every run
@@ -102,7 +106,7 @@ occlusion):
 | brightness jitter | factor in [0.6, 1.4] | `--brightness 0.4` | original |
 | contrast jitter | factor in [0.9, 1.1] | `--contrast 0.1` | original |
 | Gaussian noise | sigma per image uniform in [0, 0.2] | `--noise-min 0.0 --noise 0.2` | 2026-09-10 (was fixed 0.1) |
-| occlusion (cutout) | 2 boxes, each with p 0.5, edges 0.15 to 0.40 of the image, rotated about the centre by an angle in [-90, 90] deg, white (1.0, glare) with p 0.5 else black (dust), drawn once per batch and applied to every image in it | `--occlusion-*`, `--occlusion-angle`, `--occlusion-bright-prob/-value` | boxes per batch and 0.15-0.40 since 2026-09-10 (was per image, 0.05-0.20); rotation and bright boxes since 2026-09-11 |
+| occlusion (cutout) | 2 boxes, each with p 0.5, edges 0.15 to 0.40 of the image, rotated about the centre by an angle in [-90, 90] deg, white (1.0, glare) with p 0.5 else black (dust), drawn once per batch and applied to every image in it | `--occlusion-*`, `--occlusion-angle`, `--occlusion-bright-prob/-value` | boxes per batch and 0.15-0.40 since 2026-09-10 (was per image, 0.05-0.20); rotation and bright boxes since 2026-09-10 |
 | affine | off | `--affine-*` | never on; a translation resembles a different tilt |
 
 The run names encode which recipe each run used (section 1). A rerun of
@@ -229,7 +233,7 @@ Frames are quantized to 8 bit. The SSIM stop test uses the clean frame unless
 2x50 boxes white (`_bright`), rotated in [-45, 45] deg (`_rot`) or both (`_rotbright`);
 `occlusion_2_mixed` (2 boxes of 0.15-0.40, rotated in [-90, 90], white with p 0.5: the
 training occlusion with every box applied); `combined` (the training augmentation before
-2026-09-11) and `combined_harsh` (noise 0.2, brightness 0.6, 2 boxes of 30%). Eval flags:
+2026-09-10) and `combined_harsh` (noise 0.2, brightness 0.6, 2 boxes of 30%). Eval flags:
 `--occlusion-angle A`, `--occlusion-bright-prob P`, `--occlusion-bright-value V`; the new
 draws come after the box geometry, so conditions without them are unchanged.
 Seed 0, so every model gets the same per-start draws. Clean-frame SSIM stop test.
@@ -244,31 +248,76 @@ Checked locally on the clean 0.1 grid: r256 on `dark512` with `--model-resolutio
 0.016 against 100% / 1.10 / 0.014 on `dark64` (remaining differences: JPEG re-encoding of
 the small banks, and the stop test on the 512 frame instead of the small one).
 
-Earlier 13-condition results, each model on its own bank (3854472 and 3866737 on `dark512`,
-3867169 on `dark256`), 2320 starts on the 0.1 deg grid. Each cell is success / mean
-adjustments (converged starts) / mean angular error in deg (all starts).
+Results of 2026-09-10: 8 models x 39 conditions, 2320 starts each on the 0.1 deg grid,
+every model on `dark512` frames with `--model-resolution` (`cluster/eval_sweep_l40s.slurm`;
+per-model tables in `runs/<name>/sweep/`, the ten rotated/bright rows for the first five
+models in `runs/<name>/sweep_occ/`; merged locally in `eval_results/compare_sweep512_all.md`).
+Each cell is success / mean adjustments (converged starts) / mean final angular error in deg
+(all starts). The earlier 13-condition runs on each model's own bank agree with these rows.
 
-| condition | r512_occ05-20img_n10_e96_3854472 | r512_ft_occ15-40img_n10_e49_3866737 | r256_occ15-40batch_n00-20_e98_3867169 |
-|---|---|---|---|
-| clean | 100% / 1.14 / 0.027 | 100% / 1.11 / 0.026 | 100% / 1.03 / 0.011 |
-| noise 0.05 | 100% / 1.05 / 0.023 | 100% / 1.04 / 0.016 | 100% / 1.04 / 0.011 |
-| noise 0.10 | 100% / 1.03 / 0.018 | 100% / 1.02 / 0.010 | 100% / 1.05 / 0.012 |
-| noise 0.20 | 100% / 2.14 / 0.047 | 100% / 1.72 / 0.038 | 100% / 1.08 / 0.015 |
-| brightness 0.6 | 100% / 1.42 / 0.037 | 100% / 1.98 (max 7) / 0.055 | 100% / 1.04 / 0.013 |
-| brightness 0.8 | 100% / 1.22 / 0.028 | 100% / 1.22 / 0.033 | 100% / 1.03 / 0.011 |
-| brightness 1.2 | 100% / 1.11 / 0.027 | 100% / 1.07 / 0.022 | 100% / 1.03 / 0.011 |
-| brightness 1.4 | 100% / 1.09 / 0.026 | 100% / 1.06 / 0.021 | 100% / 1.03 / 0.012 |
-| contrast 0.9 | 100% / 1.09 / 0.024 | 100% / 1.10 / 0.025 | 100% / 1.03 / 0.011 |
-| contrast 1.1 | 100% / 1.20 / 0.028 | 100% / 1.11 / 0.026 | 100% / 1.03 / 0.011 |
-| occlusion 1 box | 93.0% / 1.34 / 0.042 | 99.7% / 1.16 / 0.030 | 100% / 1.05 / 0.015 |
-| occlusion 2 boxes | 82.1% / 1.53 (max 9) / 0.065 (max 0.79) | 98.3% / 1.23 (max 8) / 0.036 (max 0.46) | 99.8% / 1.09 (max 3) / 0.018 (max 0.09) |
-| combined (training augmentation at eval) | 89.4% / 1.47 (max 10) / 0.050 | 99.96% / 1.06 (max 9) / 0.019 | 99.9% / 1.13 (max 8) / 0.019 |
+| condition | r512_occ05-20img_n10_e96_3854472 | r512_ft_occ15-40img_n10_e49_3866737 | r512_occ15-40img_n00-20_e96_3866805 | r256_occ15-40batch_n00-20_e98_3867169 | r64_occ15-40batch_n00-20_e98_local | r256_occ15-40batch-rot90-bri50_n00-20_e98_3870306 | r128_occ15-40batch-rot90-bri50_n00-20_e98_3870308 | r64_occ15-40batch-rot90-bri50_n00-20_e98_3870310 |
+|---|---|---|---|---|---|---|---|---|
+| clean | 100% / 1.14 / 0.027 | 100% / 1.11 / 0.026 | 100% / 1.01 / 0.011 | 100% / 1.02 / 0.012 | 100% / 1.05 / 0.016 | 100% / 1.02 / 0.012 | 100% / 1.03 / 0.012 | 100% / 1.06 / 0.020 |
+| noise_0.02 | 100% / 1.11 / 0.026 | 100% / 1.05 / 0.019 | 100% / 1.02 / 0.010 | 100% / 1.02 / 0.011 | 100% / 1.05 / 0.016 | 100% / 1.03 / 0.012 | 100% / 1.03 / 0.012 | 100% / 1.07 / 0.020 |
+| noise_0.05 | 100% / 1.06 / 0.023 | 100% / 1.04 / 0.016 | 100% / 1.02 / 0.011 | 100% / 1.03 / 0.011 | 100% / 1.05 / 0.018 | 100% / 1.03 / 0.012 | 100% / 1.04 / 0.013 | 100% / 1.08 / 0.020 |
+| noise_0.10 | 100% / 1.03 / 0.018 | 100% / 1.02 / 0.010 | 100% / 1.02 / 0.012 | 100% / 1.03 / 0.013 | 100% / 1.08 / 0.021 | 100% / 1.04 / 0.014 | 100% / 1.04 / 0.014 | 100% / 1.09 / 0.022 |
+| noise_0.15 | 100% / 1.48 / 0.030 | 100% / 1.12 / 0.022 | 100% / 1.03 / 0.013 | 100% / 1.06 / 0.018 | 100% / 1.11 / 0.024 | 100% / 1.05 / 0.015 | 100% / 1.05 / 0.015 | 100% / 1.11 / 0.023 |
+| noise_0.20 | 100% / 2.13 / 0.046 | 100% / 1.72 / 0.038 | 100% / 1.04 / 0.015 | 100% / 1.13 / 0.024 | 100% / 1.15 / 0.025 | 100% / 1.06 / 0.017 | 100% / 1.06 / 0.017 | 100% / 1.13 / 0.026 |
+| noise_0.30 | 17.80% / 4.82 / 1.271 | 0.52% / 1.42 / 2.902 | 100% / 1.11 / 0.025 | 100% / 1.40 / 0.025 | 100% / 1.31 / 0.034 | 100% / 1.14 / 0.025 | 100% / 1.10 / 0.020 | 100% / 1.21 / 0.035 |
+| brightness_0.4 | 33.41% / 1.75 / 0.141 | 12.93% / 1.11 / 0.204 | 100% / 1.47 / 0.021 | 100% / 1.23 / 0.026 | 100% / 1.24 / 0.030 | 100% / 1.29 / 0.023 | 100% / 1.23 / 0.024 | 100% / 1.51 / 0.043 |
+| brightness_0.6 | 100% / 1.42 / 0.037 | 100% / 1.98 / 0.055 | 100% / 1.02 / 0.012 | 100% / 1.03 / 0.014 | 100% / 1.07 / 0.019 | 100% / 1.04 / 0.017 | 100% / 1.05 / 0.015 | 100% / 1.13 / 0.026 |
+| brightness_0.8 | 100% / 1.22 / 0.028 | 100% / 1.22 / 0.033 | 100% / 1.02 / 0.011 | 100% / 1.02 / 0.012 | 100% / 1.05 / 0.016 | 100% / 1.03 / 0.012 | 100% / 1.03 / 0.012 | 100% / 1.07 / 0.021 |
+| brightness_1.2 | 100% / 1.11 / 0.027 | 100% / 1.07 / 0.022 | 100% / 1.02 / 0.011 | 100% / 1.02 / 0.012 | 100% / 1.05 / 0.016 | 100% / 1.02 / 0.013 | 100% / 1.03 / 0.012 | 100% / 1.06 / 0.020 |
+| brightness_1.4 | 100% / 1.09 / 0.026 | 100% / 1.06 / 0.021 | 100% / 1.02 / 0.012 | 100% / 1.02 / 0.013 | 100% / 1.05 / 0.018 | 100% / 1.03 / 0.013 | 100% / 1.03 / 0.013 | 100% / 1.07 / 0.020 |
+| brightness_1.6 | 100% / 1.14 / 0.027 | 100% / 1.07 / 0.021 | 100% / 1.03 / 0.016 | 100% / 1.03 / 0.015 | 100% / 1.07 / 0.021 | 100% / 1.03 / 0.015 | 100% / 1.04 / 0.015 | 100% / 1.08 / 0.022 |
+| contrast_0.9 | 100% / 1.09 / 0.024 | 100% / 1.10 / 0.025 | 100% / 1.02 / 0.011 | 100% / 1.02 / 0.011 | 100% / 1.05 / 0.016 | 100% / 1.02 / 0.012 | 100% / 1.03 / 0.012 | 100% / 1.07 / 0.021 |
+| contrast_1.1 | 100% / 1.20 / 0.028 | 100% / 1.11 / 0.026 | 100% / 1.02 / 0.011 | 100% / 1.02 / 0.011 | 100% / 1.05 / 0.016 | 100% / 1.02 / 0.013 | 100% / 1.03 / 0.012 | 100% / 1.06 / 0.020 |
+| occlusion_1 | 93.02% / 1.34 / 0.042 | 99.66% / 1.16 / 0.030 | 100% / 1.03 / 0.016 | 100% / 1.03 / 0.016 | 100% / 1.08 / 0.020 | 100% / 1.06 / 0.017 | 100% / 1.06 / 0.016 | 100% / 1.12 / 0.024 |
+| occlusion_2 | 82.11% / 1.54 / 0.065 | 98.32% / 1.23 / 0.036 | 100% / 1.05 / 0.020 | 100% / 1.06 / 0.019 | 100% / 1.13 / 0.024 | 99.87% / 1.10 / 0.021 | 100% / 1.08 / 0.019 | 99.87% / 1.19 / 0.028 |
+| occlusion_1x10 | 100% / 1.15 / 0.028 | 100% / 1.12 / 0.026 | 100% / 1.02 / 0.012 | 100% / 1.02 / 0.012 | 100% / 1.06 / 0.017 | 100% / 1.03 / 0.013 | 100% / 1.03 / 0.013 | 100% / 1.08 / 0.021 |
+| occlusion_1x20 | 99.74% / 1.21 / 0.031 | 100% / 1.13 / 0.028 | 100% / 1.02 / 0.014 | 100% / 1.03 / 0.014 | 100% / 1.07 / 0.018 | 100% / 1.04 / 0.015 | 100% / 1.04 / 0.014 | 100% / 1.09 / 0.023 |
+| occlusion_1x30 | 92.59% / 1.46 / 0.043 | 99.57% / 1.18 / 0.031 | 100% / 1.03 / 0.016 | 100% / 1.04 / 0.016 | 100% / 1.08 / 0.021 | 100% / 1.06 / 0.018 | 100% / 1.06 / 0.016 | 100% / 1.13 / 0.024 |
+| occlusion_1x40 | 66.94% / 1.60 / 0.099 | 96.03% / 1.28 / 0.041 | 100% / 1.06 / 0.020 | 100% / 1.07 / 0.021 | 100% / 1.14 / 0.024 | 99.96% / 1.11 / 0.023 | 100% / 1.09 / 0.019 | 99.83% / 1.20 / 0.028 |
+| occlusion_1x50 | 43.53% / 1.91 / 0.218 | 76.94% / 1.39 / 0.084 | 95.95% / 1.20 / 0.034 | 98.71% / 1.17 / 0.028 | 99.31% / 1.26 / 0.029 | 97.07% / 1.21 / 0.032 | 100% / 1.19 / 0.024 | 98.53% / 1.42 / 0.033 |
+| occlusion_2x10 | 99.96% / 1.15 / 0.028 | 100% / 1.12 / 0.027 | 100% / 1.02 / 0.012 | 100% / 1.03 / 0.013 | 100% / 1.07 / 0.018 | 100% / 1.03 / 0.014 | 100% / 1.04 / 0.014 | 100% / 1.09 / 0.022 |
+| occlusion_2x20 | 98.75% / 1.30 / 0.034 | 100% / 1.15 / 0.030 | 100% / 1.03 / 0.016 | 100% / 1.04 / 0.016 | 100% / 1.09 / 0.021 | 100% / 1.06 / 0.018 | 100% / 1.05 / 0.016 | 100% / 1.13 / 0.025 |
+| occlusion_2x30 | 77.89% / 1.73 / 0.071 | 98.02% / 1.25 / 0.038 | 99.91% / 1.06 / 0.021 | 100% / 1.07 / 0.020 | 100% / 1.15 / 0.025 | 99.96% / 1.11 / 0.023 | 100% / 1.10 / 0.020 | 99.96% / 1.22 / 0.028 |
+| occlusion_2x40 | 40.00% / 1.98 / 0.192 | 81.64% / 1.43 / 0.073 | 98.02% / 1.20 / 0.032 | 98.66% / 1.19 / 0.029 | 99.48% / 1.30 / 0.031 | 97.16% / 1.27 / 0.033 | 99.66% / 1.22 / 0.026 | 97.72% / 1.40 / 0.038 |
+| occlusion_2x50 | 21.12% / 2.66 / 0.379 | 47.46% / 1.76 / 0.193 | 78.41% / 1.54 / 0.088 | 87.11% / 1.44 / 0.064 | 92.16% / 1.55 / 0.051 | 82.41% / 1.52 / 0.076 | 90.99% / 1.49 / 0.049 | 85.22% / 1.79 / 0.079 |
+| combined | 89.57% / 1.44 / 0.050 | 100% / 1.06 / 0.019 | 99.91% / 1.07 / 0.020 | 100% / 1.08 / 0.021 | 99.96% / 1.19 / 0.027 | 99.96% / 1.12 / 0.023 | 100% / 1.11 / 0.021 | 99.27% / 1.26 / 0.031 |
+| combined_harsh | 20.00% / 3.88 / 0.253 | 45.43% / 3.26 / 0.167 | 99.91% / 1.20 / 0.029 | 99.91% / 1.38 / 0.032 | 83.41% / 1.66 / 0.067 | 99.74% / 1.38 / 0.031 | 99.91% / 1.27 / 0.030 | 63.75% / 1.52 / 0.101 |
+| occlusion_1x30_bright | 0.69% / 2.25 / 1.216 | 0.69% / 2.06 / 1.370 | 1.25% / 3.10 / 1.226 | 0.47% / 1.36 / 1.229 | 7.63% / 3.93 / 1.191 | 98.97% / 1.09 / 0.023 | 99.96% / 1.08 / 0.019 | 99.01% / 1.24 / 0.032 |
+| occlusion_2x30_bright | 0.30% / 2.57 / 1.677 | 0.56% / 2.08 / 1.811 | 0.78% / 3.56 / 1.659 | 0.43% / 3.90 / 1.829 | 1.64% / 3.92 / 1.848 | 96.85% / 1.21 / 0.034 | 98.66% / 1.16 / 0.027 | 88.79% / 1.46 / 0.054 |
+| occlusion_2x50_bright | 0.30% / 2.14 / 2.504 | 0.43% / 3.10 / 2.448 | 0.43% / 2.60 / 2.317 | 0.30% / 2.71 / 2.390 | 0.60% / 1.86 / 2.439 | 31.68% / 2.53 / 0.330 | 70.34% / 1.55 / 0.201 | 15.82% / 3.46 / 0.963 |
+| occlusion_1x30_rot | 92.80% / 1.49 / 0.043 | 99.18% / 1.21 / 0.032 | 100% / 1.05 / 0.017 | 100% / 1.04 / 0.016 | 100% / 1.09 / 0.021 | 100% / 1.05 / 0.018 | 100% / 1.06 / 0.016 | 100% / 1.12 / 0.025 |
+| occlusion_2x30_rot | 77.41% / 1.73 / 0.071 | 97.16% / 1.31 / 0.040 | 99.66% / 1.12 / 0.023 | 100% / 1.08 / 0.021 | 100% / 1.16 / 0.025 | 99.91% / 1.10 / 0.023 | 100% / 1.08 / 0.021 | 99.78% / 1.20 / 0.028 |
+| occlusion_2x50_rot | 21.85% / 2.53 / 0.346 | 49.35% / 1.95 / 0.182 | 77.24% / 1.64 / 0.087 | 86.90% / 1.48 / 0.064 | 92.16% / 1.61 / 0.049 | 83.23% / 1.50 / 0.067 | 92.16% / 1.45 / 0.045 | 86.64% / 1.75 / 0.068 |
+| occlusion_1x30_rotbright | 0.34% / 2.00 / 1.437 | 0.82% / 2.58 / 1.372 | 0.73% / 3.53 / 1.522 | 0.69% / 2.69 / 1.380 | 5.22% / 4.18 / 1.329 | 99.96% / 1.07 / 0.020 | 99.96% / 1.06 / 0.018 | 99.35% / 1.20 / 0.030 |
+| occlusion_2x30_rotbright | 0.26% / 2.00 / 1.901 | 0.52% / 4.08 / 1.857 | 0.43% / 3.60 / 2.002 | 0.43% / 3.10 / 1.897 | 1.16% / 3.00 / 1.945 | 99.35% / 1.16 / 0.028 | 99.70% / 1.13 / 0.024 | 94.05% / 1.38 / 0.043 |
+| occlusion_2x50_rotbright | 0.22% / 1.80 / 2.391 | 0.34% / 2.62 / 2.417 | 0.13% / 2.33 / 2.438 | 0.09% / 0.50 / 2.399 | 0.65% / 2.73 / 2.456 | 34.48% / 2.55 / 0.276 | 74.18% / 1.53 / 0.114 | 20.43% / 3.48 / 0.707 |
+| occlusion_2_mixed | 21.51% / 1.58 / 1.107 | 25.26% / 1.28 / 1.055 | 26.12% / 1.20 / 1.170 | 26.25% / 1.14 / 0.972 | 30.82% / 1.59 / 1.032 | 99.35% / 1.12 / 0.023 | 99.87% / 1.09 / 0.021 | 97.93% / 1.25 / 0.035 |
 
-For 3854472 occlusion is what breaks the loop; light noise, brightness and contrast are
-absorbed. Fine-tuning with the larger boxes (3866737) recovers most of it (2 boxes 82.1% to
-98.3%, combined 89.4% to 99.96%) at the cost of brightness 0.6 (1.42 to 1.98 adjustments).
-The 256 px model is flat across every condition, including noise 0.20 and brightness 0.6,
-with the per-batch occlusion recipe; resolution and recipe are confounded. With
+Findings:
+
+- The 512 px failures come from the recipe, not the resolution. r512_occ15-40img_n00-20
+  (noise range, 0.15-0.40 boxes) stays at 100% for noise 0.30, brightness 0.4 and
+  combined_harsh, like the 256 px run, and has the lowest clean error (0.011 deg); it trails
+  256 only on 50% boxes (1 box 96.0 vs 98.7%, 2 boxes 78.4 vs 87.1%). The fixed-noise
+  runs (3854472 and its fine-tune) fail at noise 0.30 and brightness 0.4.
+- Rotation alone changes nothing: rotated boxes score within about 1% of the same boxes
+  axis-aligned, for every model.
+- Without bright boxes in training every model fails glare: at most 7.6% success with one
+  30% bright box, final errors 1.2 to 2.5 deg.
+- The rot90-bri50 runs handle it: one or two 30% bright boxes 89 to 100%, occlusion_2_mixed
+  98 to 100%, with dark-box, noise and brightness rows at the level of the earlier 256 px
+  run. At 64 px the cost is visible: combined_harsh 63.8% (earlier 64 px run 83.4%), clean
+  error 0.020 deg (0.016).
+- Among the rot90-bri50 runs, 128 px is best or tied on nearly every row: clean 0.012 deg as
+  at 256, noise 0.30 1.10 adjustments / 0.020 deg, 1 box of 50% 100%, 2 boxes of 50% 91.0%
+  (256: 82.4%, 64: 85.2%), 2 bright 50% boxes 70.3% (256: 31.7%, 64: 15.8%). One seed each.
+- Two 50% boxes, bright or rotated-bright, remain the failure case for every model.
+
+With
 `--perturb-ssim`, noise sigma 0.1 alone pins the SSIM near 0.1, so the stop test never
 fires although the final error stays small: SSIM is too noise-sensitive to serve as a
 convergence test on noisy frames, which is relevant for the hardware too.
@@ -287,9 +336,11 @@ convergence test on noisy frames, which is relevant for the hardware too.
   default. Section 3 says how to reproduce its recipe.
 - All eval starts are seen positions (section 2). There is no held-out set off the
   training grid.
-- The 256 px result has been evaluated only against the 256 px bank and only offline.
-  `TiltPredictor` on the Pi still preprocesses to 512; deploying a 256 model needs the
-  resize in `config.py` / `app/` changed to match.
+- The 256, 128 and 64 px models have been evaluated only offline. `TiltPredictor` on the Pi
+  still preprocesses to 512; deploying one needs the resize in `config.py` / `app/` changed
+  to match (box average by the integer factor, as in `--model-resolution`).
+- One training seed per recipe. Differences of a few percent on the hardest occlusion
+  conditions may be run-to-run variation.
 - `--compile` is untested on the L40S.
 - `torch.nn.functional.interpolate(mode="area")` (adaptive average pooling) on CUDA, torch
   2.14, returns the first image for every row when the batch was built as
@@ -304,14 +355,11 @@ convergence test on noisy frames, which is relevant for the hardware too.
 
 ## 7. Next steps
 
-- When 3866805 finishes, compare the four runs on `eval/*` and `eval_val/*` in W&B and
-  in `runs/<job>/eval*/summary.json`: does the noise range help, does per-batch occlusion
-  (3867169 only, confounded with 256 px) help. Run `utils/eval_sweep.py` on each checkpoint
-  for the robustness table; it is the metric that separates them, since clean-frame numbers
-  are all near 100%.
-- Decide on 256 px. If the offline gain holds up, retrain at 256 with the 3854472 recipe
-  for a clean A/B, then check inference time and RAM on the Pi, which is where 256 should
-  pay off most (the README's int8 plan is the other lever there).
+- Resolution: with the rotated and bright box recipe, 128 px is best or tied on the sweep
+  (section 5) with a quarter of 256's pixels. Repeat 128 and 256 with another seed before
+  deciding, then check inference time and RAM on the Pi (the README's int8 plan is the other
+  lever there).
+- Two bright boxes of 50% edge remain the failure case (16 to 74% success).
 - Fine-tuning used the full lr 2.8e-3 with the same restart schedule; a lower lr
   (`EXTRA_ARGS="--lr 0.001"`) is untried.
 - If runs need to be faster at 512 px, the L40S is compute-bound at batch 512, so the
