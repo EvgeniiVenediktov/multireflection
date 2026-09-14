@@ -242,7 +242,7 @@ eval mode, by 2.7× instead of 550×.
 ## 8. Figures per model
 
 - **Heatmaps:** the clean grid closed loop over all 2,320 starts, with TEST regions outlined in
-  green and VALIDATION regions in orange. Neither region shows up as a worse area.
+  cyan and VALIDATION regions in orange. Neither region shows up as a worse area.
 - **Noise curve:** closed-loop final error vs σ with success rate, over 10 evaluation seeds.
 
 ### 64 px ResNet

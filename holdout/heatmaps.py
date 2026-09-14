@@ -45,13 +45,13 @@ import matplotlib.ticker
 
 TRAIN, VAL, TEST = 0, 1, 2
 SPLIT_CODE = {"train": TRAIN, "val": VAL, "test": TEST}
-SPLIT_COLORS = {"train": "#4C72B0", "val": "#DD8452", "test": "#55A868"}
+SPLIT_COLORS = {"train": "#4C72B0", "val": "#FF6D00", "test": "#00FFFF"}
 GROUP_ORDER = ["train", "val", "test"]
 # display only; the CSV and stdout keep the short group names
 GROUP_LABELS = {"train": "train", "val": "validation", "test": "test"}
 
 # split map hues, saturated: the muted fills blend into viridis when drawn as thin lines
-TEST_OUTLINE_COLOR = "#00C853"
+TEST_OUTLINE_COLOR = "#00FFFF"
 VAL_OUTLINE_COLOR = "#FF6D00"
 NOT_CONVERGED_COLOR = "#FF3B30"
 

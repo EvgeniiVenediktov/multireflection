@@ -43,5 +43,13 @@
   "eval_dir": "eval_results/mlp_r128_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881608_sweep10",
   "train_summary": "eval_results/mlp_r128_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881608_holdout_test/train_summary.json",
   "wandb_run": "l40s-3881608"
+ },
+ {
+  "label": "mlp256",
+  "checkpoint": "saved_models/real/mlp_r256_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3943793.pth",
+  "resolution": 256,
+  "split": "holdout",
+  "eval_dir": "eval_results/mlp_r256_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3943793_sweep10",
+  "train_summary": "eval_results/mlp_r256_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3943793_eval_grid/train_summary.json"
  }
 ]

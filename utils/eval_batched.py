@@ -73,7 +73,7 @@ from app.inference import model_from_state_dict, evaluate_position  # noqa: E402
 
 DEFAULT_CHECKPOINT = REPO_ROOT / "saved_models" / "real" / "r512_occ05-20img_n10_e96_3854472.pth"
 DEFAULT_DATA_DIR = "/mnt/h/dark512"
-PERTURB_KEYS = ("brightness", "brightness_fixed", "contrast", "contrast_fixed", "noise", "noise_min",
+PERTURB_KEYS = ("brightness", "brightness_fixed", "contrast", "contrast_fixed", "blur", "noise", "noise_min",
                 "occlusion_count", "occlusion_min", "occlusion_max", "occlusion_prob", "perturb_ssim",
                 "perturb_seed")
 
@@ -170,6 +170,7 @@ class Perturbation:
         self.brightness_fixed = args.brightness_fixed
         self.contrast = args.contrast
         self.contrast_fixed = args.contrast_fixed
+        self.blur = getattr(args, "blur", 0) or 0
         self.noise = args.noise or 0.0
         self.noise_min = args.noise_min if self.noise > 0 else None
         self.occlusion_count = args.occlusion_count
@@ -187,9 +188,11 @@ class Perturbation:
         self.ssim = bool(args.perturb_ssim)
         self.use_brightness = bool(self.brightness) or self.brightness_fixed is not None
         self.use_contrast = bool(self.contrast) or self.contrast_fixed is not None
+        self.use_blur = self.blur > 1
         self.use_noise = self.noise > 0
         self.use_occlusion = self.occlusion_count > 0 and self.occlusion_prob > 0
-        self.enabled = self.use_brightness or self.use_contrast or self.use_noise or self.use_occlusion
+        self.enabled = (self.use_brightness or self.use_contrast or self.use_blur or self.use_noise
+                        or self.use_occlusion)
 
         H, W = image_shape
         K = max(self.occlusion_count, 0)
@@ -245,6 +248,7 @@ class Perturbation:
             "brightness_fixed": self.brightness_fixed,
             "contrast": self.contrast,
             "contrast_fixed": self.contrast_fixed,
+            "blur": self.blur if self.use_blur else None,
             "noise": self.noise if self.use_noise else None,
             "noise_min": self.noise_min,
             "occlusion_count": self.occlusion_count,
@@ -270,6 +274,8 @@ class Perturbation:
             parts.append(f"contrast factor {self.contrast_fixed}")
         elif self.contrast is not None:
             parts.append(f"contrast factor in [{max(0.0, 1 - self.contrast):g}, {1 + self.contrast:g}] per trajectory")
+        if self.use_blur:
+            parts.append(f"{self.blur}x{self.blur} box blur before the other perturbations")
         if self.use_noise:
             if self.noise_min is not None:
                 parts.append(f"noise sigma in [{self.noise_min:g}, {self.noise:g}] per trajectory, re-drawn per step")
@@ -294,6 +300,11 @@ class Perturbation:
         idx_list = [int(i) for i in idx]
         steps = [0] * len(idx_list) if steps is None else [int(t) for t in steps]
         idx = torch.as_tensor(idx_list, device=self.device, dtype=torch.long)
+        if self.use_blur:
+            # Box blur of the captured frame, before anything else touches it. Edge pixels average
+            # only real pixels (count_include_pad=False), so the border does not darken.
+            x = torch.nn.functional.avg_pool2d(x, self.blur, stride=1, padding=self.blur // 2,
+                                               count_include_pad=False)
         if self.use_brightness:
             x = (x * self.bright[idx].view(-1, 1, 1, 1)).clamp_(0.0, 1.0)
         if self.use_contrast:
@@ -721,6 +732,9 @@ def parse_args(argv=None):
     c.add_argument("--contrast", type=float, default=None,
                    help="per-trajectory contrast factor drawn once in [1-C, 1+C]")
     c.add_argument("--contrast-fixed", type=float, default=None, help="contrast factor F for every trajectory")
+    q.add_argument("--blur", type=int, default=0,
+                   help="box blur of this odd kernel size, applied to the frame before every other "
+                        "perturbation (0: off)")
     q.add_argument("--noise", type=float, default=None, help="additive Gaussian noise sigma (in [0, 1] units), re-drawn per step")
     q.add_argument("--noise-min", type=float, default=None,
                    help="with --noise S: sigma drawn once per trajectory in [min, S]")
@@ -745,6 +759,8 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.noise_min is not None and (args.noise is None or args.noise_min >= args.noise):
         p.error("--noise-min needs --noise S with min < S")
+    if args.blur and (args.blur < 3 or args.blur % 2 == 0):
+        p.error("--blur needs an odd kernel size >= 3")
     for name in ("brightness", "brightness_fixed", "contrast", "contrast_fixed", "noise"):
         v = getattr(args, name)
         if v is not None and v < 0:
