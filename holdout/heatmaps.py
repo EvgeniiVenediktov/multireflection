@@ -3,16 +3,16 @@
 Combines holdout/make_split.py's split.csv with a utils/eval_batched.py trace.csv
 (a closed-loop replay over a start grid) to answer: how does the model do on
 starts whose own position falls in TRAIN vs VAL vs TEST, and are the TEST/VAL
-holes visible as worse regions in the corrections heatmap?
+regions visible as worse areas in the corrections heatmap?
 
 Outputs (in --out-dir):
   split_map.png            train/val/test over the position grid (like
                             make_split.py's split_map.png, but with a custom
                             title and reimplemented here to avoid depending on
                             the bank-scanning parts of make_split.py)
-  corrections_heatmap.png  number of corrections per start, TEST/VAL hole
-                            outlines overlaid, non-converged starts marked,
-                            per-group stats in a text box
+  corrections_heatmap.png  number of corrections per start, TEST/VAL region
+                            outlines overlaid, non-converged starts marked
+                            (per-group statistics go to stdout and the CSV)
   angular_error_heatmap.png  (only with --also-error) same overlay, final
                             angular error instead of corrections
   corrections_by_split.csv   group, starts, success_rate, adjustments_mean,
@@ -26,7 +26,6 @@ Run from the repository root, e.g.:
     python holdout/heatmaps.py \\
         --split /home/evv/data/holdout_split/split.csv \\
         --trace eval_results/<run>_eval_grid/trace.csv \\
-        --origins /home/evv/data/holdout_split/closed_loop_origins.txt \\
         --title "<run name>" \\
         --out-dir eval_results/<run>_eval_grid
 """
@@ -48,10 +47,12 @@ TRAIN, VAL, TEST = 0, 1, 2
 SPLIT_CODE = {"train": TRAIN, "val": VAL, "test": TEST}
 SPLIT_COLORS = {"train": "#4C72B0", "val": "#DD8452", "test": "#55A868"}
 GROUP_ORDER = ["train", "val", "test"]
+# display only; the CSV and stdout keep the short group names
+GROUP_LABELS = {"train": "train", "val": "validation", "test": "test"}
 
-# distinct from SPLIT_COLORS so hole outlines read clearly on top of viridis
-TEST_OUTLINE_COLOR = "#FF3B30"
-VAL_OUTLINE_COLOR = "#FFD60A"
+# split map hues, saturated: the muted fills blend into viridis when drawn as thin lines
+TEST_OUTLINE_COLOR = "#00C853"
+VAL_OUTLINE_COLOR = "#FF6D00"
 NOT_CONVERGED_COLOR = "#FF3B30"
 
 
@@ -85,22 +86,6 @@ def split_of(grid, ix_min, ix_max, iy_min, iy_max, x_deg, y_deg):
     if not (ix_min <= ix <= ix_max and iy_min <= iy <= iy_max):
         return None
     return int(grid[ix - ix_min, iy - iy_min])
-
-
-def load_origins(path):
-    """Origin (x, y) pairs from a closed_loop_origins.txt-style file of x{X}_y{Y}.jpg names."""
-    xs, ys = [], []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.endswith(".jpg"):
-                line = line[:-4]
-            xpart, ypart = line.split("_y")
-            xs.append(float(xpart[1:]))
-            ys.append(float(ypart))
-    return xs, ys
 
 
 def load_trace_finals(path):
@@ -151,7 +136,7 @@ def save_tight(fig, out_path):
     plt.close(fig)
 
 
-def plot_split_map(grid, ix_min, ix_max, iy_min, iy_max, origins, title, out_path):
+def plot_split_map(grid, ix_min, ix_max, iy_min, iy_max, title, out_path):
     extent = split_extent(ix_min, ix_max, iy_min, iy_max)
     cmap = matplotlib.colors.ListedColormap([SPLIT_COLORS["train"], SPLIT_COLORS["val"], SPLIT_COLORS["test"]])
     counts = {name: int(np.sum(grid == code)) for name, code in SPLIT_CODE.items()}
@@ -159,15 +144,13 @@ def plot_split_map(grid, ix_min, ix_max, iy_min, iy_max, origins, title, out_pat
     fig, ax = plt.subplots(figsize=(6.4, 4.6))
     ax.imshow(grid.T, origin="lower", extent=extent, cmap=cmap, vmin=0, vmax=2,
               aspect="equal", interpolation="nearest")
-    handles = [matplotlib.patches.Patch(color=SPLIT_COLORS[name], label=f"{name} {100 * counts[name] / grid.size:.1f}%")
+    handles = [matplotlib.patches.Patch(color=SPLIT_COLORS[name],
+                                        label=f"{GROUP_LABELS[name]} {100 * counts[name] / grid.size:.1f}%")
                for name in GROUP_ORDER]
-    if origins is not None:
-        ox, oy = origins
-        handles.append(ax.scatter(ox, oy, s=8, c="black", marker="x", linewidths=0.8, label="origins"))
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
-    ax.set_xlabel("x (°)")
-    ax.set_ylabel("y (°)")
+    ax.set_xlabel("X origin (°)")
+    ax.set_ylabel("Y origin (°)")
     top_legend(ax, handles)
     if title:
         ax.set_title(title, pad=18, fontsize=10)
@@ -213,11 +196,16 @@ def stats_text(stats, sep="\n"):
     return sep.join(parts)
 
 
-def add_hole_overlay(ax, grid, ix_min, ix_max, iy_min, iy_max):
-    extent = split_extent(ix_min, ix_max, iy_min, iy_max)
+def add_region_overlay(ax, grid, ix_min, ix_max, iy_min, iy_max):
+    # Repeat the edge cells outward: a region that runs off the position grid keeps running,
+    # so the axes clip its outline at the border instead of leaving a gap there or closing it
+    # into a smaller square. PAD only has to exceed the gap between grid edge and axes limit.
+    pad = 10
+    extent = ((ix_min - 0.5 - pad) / 100, (ix_max + 0.5 + pad) / 100,
+              (iy_min - 0.5 - pad) / 100, (iy_max + 0.5 + pad) / 100)
     for code, color in ((TEST, TEST_OUTLINE_COLOR), (VAL, VAL_OUTLINE_COLOR)):
-        ax.contour((grid == code).T.astype(float), levels=[0.5], colors=color, linewidths=0.8,
-                   extent=extent, origin="lower")
+        mask = np.pad((grid == code).T.astype(float), pad, mode="edge")
+        ax.contour(mask, levels=[0.5], colors=color, linewidths=1.0, extent=extent, origin="lower")
 
 
 def plot_metric_heatmap(finals, grid, ix_min, ix_max, iy_min, iy_max, field, label, integer_ticks,
@@ -234,7 +222,7 @@ def plot_metric_heatmap(finals, grid, ix_min, ix_max, iy_min, iy_max, field, lab
 
     fig, ax = plt.subplots(figsize=(6.4, 4.6))
     im = ax.imshow(z, extent=extent, origin="lower", cmap="viridis", aspect="equal", interpolation="nearest")
-    add_hole_overlay(ax, grid, ix_min, ix_max, iy_min, iy_max)
+    add_region_overlay(ax, grid, ix_min, ix_max, iy_min, iy_max)
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
 
@@ -247,9 +235,9 @@ def plot_metric_heatmap(finals, grid, ix_min, ix_max, iy_min, iy_max, field, lab
     else:
         cbar.ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=6))
 
-    handles = [matplotlib.lines.Line2D([0], [0], color=TEST_OUTLINE_COLOR, lw=1.5, label="TEST hole"),
-               matplotlib.lines.Line2D([0], [0], color=VAL_OUTLINE_COLOR, lw=1.5, label="VAL hole")]
-    failed = [(x, y) for (x, y), d in finals.items() if not d["converged"]]
+    handles = [matplotlib.lines.Line2D([0], [0], color=TEST_OUTLINE_COLOR, lw=1.5, label="TEST region"),
+               matplotlib.lines.Line2D([0], [0], color=VAL_OUTLINE_COLOR, lw=1.5, label="VALIDATION region")]
+    failed =[(x, y) for (x, y), d in finals.items() if not d["converged"]]
     if failed:
         handles.append(ax.scatter(*zip(*failed), marker="x", s=20, c=NOT_CONVERGED_COLOR, linewidths=1.1,
                                   label=f"not converged ({len(failed)})"))
@@ -276,7 +264,6 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--split", required=True, help="split.csv from holdout/make_split.py")
     p.add_argument("--trace", required=True, help="trace.csv from utils/eval_batched.py")
-    p.add_argument("--origins", default=None, help="closed_loop_origins.txt, marked on the split map")
     p.add_argument("--title", default=None, help="optional short title (e.g. '128 px, hold-out'); none by default")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--also-error", action="store_true",
@@ -289,11 +276,10 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     grid, ix_min, ix_max, iy_min, iy_max = load_split_grid(args.split)
-    origins = load_origins(args.origins) if args.origins else None
     finals = load_trace_finals(args.trace)
     stats = group_stats(finals, grid, ix_min, ix_max, iy_min, iy_max)
 
-    plot_split_map(grid, ix_min, ix_max, iy_min, iy_max, origins, args.title,
+    plot_split_map(grid, ix_min, ix_max, iy_min, iy_max, args.title,
                    os.path.join(args.out_dir, "split_map.png"))
 
     plot_metric_heatmap(finals, grid, ix_min, ix_max, iy_min, iy_max, "t", "Number of corrections", True,

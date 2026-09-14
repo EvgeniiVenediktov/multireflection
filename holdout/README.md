@@ -11,7 +11,7 @@ python holdout/make_split.py --data-dir /home/evv/data/dark64 --out-dir /home/ev
 ```
 
 Integer grid indices ix = round(x * 100), iy = round(y * 100) from the bank listing: 572 x 400 =
-228,800 positions, x in [-2.00, 3.71], y in [-2.00, 1.99] (no y = +2.00 row). Chebyshev holes,
+228,800 positions, x in [-2.00, 3.71], y in [-2.00, 1.99] (no y = +2.00 row). Chebyshev regions,
 clipped at the edges:
 
 - TEST: max(|dx|, |dy|) <= 0.10 deg around each of the 108 Algorithm 2 origins (X in -2.0 ... 3.5,
@@ -29,7 +29,7 @@ clamped to 1.99; (0, 0) is TRAIN), `counts.json`, `split_map.png` (copy in this 
 
 ## Training and model selection
 
-Run names carry the split: `r<res>_..._e<epochs>_hold[_s<seed>]_<job>` for hole-trained runs,
+Run names carry the split: `r<res>_..._e<epochs>_hold[_s<seed>]_<job>` for region-trained runs,
 `..._e<epochs>_fullctl_<job>` for the full-data control; names without a marker are random-split runs.
 MLP runs (`--arch mlp`) prefix the name with `mlp_`, e.g. `mlp_r128_..._e98_hold_<job>`.
 The W&B name carries this from the start: the submit scripts pass `--split-tag hold` / `fullctl` to
@@ -40,20 +40,23 @@ trains on TRAIN, keeps the best-VAL checkpoint and records the selected epoch in
 `train_summary.json` and the W&B summary (`best_epoch`). TEST names are never passed to training.
 
 - `holdout/submit_64.sh` (on the cluster checkout): one training seed (0) per resolution on dark<RES> via
-  `cluster/train_l40s.slurm`, each followed by `cluster/holdout_test_l40s.slurm` (TEST evaluation
-  and closed-loop replay). `RES` and `SEEDS` override.
+  `cluster/train_l40s.slurm`, which also replays the clean closed loop over the 0.1 deg start grid.
+  `RES` and `SEEDS` override. The open-loop TEST evaluation is no longer queued after training.
 - `holdout/submit_control.sh`: the full-data control. Same recipe on TRAIN + VAL + TEST for a fixed
-  `EPOCHS` equal to the selected epoch of the hole-trained runs, `--save-last`; its closed-loop
+  `EPOCHS` equal to the selected epoch of the region-trained runs, `--save-last`; its closed-loop
   replay is the comparison. Its TEST numbers are not a hold-out result.
 
 Hardware closed loop (Algorithm 2): `app/eval.py` already starts from the same 108 origins
-(`EVAL_GRID_STEP = 0.5`); five runs with the hole-trained model and with the control.
+(`EVAL_GRID_STEP = 0.5`); five runs with the region-trained model and with the control.
 
 ## Offline TEST evaluation
 
 `holdout/eval_test.py` evaluates one checkpoint open-loop on every TEST position of the split:
 one prediction per TEST image, compared with the position in the file name. TEST frames are
 decoded once and reused for all conditions and seeds.
+
+This surface, and the nearest-neighbour baseline below, were dropped from
+`reports/holdout_resolution_study.md` and from the pipeline; the script still runs on request.
 
 ```
 python holdout/eval_test.py --checkpoint runs/<name>/<name>.pth --model-resolution 256 \
@@ -71,7 +74,7 @@ python holdout/eval_test.py --checkpoint runs/<name>/<name>.pth --model-resoluti
 - Metrics per condition and seed: n, angular error mean/std/median/p95/max, signed per-axis mean
   and std, per-axis mean absolute error; aggregated over seeds as mean and std across seeds. The
   same per distance-to-TRAIN bucket (0.01 deg steps, 0.01 to 0.11).
-- Nearest-neighbour baseline (clean, `--nn`/`--no-nn`): label of the L2-nearest TRAIN image, TEST
+- Nearest-neighbour baseline (clean, off by default, `--nn` to run it): label of the L2-nearest TRAIN image, TEST
   and TRAIN both box-averaged from the bank's frames to `--nn-resolution` (default the model
   resolution) and quantized to 8 bit; float32 search on the GPU in chunks. TRAIN frames are reduced
   while loading (memory N_train x r x r). `--nn-test-samples` defaults to all TEST samples at
@@ -86,8 +89,9 @@ python holdout/eval_test.py --checkpoint runs/<name>/<name>.pth --model-resoluti
   conditions, NN baseline).
 
 Cluster: `cluster/holdout_test_l40s.slurm` (1 L40S, 16 CPUs, 64 GB) stages dark512 and runs
-eval_test.py. Knobs: `CKPT` (required), `MODEL_RES`, `SPLIT`, `OUT_DIR`, `EXTRA_ARGS`. With
-`CLOSED_LOOP=1` (default) it then runs the offline closed-loop replay `utils/eval_batched.py
+eval_test.py. It is not queued by the pipeline any more; submit it by hand when you want these
+numbers. Knobs: `CKPT` (required), `MODEL_RES`, `SPLIT`, `OUT_DIR`, `EXTRA_ARGS`. With
+`CLOSED_LOOP=1` (no longer the default) it then runs the offline closed-loop replay `utils/eval_batched.py
 --starts-file $ORIGINS` (default `closed_loop_origins.txt` of the split, 108 origins) once clean and
 once per condition in `CL_CONDITIONS` (default `occlusion_2x30,occlusion_2x30_rotbright,noise_0.20`,
 perturbation seed 0), writing to `$OUT_DIR/closed_loop/<condition>/`. `holdout/condition_flags.py
@@ -101,11 +105,12 @@ avg_pool2d + rounding differ by at most one gray level on about 1.4 percent of p
 
 ## Heatmaps
 
-`holdout/heatmaps.py --split split.csv --trace <eval_batched trace.csv over a start grid> [--origins
-closed_loop_origins.txt] --title "<run name>" --out-dir <dir> [--also-error]` overlays the spatial
-split on a closed-loop replay: `split_map.png` (train/val/test over the grid), `corrections_heatmap.png`
-(adjustments per start, TEST/VAL hole outlines, non-converged starts marked red, and a
-train/val/test stats box), optionally `angular_error_heatmap.png`, and `corrections_by_split.csv`.
+`holdout/heatmaps.py --split split.csv --trace <eval_batched trace.csv over a start grid>
+--title "<run name>" --out-dir <dir> [--also-error]` overlays the spatial split on a closed-loop
+replay: `split_map.png` (train/validation/test over the grid), `corrections_heatmap.png`
+(adjustments per start, TEST and VALIDATION region outlines, non-converged starts marked red),
+optionally `angular_error_heatmap.png`, and `corrections_by_split.csv` with the per-group stats,
+which also go to stdout. Origins are not marked on any of these figures.
 A start's group is the split of its own position, not of its trajectory. For a random-split
-checkpoint pass the same split.csv for reference and say so in `--title` (holes were not excluded
+checkpoint pass the same split.csv for reference and say so in `--title` (regions were not excluded
 from its training).

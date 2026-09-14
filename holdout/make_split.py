@@ -30,7 +30,7 @@ Outputs (in --out-dir):
                            utils/eval_batched.py --starts-file
   counts.json              grid shape, per-split counts/percentages, hole
                            counts, clamped-origin count, distance histograms
-  split_map.png            the grid colored by split, with origins marked
+  split_map.png            the grid colored by split
 
 Run from the repository root:
     python holdout/make_split.py
@@ -183,7 +183,7 @@ def histogram(dist_values, bucket=0.01):
     return {f"{edges[i]:.2f}-{edges[i + 1]:.2f}": int(c) for i, c in enumerate(counts) if c}
 
 
-def plot_split(split, dist, ix_min, ix_max, iy_min, iy_max, origins, out_path):
+def plot_split(split, dist, ix_min, ix_max, iy_min, iy_max, out_path):
     x_min, x_max = ix_min / 100, ix_max / 100
     y_min, y_max = iy_min / 100, iy_max / 100
     # split is [ix, iy]; imshow wants [row=y, col=x].
@@ -192,19 +192,12 @@ def plot_split(split, dist, ix_min, ix_max, iy_min, iy_max, origins, out_path):
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.imshow(img, origin="lower", extent=[x_min, x_max, y_min, y_max],
                cmap=cmap, vmin=0, vmax=2, aspect="equal")
-    ox = [o[0] / 100 for o in origins]
-    oy = [o[1] / 100 for o in origins]
-    origin_handle = ax.scatter(ox, oy, s=8, c="black", marker="x", linewidths=0.8, label="eval origins")
-    zero_handle = ax.scatter([0], [0], s=40, facecolors="none", edgecolors="black", linewidths=1.2,
-                              label="(0,0) origin (TRAIN)")
     handles = [
         matplotlib.patches.Patch(color="#4C72B0", label="train"),
-        matplotlib.patches.Patch(color="#DD8452", label="val"),
+        matplotlib.patches.Patch(color="#DD8452", label="validation"),
         matplotlib.patches.Patch(color="#55A868", label="test"),
-        origin_handle,
-        zero_handle,
     ]
-    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=5, fontsize=8)
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=3, fontsize=8)
     ax.set_xlabel("x (deg)")
     ax.set_ylabel("y (deg)")
     ax.set_title("Spatial train/val/test split")
@@ -277,7 +270,7 @@ def main():
     with open(os.path.join(args.out_dir, "counts.json"), "w") as f:
         json.dump(counts, f, indent=2)
 
-    plot_split(split, dist, ix_min, ix_max, iy_min, iy_max, origins,
+    plot_split(split, dist, ix_min, ix_max, iy_min, iy_max,
                os.path.join(args.out_dir, "split_map.png"))
 
     elapsed = time.perf_counter() - t0

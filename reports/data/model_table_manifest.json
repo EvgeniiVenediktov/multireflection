@@ -1,0 +1,47 @@
+[
+ {
+  "label": "r64",
+  "checkpoint": "saved_models/real/r64_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881600.pth",
+  "resolution": 64,
+  "split": "holdout",
+  "eval_dir": "eval_results/r64_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881600_sweep10",
+  "train_summary": "eval_results/r64_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881600_holdout_test/train_summary.json",
+  "wandb_run": "l40s-3881600"
+ },
+ {
+  "label": "r128",
+  "checkpoint": "saved_models/real/r128_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881604.pth",
+  "resolution": 128,
+  "split": "holdout",
+  "eval_dir": "eval_results/r128_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881604_sweep10",
+  "train_summary": "eval_results/r128_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881604_holdout_test/train_summary.json",
+  "wandb_run": "l40s-3881604"
+ },
+ {
+  "label": "r256",
+  "checkpoint": "saved_models/real/r256_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881612.pth",
+  "resolution": 256,
+  "split": "holdout",
+  "eval_dir": "eval_results/r256_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881612_sweep10",
+  "train_summary": "eval_results/r256_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881612_holdout_test/train_summary.json",
+  "wandb_run": "l40s-3881612"
+ },
+ {
+  "label": "r512",
+  "checkpoint": "saved_models/real/r512_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881616.pth",
+  "resolution": 512,
+  "split": "holdout",
+  "eval_dir": "eval_results/r512_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881616_sweep10",
+  "train_summary": "eval_results/r512_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881616_holdout_test/train_summary.json",
+  "wandb_run": "l40s-3881616"
+ },
+ {
+  "label": "mlp128",
+  "checkpoint": "saved_models/real/mlp_r128_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881608.pth",
+  "resolution": 128,
+  "split": "holdout",
+  "eval_dir": "eval_results/mlp_r128_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881608_sweep10",
+  "train_summary": "eval_results/mlp_r128_occ15-40img-rot90-fill0-255_n00-20_e98_hold_3881608_holdout_test/train_summary.json",
+  "wandb_run": "l40s-3881608"
+ }
+]

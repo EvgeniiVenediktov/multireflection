@@ -339,7 +339,7 @@ def parse_args(argv=None):
     p.add_argument("--no-fp16", action="store_true", help="disable fp16 autocast for the model")
     p.add_argument("--max-test-samples", type=int, default=None,
                    help=f"debug: evaluate a random subset (seed {MAX_TEST_SEED}) of this many TEST samples")
-    p.add_argument("--nn", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--nn", action=argparse.BooleanOptionalAction, default=False,
                    help="nearest-neighbour baseline (default on)")
     p.add_argument("--nn-test-samples", type=int, default=None,
                    help="TEST samples for the NN baseline (default: all at NN resolution <= 128, else 5000)")

@@ -1,22 +1,27 @@
-"""Markdown report of spatial hold-out evaluations (holdout/eval_test.py outputs) for several models.
+"""Markdown report of spatial hold-out evaluations for several models.
 
     python holdout/report.py r64=eval_results/<name>_holdout_test r128=... --out report.md [--quiet]
 
-Each directory is one model's eval_test.py output (optionally with train_summary.json copied in).
-Sections:
-- TEST open-loop angular error per condition: mean over TEST positions, +- standard deviation of
-  that mean over perturbation seeds, and (sd) the spread over positions.
-- Clean error vs distance to TRAIN, with each model's nearest-neighbour baseline (mean +- sd over
-  the positions in the bucket).
-- Closed-loop replay from the origins: success % +- its standard error [95% Wilson interval],
-  adjustments (converged starts) and final angular error as mean +- sd over origins.
+Each directory is one model's holdout/eval_test.py output (optionally with train_summary.json
+copied in). Sections:
+- Models: selected epoch, training images, TEST positions.
+- Grid closed loop by start area: the clean replay from the 2,320 starts of the 0.1 deg grid,
+  grouped by the split of each start's own position. Read from the sibling <run>_eval_grid
+  directory written by holdout/heatmaps.py, when it exists.
+
+Removed on purpose (see reports/holdout_resolution_study.md): the per-image TEST open-loop
+tables, the nearest-neighbour baseline with its error-vs-distance buckets, and the closed-loop
+replay from the 108 origins. The closed-loop sweep and the noise curve carry the robustness
+results instead.
 """
 
 import argparse
 import csv
 import json
-import math
 from pathlib import Path
+
+GROUP_ORDER = ["train", "val", "test"]
+GROUP_LABELS = {"train": "TRAIN area", "val": "VALIDATION regions", "test": "TEST regions"}
 
 
 def rows(path):
@@ -28,26 +33,19 @@ def num(v):
     return float(v) if v not in (None, "", "None", "nan") else None
 
 
-def pm(mean, std, digits):
-    if mean is None:
-        return "n/a"
-    return f"{mean:.{digits}f}" + (f" ± {std:.{digits}f}" if std is not None else "")
-
-
-def wilson(k, n, z=1.96):
-    if n == 0:
-        return float("nan"), float("nan")
-    p = k / n
-    d = 1 + z * z / n
-    c = (p + z * z / (2 * n)) / d
-    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
-    return 100 * (c - h), 100 * (c + h)
-
-
 def table(header, body):
     out = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     out += ["| " + " | ".join(r) + " |" for r in body]
     return out
+
+
+def grid_dir_for(d):
+    """Sibling <run>_eval_grid directory of a <run>_holdout_test[10|_s3_9] directory."""
+    name = d.name
+    for suffix in ("_holdout_test10", "_holdout_test_s3_9", "_holdout_test"):
+        if name.endswith(suffix):
+            return d.with_name(name[: -len(suffix)] + "_eval_grid")
+    return d.with_name(name + "_eval_grid")
 
 
 def main():
@@ -63,91 +61,44 @@ def main():
         if not sep:
             p.error(f"expected LABEL=path, got {spec}")
         models.append((label, Path(path)))
-    labels = [m[0] for m in models]
     md = ["# Spatial hold-out evaluation", ""]
 
-    # Settings
+    # Models
     md += ["## Models", ""]
     body = []
     for label, d in models:
-        s = json.loads((d / "summary.json").read_text()) if (d / "summary.json").exists() else {}
         t = json.loads((d / "train_summary.json").read_text()) if (d / "train_summary.json").exists() else {}
-        nn = s.get("nn", {}) or {}
-        m = rows(d / "metrics.csv")
-        body.append([label, str(t.get("best_epoch", "n/a")), str(t.get("n_train", "n/a")), m[0]["n"] if m else "n/a",
-                     f"{nn.get('resolution', 'n/a')} px, {nn.get('test_samples', 'n/a')} samples"])
-    md += table(["model", "selected epoch", "train images", "TEST positions", "nearest neighbour"], body) + [""]
+        m = rows(d / "metrics.csv") if (d / "metrics.csv").exists() else []
+        body.append([label, str(t.get("best_epoch", "n/a")), str(t.get("n_train", "n/a")),
+                     m[0]["n"] if m else "n/a"])
+    md += table(["model", "selected epoch", "train images", "TEST positions"], body) + [""]
 
-    # TEST open-loop
-    metrics = {label: {r["condition"]: r for r in rows(d / "metrics.csv")} for label, d in models}
-    conditions = []
-    for label in labels:
-        conditions += [c for c in metrics[label] if c not in conditions]
-    md += ["## TEST open-loop angular error (deg)", "",
-           "mean ± std over perturbation seeds (sd over TEST positions)", ""]
-    body = []
-    for c in conditions:
-        cells = []
-        for label in labels:
-            r = metrics[label].get(c)
-            if r is None:
-                cells.append("-")
-                continue
-            cells.append(f"{pm(num(r['ang_err_mean']), num(r.get('ang_err_mean_std')), 4)} (sd {num(r['ang_err_std']):.3f})")
-        body.append([c] + cells)
-    md += table(["condition"] + labels, body) + [""]
-
-    # Error vs distance, clean, with nearest neighbour
-    md += ["## Clean error vs distance to TRAIN (deg)", "", "mean ± sd over the TEST positions in the bucket", ""]
-    buckets, nn_buckets, dists = {}, {}, set()
+    # Grid closed loop by start area
+    grids = {}
     for label, d in models:
-        buckets[label] = {r["dist_deg"]: r for r in rows(d / "buckets.csv") if r["condition"] == "clean"}
-        nn_path = d / "nn_buckets.csv"
-        nn_buckets[label] = {r["dist_deg"]: r for r in rows(nn_path) if r["method"] == "nn"} if nn_path.exists() else {}
-        dists |= set(buckets[label])
-    header = ["dist", "n"]
-    for label in labels:
-        header += [label, f"NN {label}"]
-    body = []
-    for dist in sorted(dists, key=float):
-        n = next((buckets[l][dist]["n"] for l in labels if dist in buckets[l]), "")
-        cells = [f"{float(dist):.2f}", n]
-        for label in labels:
-            b, q = buckets[label].get(dist), nn_buckets[label].get(dist)
-            cells.append(pm(num(b["ang_err_mean"]), num(b["ang_err_std"]), 4) if b else "-")
-            cells.append(pm(num(q["ang_err_mean"]), num(q["ang_err_std"]), 4) if q else "-")
-        body.append(cells)
-    md += table(header, body) + [""]
-
-    # Closed loop
-    cl_conditions = []
-    for _, d in models:
-        if (d / "closed_loop").is_dir():
-            cl_conditions += [c.name for c in sorted((d / "closed_loop").iterdir()) if c.name not in cl_conditions]
-    if cl_conditions:
-        md += ["## Closed-loop replay from the origins", "",
-               "success % ± standard error [95% Wilson]; adjustments (converged) and final error (deg) mean ± sd over origins", ""]
+        f = grid_dir_for(d) / "corrections_by_split.csv"
+        if f.exists():
+            grids[label] = {r["group"]: r for r in rows(f)}
+    if grids:
+        starts = {g: next(iter(grids.values()))[g]["starts"] for g in GROUP_ORDER}
+        md += ["## Grid closed loop by start area", "",
+               "clean replay from the 0.1 deg grid; success %; mean corrections; final error (deg)", ""]
+        header = ["model"] + [f"{GROUP_LABELS[g]} ({starts[g]})" for g in GROUP_ORDER]
         body = []
-        for c in cl_conditions:
+        for label, _ in models:
+            if label not in grids:
+                body.append([label] + ["-"] * len(GROUP_ORDER))
+                continue
             cells = []
-            for _, d in models:
-                f = d / "closed_loop" / c / "summary.json"
-                if not f.exists():
-                    cells.append("-")
-                    continue
-                s = json.loads(f.read_text())
-                n, k = s["n_starts"], s["n_converged"]
-                rate = k / n
-                se = 100 * math.sqrt(rate * (1 - rate) / n)
-                lo, hi = wilson(k, n)
-                adj, err = s["adjustments_converged"], s["final_angular_error_deg"]
-                cells.append(f"{100 * rate:.1f} ± {se:.1f} [{lo:.1f}, {hi:.1f}]; adj {pm(num(adj['mean']), num(adj['std']), 2)}; "
-                             f"err {pm(num(err['mean']), num(err['std']), 3)}")
-            body.append([c] + cells)
-        md += table(["condition"] + labels, body) + [""]
+            for g in GROUP_ORDER:
+                r = grids[label][g]
+                cells.append(f"{100 * num(r['success_rate']):.1f}%; {num(r['adjustments_mean']):.2f}; "
+                             f"{num(r['final_angular_error_mean']):.4f}")
+            body.append([label] + cells)
+        md += table(header, body) + [""]
 
     Path(args.out).write_text("\n".join(md) + "\n")
-    print(f"{len(conditions)} TEST conditions, {len(cl_conditions)} closed-loop conditions, {len(labels)} models -> {args.out}"
+    print(f"{len(models)} models, {len(grids)} with grid replay -> {args.out}"
           if args.quiet else "\n".join(md))
 
 

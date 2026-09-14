@@ -12,7 +12,8 @@
 # Knobs: CKPT (required), MODEL_RES (512), SPLIT (split.csv of the hold-out split),
 # OUT_DIR (<checkpoint dir>/holdout_test), EXTRA_ARGS (appended to eval_test.py, word-split,
 # e.g. EXTRA_ARGS="--conditions clean,noise_0.20 --nn-resolution 128"),
-# CLOSED_LOOP (1: run the closed-loop stage, 0: skip), ORIGINS (start file, default
+# CLOSED_LOOP (1: run the origin closed-loop stage, 0: skip, the default since the report
+# dropped that surface), ORIGINS (start file, default
 # closed_loop_origins.txt next to the default split), CL_CONDITIONS (comma-separated
 # utils/eval_sweep.CONDITIONS names run after clean, perturbation seed 0).
 # Closed-loop outputs: $OUT_DIR/closed_loop/<condition>/.
@@ -40,7 +41,7 @@ MODEL_RES="${MODEL_RES:-512}"
 SPLIT="${SPLIT:-$DATA_ROOT/data/holdout_split/split.csv}"
 OUT_DIR="${OUT_DIR:-$(dirname "$CKPT")/holdout_test}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
-CLOSED_LOOP="${CLOSED_LOOP:-1}"
+CLOSED_LOOP="${CLOSED_LOOP:-0}"
 ORIGINS="${ORIGINS:-$DATA_ROOT/data/holdout_split/closed_loop_origins.txt}"
 CL_CONDITIONS="${CL_CONDITIONS:-occlusion_2x30,occlusion_2x30_rotbright,noise_0.20}"
 CPUS="${SLURM_CPUS_PER_TASK:-16}"

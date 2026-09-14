@@ -1,7 +1,11 @@
 #!/bin/bash
 # submit_64.sh - spatial hold-out pipeline on CRCD for one resolution (default 64 px): training on
-# TRAIN (model selection on VAL, seed 0; SEEDS="0 1 2" for more), each followed by the TEST-hole evaluation and
-# the offline closed-loop replay from the 108 origins (cluster/holdout_test_l40s.slurm).
+# TRAIN (model selection on VAL, seed 0; SEEDS="0 1 2" for more). The training job itself replays the
+# clean closed loop over the 0.1 deg start grid, which is what the report is built from.
+#
+# The per-image TEST open-loop evaluation, the nearest-neighbour baseline and the closed-loop replay
+# from the 108 origins are no longer part of the pipeline; cluster/holdout_test_l40s.slurm still runs
+# them by hand (CLOSED_LOOP=1 and --nn now have to be asked for).
 #
 #   cd /ihome/kchen/evv13/multireflection && bash holdout/submit_64.sh
 #   RES=128 bash holdout/submit_64.sh
@@ -24,7 +28,7 @@ SBATCH_ARGS=${SBATCH_ARGS:-}
 TRAIN_EXTRA=${TRAIN_EXTRA:-}
 # cluster/train_l40s.slurm names the run resnet18_l40s_<DATASET>_<job>, without the tag for dark512
 TAG="dark${RES}_"; [ "$RES" = 512 ] && TAG=""
-for f in split.csv train_names.txt val_names.txt closed_loop_origins.txt; do
+for f in split.csv train_names.txt val_names.txt; do
     [ -f "$S/$f" ] || { echo "missing $S/$f"; exit 1; }
 done
 
@@ -33,9 +37,6 @@ for seed in $SEEDS; do
         --export=ALL,DATASET=dark$RES,EXTRA_ARGS="--resolution $RES --seed $seed --split-tag hold --train-keys-file $S/train_names.txt --val-keys-file $S/val_names.txt $TRAIN_EXTRA" \
         cluster/train_l40s.slurm)
     jid=${jid%%;*}
-    tid=$(sbatch --parsable --dependency=afterok:$jid --job-name=holdtest-r$RES-s$seed \
-        --export=ALL,CKPT=$R/$jid/resnet18_l40s_${TAG}${jid}_best_model.pth,MODEL_RES=$RES \
-        cluster/holdout_test_l40s.slurm)
-    echo "r$RES seed $seed: train $jid -> test ${tid%%;*}"
+    echo "r$RES seed $seed: train $jid (checkpoint $R/$jid/resnet18_l40s_${TAG}${jid}_best_model.pth)"
 done
 squeue -M gpu -u "$USER" -h -o "%i %j %T %R"

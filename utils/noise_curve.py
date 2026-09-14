@@ -161,35 +161,38 @@ def write_csv(rows, path, columns):
 
 
 def plot(rows, label, out_path):
+    """Final angular error and success rate against the noise sigma (the run label is not drawn)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    err_color, success_color = "#0072B2", "#D55E00"  # colour-blind safe (Okabe-Ito)
     levels = [r["level"] for r in rows]
     err = [r["final_angular_error_mean"] for r in rows]
     err_std = [r["final_angular_error_mean_std"] or 0.0 for r in rows]
     success = [100 * r["success_rate_mean"] for r in rows]
-    run_counts = sorted({r["runs"] for r in rows})
-    n_runs = str(run_counts[0]) if len(run_counts) == 1 else f"{run_counts[0]}-{run_counts[-1]}"
-    starts = rows[0]["starts"]
 
-    fig, ax1 = plt.subplots()
-    ax1.errorbar(levels, err, yerr=err_std, marker="o", color="tab:blue", capsize=3, label="final angular error")
-    ax1.set_xlabel("noise sigma")
-    ax1.set_ylabel("final angular error (°)", color="tab:blue")
-    ax1.tick_params(axis="y", labelcolor="tab:blue")
+    fig, ax1 = plt.subplots(figsize=(6.4, 4.2))
+    error_line = ax1.errorbar(levels, err, yerr=err_std, marker="o", markersize=5, linewidth=1.8,
+                              color=err_color, capsize=3, label="Final angular error")
+    ax1.set_xlabel("Noise \u03c3")
+    ax1.set_ylabel("Final angular error (\u00b0)", color=err_color)
+    ax1.tick_params(axis="y", labelcolor=err_color)
+    ax1.grid(True, alpha=0.25)
+    ax1.set_ylim(bottom=0)
 
     ax2 = ax1.twinx()
-    ax2.plot(levels, success, marker="s", color="tab:orange", label="success rate")
-    ax2.set_ylabel("success rate (%)", color="tab:orange")
-    ax2.tick_params(axis="y", labelcolor="tab:orange")
+    success_line, = ax2.plot(levels, success, marker="s", markersize=4, linestyle="--", linewidth=1.4,
+                             color=success_color, label="Success rate")
+    ax2.set_ylabel("Success rate (%)", color=success_color)
+    ax2.tick_params(axis="y", labelcolor=success_color)
     ax2.set_ylim(0, 105)
 
-    plt.title(f"{label}: noise robustness ({n_runs} run(s)/level, {starts} starts)")
+    ax1.set_title("Final model noise robustness", fontsize=11)
+    ax1.legend(handles=[error_line, success_line], loc="lower right", fontsize=9, frameon=False)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.03)
     plt.close(fig)
-
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -11,8 +11,8 @@ Columns: params (trainable), weights_MB (float32), RAM_peak_MB (measured peak RS
 CPU float32 batch-1 inference including checkpoint loading, fresh subprocess, 4 threads, cached
 per resolution), RAM_forward_MB (peak RSS increase during the forward passes only),
 best_val_mse, and clean / noisy / occlusion / combined_harsh errors (mean ± std over
-perturbation seeds) from eval_dir/sweep.csv (random split, utils/eval_sweep.py) or
-eval_dir/metrics.csv (holdout split, holdout/eval_test.py).
+perturbation seeds) from eval_dir/sweep.csv (utils/eval_sweep.py), the closed-loop replay over
+the 0.1 deg start grid, for both splits.
 
 Usage:
   python utils/model_table.py --manifest eval_results/model_table_manifest.json \
@@ -31,10 +31,10 @@ THREADS = 4
 MIB = 2 ** 20
 
 METRIC_NAME = {"random": "closed-loop final error, 0.1 deg grid",
-               "holdout": "open-loop TEST-hole error"}
+               "holdout": "closed-loop final error, 0.1 deg grid"}
 # split -> (file, count column, mean column, std column)
-EVAL_FILE = {"random": ("sweep.csv", "starts", "final_angular_error_mean", "final_angular_error_mean_std"),
-             "holdout": ("metrics.csv", "n", "ang_err_mean", "ang_err_mean_std")}
+_SWEEP = ("sweep.csv", "starts", "final_angular_error_mean", "final_angular_error_mean_std")
+EVAL_FILE = {"random": _SWEEP, "holdout": _SWEEP}
 
 # Runs in a fresh interpreter; prints one JSON line.
 RAM_PROBE = r"""
@@ -295,11 +295,9 @@ def main():
         f"representative of a Pi; the increase is the model-specific part, though ARM CPU kernels may use different "
         f"workspace memory. `best_val_mse` is the best validation MSE (training loss on normalized targets) from "
         f"train_summary.json, else the W&B run summary. Evaluation cells are mean ± std, std over perturbation seeds "
-        f"(`runs`); clean has a single run and shows only the mean. Random split: closed-loop replay over the 0.1 deg "
+        f"(`runs`); clean has a single run and shows only the mean. Both splits: closed-loop replay over the 0.1 deg "
         f"grid (utils/eval_sweep.py, eval_dir/sweep.csv), metric = final angular error after the loop, averaged over "
-        f"`starts` start positions. Holdout split: open-loop angular error of single predictions on the TEST hole "
-        f"positions (holdout/eval_test.py, eval_dir/metrics.csv), averaged over `starts` TEST positions. The two "
-        f"metrics are not directly comparable. Conditions: noisy = {args.noise_condition}, occlusion = "
+        f"`starts` start positions. Conditions: noisy = {args.noise_condition}, occlusion = "
         f"{args.occlusion_condition}, combined_harsh. Per-row sources: " + "; ".join(row_notes) + "."
     )
 
