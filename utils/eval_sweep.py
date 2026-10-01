@@ -29,6 +29,11 @@ nothing random and runs once. Each run writes its normal eval outputs to
 seed) and sweep.csv / sweep.md (one row per condition: mean over seeds, *_std = standard
 deviation over seeds, max = max over seeds). adjustments_* are over converged starts (the
 same quantity eval_batched reports to W&B), the angular error columns are over all starts.
+--stop-motion EPS is passed through (second stop rule, see eval_batched.py); stops_* count
+the trajectories each rule stopped (none: max adjustments reached), verified_success_rate is
+converged with a final angular error below eval_batched.VERIFY_ERROR_DEG, false_stops the
+converged starts at or above it. In sweep.csv the stops_* and false_stops columns are means
+over seeds and false_stops_total their sum.
 To compare models of different input sizes on the same frames, run every one on the 512 px
 bank with --model-resolution set to the model's size.
 """
@@ -77,10 +82,13 @@ CONDITIONS = [
 
 SEED_COLUMNS = ["condition", "seed", "starts", "success_rate", "adjustments_mean", "adjustments_std",
                 "adjustments_max", "final_ssim_mean", "final_angular_error_mean", "final_angular_error_std",
-                "final_angular_error_max", "wall_s"]
+                "final_angular_error_max", "verified_success_rate", "stops_ssim", "stops_motion", "stops_none",
+                "false_stops", "stop_motion", "wall_s"]
 COLUMNS = ["condition", "seeds", "starts", "success_rate", "success_rate_std", "adjustments_mean",
            "adjustments_mean_std", "adjustments_max", "final_ssim_mean", "final_angular_error_mean",
-           "final_angular_error_mean_std", "final_angular_error_max", "wall_s"]
+           "final_angular_error_mean_std", "final_angular_error_max", "verified_success_rate",
+           "verified_success_rate_std", "stops_ssim", "stops_motion", "stops_none", "false_stops",
+           "false_stops_total", "stop_motion", "wall_s"]
 
 
 def row_from_summary(name, summary):
@@ -97,6 +105,12 @@ def row_from_summary(name, summary):
         "final_angular_error_mean": err["mean"],
         "final_angular_error_std": err["std"],
         "final_angular_error_max": err["max"],
+        "verified_success_rate": summary.get("verified_success_rate"),
+        "stops_ssim": summary.get("stop_reasons", {}).get("ssim"),
+        "stops_motion": summary.get("stop_reasons", {}).get("motion"),
+        "stops_none": summary.get("stop_reasons", {}).get("none"),
+        "false_stops": summary.get("false_stop_count"),
+        "stop_motion": summary["settings"].get("stop_motion"),
         "wall_s": summary["wall_time_s"],
     }
 
@@ -131,6 +145,14 @@ def aggregate(name, runs):
         "final_angular_error_mean": mean("final_angular_error_mean"),
         "final_angular_error_mean_std": std("final_angular_error_mean"),
         "final_angular_error_max": vmax("final_angular_error_max"),
+        "verified_success_rate": mean("verified_success_rate"),
+        "verified_success_rate_std": std("verified_success_rate"),
+        "stops_ssim": mean("stops_ssim"),
+        "stops_motion": mean("stops_motion"),
+        "stops_none": mean("stops_none"),
+        "false_stops": mean("false_stops"),
+        "false_stops_total": int(values("false_stops").sum()) if len(values("false_stops")) else None,
+        "stop_motion": runs[0].get("stop_motion"),
         "wall_s": float(values("wall_s").sum()),
     }
 
@@ -190,6 +212,11 @@ def parse_args():
                    help="comma-separated subset of: " + ", ".join(names))
     p.add_argument("--perturb-ssim", action="store_true",
                    help="passed through: SSIM stop test on the perturbed frame (ignored for clean)")
+    p.add_argument("--stop-motion", type=float, default=None, metavar="EPS",
+                   help="passed through: also stop once the last two predicted corrections are < EPS deg")
+    p.add_argument("--stop-motion-steps", type=int, default=None, metavar="K",
+                   help="passed through: the last K corrections must be < EPS (eval_batched default 2)")
+    p.add_argument("--raw-ssim", action="store_true", help="passed through: unrounded SSIM against the threshold")
     p.add_argument("--perturb-seeds", default="0,1,2",
                    help="comma-separated perturbation seeds; every perturbed condition runs once per seed")
     p.add_argument("--no-fp16", action="store_true")
@@ -228,6 +255,12 @@ def main():
         common.append("--no-fp16")
     if args.model_resolution:
         common += ["--model-resolution", str(args.model_resolution)]
+    if args.stop_motion is not None:
+        common += ["--stop-motion", str(args.stop_motion)]
+    if args.stop_motion_steps is not None:
+        common += ["--stop-motion-steps", str(args.stop_motion_steps)]
+    if args.raw_ssim:
+        common.append("--raw-ssim")
 
     rows, seed_rows = [], []
     t0 = time.perf_counter()

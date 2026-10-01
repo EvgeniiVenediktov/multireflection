@@ -9,6 +9,15 @@ position to camera image, so the closed loop
     pos = clamp(round(pos - clip(model(image)), 2))
 
 can be simulated for every start on a grid without touching the hardware.
+With --stop-motion EPS a second stop rule is added: a trajectory also counts as
+converged once the Euclidean norm of each of its last two predicted corrections
+(the clipped model output, before rounding and clamping) is below EPS degrees,
+so it needs at least two corrections (--stop-motion-steps K: the last K). The SSIM
+test is checked first, on the SSIM rounded to 2 decimals like the hardware metric, or
+unrounded with --raw-ssim; the rule that stopped each trajectory is recorded ("ssim",
+"motion", or empty for a trajectory that hit --max-adj). Both are off by default, which
+is the loop above exactly.
+
 All starts are advanced simultaneously and the model is run in GPU batches;
 SSIM is memoized by position and computed in a thread pool.
 
@@ -24,7 +33,9 @@ Outputs (in --out-dir): trace.csv (one row per trajectory per step, t=0
 included), eval.log (same line format as app/eval.py, readable by
 utils/graph_eval.py), summary.json, and three heatmaps over the start grid:
 number of adjustments (the paper's evaluation figure), final angular error and
-final SSIM.
+final SSIM. summary.json also counts the stop reasons and reports
+verified_success_rate (converged and final angular error < VERIFY_ERROR_DEG) and
+false_stop_count (converged with a final error at or above it).
 
 Perturbations (all off by default) distort the image the MODEL sees, to measure
 how robust the closed loop is to conditions it may meet on the hardware. They use
@@ -76,6 +87,7 @@ DEFAULT_DATA_DIR = "/mnt/h/dark512"
 PERTURB_KEYS = ("brightness", "brightness_fixed", "contrast", "contrast_fixed", "blur", "noise", "noise_min",
                 "occlusion_count", "occlusion_min", "occlusion_max", "occlusion_prob", "perturb_ssim",
                 "perturb_seed")
+VERIFY_ERROR_DEG = 0.07  # a converged trajectory ending at least this far from (0, 0) is a false stop
 
 
 def clip(v, minv, maxv):
@@ -484,6 +496,8 @@ def run(args):
     adj = [0] * n
     done = [False] * n
     converged = [False] * n
+    stop_reason = [""] * n  # "ssim", "motion", or "" (max_adj reached)
+    norms = [[] for _ in range(n)]  # norm of every predicted correction, in degrees
     final_ssim = [0.0] * n
     trace = []  # rows for trace.csv
     log_lines = []
@@ -511,15 +525,22 @@ def run(args):
             images = []
             for i in active:
                 raw = raw_of[i]
-                sim = round(raw, 2)
+                sim = raw if args.raw_ssim else round(raw, 2)
                 if sim >= args.threshold:
                     done[i] = True
                     converged[i] = True
+                    stop_reason[i] = "ssim"
+                elif (args.stop_motion is not None and len(norms[i]) >= args.stop_motion_steps
+                      and all(v < args.stop_motion for v in norms[i][-args.stop_motion_steps:])):
+                    done[i] = True
+                    converged[i] = True
+                    stop_reason[i] = "motion"
                 elif adj[i] >= args.max_adj:
                     done[i] = True
                 if done[i]:
                     final_ssim[i] = sim
-                    trace.append([*grid[i], adj[i], *pos[i], sim, raw, "", "", "", "", int(converged[i])])
+                    trace.append([*grid[i], adj[i], *pos[i], sim, raw, "", "", "", "", int(converged[i]),
+                                  stop_reason[i]])
                 else:
                     still.append(i)
                     images.append(frame_of[i] if perturb_ssim else bank.images[pos[i]])
@@ -533,12 +554,13 @@ def run(args):
                 px, py = float(preds[k, 0]), float(preds[k, 1])
                 x_pred = -clip(px, X_TILT_START, X_TILT_STOP)
                 y_pred = -clip(py, Y_TILT_START, Y_TILT_STOP)
+                norms[i].append(float(np.hypot(x_pred, y_pred)))
                 x = round(pos[i][0] + x_pred, 2)
                 y = round(pos[i][1] + y_pred, 2)
                 x, y = bank.clamp(x, y)
                 raw = raw_of[i]
-                sim = round(raw, 2)
-                trace.append([*grid[i], adj[i], *pos[i], sim, raw, x_pred, y_pred, x, y, 0])
+                sim = raw if args.raw_ssim else round(raw, 2)
+                trace.append([*grid[i], adj[i], *pos[i], sim, raw, x_pred, y_pred, x, y, 0, ""])
                 pos[i] = (x, y)
                 adj[i] += 1
                 log_lines.append(log_line(grid[i][0], grid[i][1], adj[i], x_pred, y_pred, x, y, sim))
@@ -551,7 +573,7 @@ def run(args):
     with open(out_dir / "trace.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["origin_x", "origin_y", "t", "pos_x", "pos_y", "ssim", "ssim_raw",
-                    "pred_x", "pred_y", "next_x", "next_y", "converged"])
+                    "pred_x", "pred_y", "next_x", "next_y", "converged", "stop_reason"])
         w.writerows(trace)
     with open(out_dir / "eval.log", "w") as f:
         f.writelines(log_lines)
@@ -560,6 +582,10 @@ def run(args):
     conv_arr = np.array(converged, dtype=bool)
     ssim_arr = np.array(final_ssim, dtype=np.float64)
     err_arr = np.array([np.hypot(*p) for p in pos], dtype=np.float64)
+    verified = conv_arr & (err_arr < VERIFY_ERROR_DEG)
+    false_stops = conv_arr & (err_arr >= VERIFY_ERROR_DEG)
+    reasons = {r: sum(1 for v in stop_reason if v == r) for r in ("ssim", "motion")}
+    reasons["none"] = sum(1 for v in stop_reason if not v)
 
     def stats(a):
         if not len(a):
@@ -572,6 +598,10 @@ def run(args):
         "n_starts": n,
         "n_converged": int(conv_arr.sum()),
         "success_rate": float(conv_arr.mean()),
+        "stop_reasons": reasons,
+        "verified_success_rate": float(verified.mean()),
+        "false_stop_count": int(false_stops.sum()),
+        "verify_error_deg": VERIFY_ERROR_DEG,
         "adjustments_converged": stats(adj_arr[conv_arr]),
         "adjustments_all": stats(adj_arr),
         "final_ssim": stats(ssim_arr),
@@ -588,6 +618,9 @@ def run(args):
             "grid_step": None if args.starts_file else args.grid_step,
             "starts_file": args.starts_file,
             "max_adj": args.max_adj,
+            "stop_motion": args.stop_motion,
+            "stop_motion_steps": args.stop_motion_steps,
+            "raw_ssim": args.raw_ssim,
             "batch_size": args.batch_size,
             "fp16": predictor.fp16,
             "workers": workers,
@@ -610,6 +643,11 @@ def run(args):
     print(f"{'starts':<28}{n}")
     print(f"{'perturbation':<28}{perturb.describe() if perturb else 'none'}")
     print(f"{'converged':<28}{summary['n_converged']} ({100 * summary['success_rate']:.2f} %)")
+    print(f"{'stop reasons':<28}ssim {reasons['ssim']}, motion {reasons['motion']}, none {reasons['none']}"
+          + (f" (stop-motion {args.stop_motion:g} deg, last {args.stop_motion_steps})"
+             if args.stop_motion is not None else ""))
+    print(f"{'verified (err < %g deg)' % VERIFY_ERROR_DEG:<28}{int(verified.sum())} "
+          f"({100 * summary['verified_success_rate']:.2f} %), false stops {summary['false_stop_count']}")
     print(f"{'adjustments (converged)':<28}{fmt(summary['adjustments_converged'])}")
     print(f"{'adjustments (all)':<28}{fmt(summary['adjustments_all'])}")
     print(f"{'final SSIM':<28}{fmt(summary['final_ssim'])}")
@@ -711,6 +749,14 @@ def parse_args(argv=None):
                    help="start positions from a file of image names, e.g. a run's val_names.txt; overrides --grid-step")
     p.add_argument("--threshold", type=float, default=0.97)
     p.add_argument("--max-adj", type=int, default=EVAL_MAX_ADJ_NUMBER)
+    p.add_argument("--stop-motion", type=float, default=None, metavar="EPS",
+                   help="also stop (converged) once the last two predicted corrections both have a "
+                        "Euclidean norm < EPS deg; default off (SSIM stop test only)")
+    p.add_argument("--stop-motion-steps", type=int, default=2, metavar="K",
+                   help="with --stop-motion: the last K predicted corrections must all be < EPS (default 2)")
+    p.add_argument("--raw-ssim", action="store_true",
+                   help="compare the unrounded SSIM against --threshold (default: rounded to 2 decimals, "
+                        "like the hardware metric); the compared value is what trace.csv records as ssim")
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--workers", type=int, default=None, help="thread pool size for decode+SSIM (default: cpu count)")
     p.add_argument("--out-dir", default=None, help="default: eval_results/<checkpoint stem>/")
@@ -757,6 +803,10 @@ def parse_args(argv=None):
                    help="also feed the perturbed frame to the SSIM stop test (default: SSIM on the clean image)")
     q.add_argument("--perturb-seed", type=int, default=0)
     args = p.parse_args(argv)
+    if args.stop_motion is not None and args.stop_motion <= 0:
+        p.error("--stop-motion must be > 0")
+    if args.stop_motion_steps < 1:
+        p.error("--stop-motion-steps must be >= 1")
     if args.noise_min is not None and (args.noise is None or args.noise_min >= args.noise):
         p.error("--noise-min needs --noise S with min < S")
     if args.blur and (args.blur < 3 or args.blur % 2 == 0):
