@@ -57,4 +57,20 @@ plateau takes about 1 deg; the real mount resolves 0.01 deg.
 3. M1 as the controlled mirror.
 4. Sim-to-real: camera model fitted to the real setup, encoder fine-tuned on real images.
 
+## Future extensions
+
+- **Model-based control for real-world deployment.** On the real cell every interaction is
+  slow and expensive, which is where model-based methods pay off. Two routes:
+  - a learned world model (DreamerV3 / TD-MPC2 style) pretrained in simulation and then
+    fine-tuned on a small amount of real-cell data, with the policy trained or planned in
+    its latent space;
+  - the known physics: estimate the hidden state (M2 tilt, separation, laser tilt) from the
+    image history, then search the simulator for the action that maximizes path. Depends
+    on the simulator matching the real cell closely, since the target regions are ~0.2 deg wide.
+- **Mirror substrate and edge scattering.** The simulator treats each mirror as an
+  infinitely thin spherical cap: a ray outside the aperture just misses, and a back-side
+  hit is detected only within the cap. The real mirrors have glass thickness, edges and
+  bevels; a beam landing on an edge scatters light that shows up in the camera image.
+  Modelling the substrate geometry and that scattering is needed for sim-to-real.
+
 Plan and code review: [PLAN.md](PLAN.md).

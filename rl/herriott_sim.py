@@ -1,6 +1,10 @@
 """
-herriott_sim.py - High-performance Herriott cell simulation for RL
-All tensor ops, no Python loops in hot path, fully differentiable
+herriott_sim.py - Batched Herriott cell ray tracer for RL
+
+Two backends with the same outputs:
+    "torch"  - the reference: per-bounce tensor ops over the batch (slow at RL batch
+               sizes, launch/sync bound), used by the tests as ground truth
+    "triton" - one fused kernel per call (sim_triton.py), default on CUDA
 
 State vector (13 DOF):
     [m1_pitch, m1_yaw, m2_pitch, m2_yaw, separation,
@@ -20,12 +24,15 @@ State vector (13 DOF):
     10 laser_dy    - Laser Y offset from hole center (mm)
     11 laser_pitch - Laser pitch relative to M1 normal (deg)
     12 laser_yaw   - Laser yaw relative to M1 normal (deg)
+
+The measured cell lives in geometry.py (CellGeometry); the MirrorConfig / SimConfig
+defaults below are legacy values kept for the old env.
 """
 
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 # Default device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,6 +53,16 @@ S_LASER_DY = 10
 S_LASER_PITCH = 11
 S_LASER_YAW = 12
 STATE_DIM = 13
+
+# Stop reasons (stop_reason output, int8)
+STOP_CAP = 0  # Still active when the bounce cap was reached
+STOP_HOLE = 1  # Left through the M1 hole
+STOP_MISSED = 2  # No valid hit on either mirror
+STOP_BLOCKED = 3  # A back-side mirror hit is the nearest event
+STOP_INTENSITY = 4  # Intensity fell below the threshold
+STOP_NAMES = ("cap", "hole", "missed", "blocked", "intensity")
+
+BACKENDS = ("torch", "triton")
 
 
 @dataclass
@@ -215,11 +232,13 @@ class HerriottSim:
         hole_radius: float = 0,
         hole_offset: torch.Tensor = None,
         return_hole: bool = False,
+        return_local: bool = False,
     ):
         """Check if hit is within mirror aperture and not in hole.
 
         With return_hole=True, returns (valid, in_hole) where in_hole marks hits
-        inside the aperture that fall in the hole.
+        inside the aperture that fall in the hole. With return_local=True, the
+        mirror-local (lx, ly) of the hit, (B, 2), is appended to the return.
         """
         rel = hit - position
 
@@ -241,9 +260,12 @@ class HerriottSim:
             in_hole = valid & (hole_dist < hole_radius)
             valid = valid & ~in_hole
 
+        out = (valid,)
         if return_hole:
-            return valid, in_hole
-        return valid
+            out = out + (in_hole,)
+        if return_local:
+            out = out + (torch.stack([lx, ly], dim=-1),)
+        return out if len(out) > 1 else valid
 
     @staticmethod
     def _front_side(
@@ -259,27 +281,55 @@ class HerriottSim:
         """
         return (directions * (center - hit)).sum(dim=-1) < 0
 
-    def simulate(self, state: torch.Tensor) -> dict:
+    def simulate(
+        self,
+        state: torch.Tensor,
+        backend: Optional[str] = None,
+        store_world: bool = True,
+    ) -> dict:
         """
         Run simulation for given state(s).
 
         Args:
             state: (B, 13) state vector
+            backend: "triton" (fused kernel) or "torch" (reference); default
+                "triton" for CUDA states, "torch" otherwise
+            store_world: also return the world-frame hit_sequence (otherwise
+                hit_sequence is None)
 
         Returns:
-            dict with:
-                - hit_counts: (B,) number of bounces per config
-                - final_positions: (B, 3) last hit position
+            dict with (N = sim_cfg.max_bounces):
+                - hit_counts: (B,) int64 number of bounces per config
+                - final_positions: (B, 3) last hit position (0 if no hit)
                 - total_path_length: (B,) total optical path
-                - hit_sequence: (B, max_bounces, 3) all hit positions (padded)
-                - intensity: (B,) remaining beam intensity
-                - exited_hole: (B,) bool, the ray ended by leaving through the
-                  M1 hole (reached the hole from the reflective side)
+                - hit_sequence: (B, N, 3) world hit positions (0 padded) or None
+                - hit_mirror: (B, N) int8, 1 or 2 per stored hit, 0 padding
+                - hit_local_xy: (B, N, 2) hit (lx, ly) in the hit mirror's local
+                  frame (0 padded)
+                - intensity: (B,) remaining beam intensity (reflectivity product
+                  over the hits)
+                - stop_reason: (B,) int8, one of the STOP_* constants
+                - exited_hole: (B,) bool, stop_reason == STOP_HOLE: the ray ended
+                  by leaving through the M1 hole (reached it from the
+                  reflective side)
         """
-        B = state.shape[0]
         assert (
             state.shape[1] == STATE_DIM
         ), f"Expected state dim {STATE_DIM}, got {state.shape[1]}"
+        if backend is None:
+            backend = "triton" if state.is_cuda else "torch"
+        if backend == "triton":
+            from sim_triton import simulate_triton
+
+            return simulate_triton(self, state, store_world=store_world)
+        if backend == "torch":
+            return self._simulate_torch(state, store_world=store_world)
+        raise ValueError(f"Unknown backend {backend!r}, expected one of {BACKENDS}")
+
+    def _simulate_torch(self, state: torch.Tensor, store_world: bool = True) -> dict:
+        """Reference implementation: per-bounce tensor ops over the batch."""
+        B = state.shape[0]
+        N = self.sim_cfg.max_bounces
 
         # Parse state
         m1_pitch = state[:, S_M1_PITCH]
@@ -338,18 +388,21 @@ class HerriottSim:
         directions = F.normalize(directions, dim=-1)
 
         # Tracing storage
-        hit_sequence = torch.zeros(
-            B, self.sim_cfg.max_bounces, 3, device=self.device, dtype=self.dtype
-        )
+        hit_sequence = torch.zeros(B, N, 3, device=self.device, dtype=self.dtype)
+        hit_mirror = torch.zeros(B, N, dtype=torch.int8, device=self.device)
+        hit_local_xy = torch.zeros(B, N, 2, device=self.device, dtype=self.dtype)
         hit_counts = torch.zeros(B, dtype=torch.long, device=self.device)
         active = torch.ones(B, dtype=torch.bool, device=self.device)
         intensity = torch.ones(B, device=self.device, dtype=self.dtype)
         path_length = torch.zeros(B, device=self.device, dtype=self.dtype)
         last_hit_mirror = torch.zeros(B, dtype=torch.long, device=self.device)
         exited_hole = torch.zeros(B, dtype=torch.bool, device=self.device)
+        stop_reason = torch.full(
+            (B,), STOP_CAP, dtype=torch.int8, device=self.device
+        )
         inf = torch.tensor(float("inf"), device=self.device)
 
-        for bounce in range(self.sim_cfg.max_bounces):
+        for bounce in range(N):
             if not active.any():
                 break
 
@@ -368,7 +421,7 @@ class HerriottSim:
             hit2_far = origins + t2_far.unsqueeze(-1) * directions
 
             # Aperture check each candidate (M1 also reports hole crossings)
-            ap1_near, hole1_near = self._check_aperture(
+            ap1_near, hole1_near, lxy1_near = self._check_aperture(
                 hit1_near,
                 m1_pos,
                 m1_R,
@@ -378,8 +431,9 @@ class HerriottSim:
                 self.m1_cfg.hole_radius,
                 self.m1_hole_offset,
                 return_hole=True,
+                return_local=True,
             )
-            ap1_far, hole1_far = self._check_aperture(
+            ap1_far, hole1_far, lxy1_far = self._check_aperture(
                 hit1_far,
                 m1_pos,
                 m1_R,
@@ -389,27 +443,32 @@ class HerriottSim:
                 self.m1_cfg.hole_radius,
                 self.m1_hole_offset,
                 return_hole=True,
+                return_local=True,
             )
             hole1_near = v1_near & hole1_near
             hole1_far = v1_far & hole1_far
             v1_near = v1_near & ap1_near
             v1_far = v1_far & ap1_far
-            v2_near = v2_near & self._check_aperture(
+            ap2_near, lxy2_near = self._check_aperture(
                 hit2_near,
                 m2_pos,
                 m2_R,
                 m2_normal,
                 self.m2_aperture,
                 self.m2_sag,
+                return_local=True,
             )
-            v2_far = v2_far & self._check_aperture(
+            ap2_far, lxy2_far = self._check_aperture(
                 hit2_far,
                 m2_pos,
                 m2_R,
                 m2_normal,
                 self.m2_aperture,
                 self.m2_sag,
+                return_local=True,
             )
+            v2_near = v2_near & ap2_near
+            v2_far = v2_far & ap2_far
 
             # Incidence side: a mirror reflects only when hit on its reflective
             # face. A hit on the back of a mirror blocks the ray (no reflection).
@@ -446,13 +505,17 @@ class HerriottSim:
             t1_far = torch.where(v1_far, t1_far, inf)
             t1 = torch.minimum(t1_near, t1_far)
             v1 = t1 < inf
-            hit1 = torch.where((t1 == t1_near).unsqueeze(-1), hit1_near, hit1_far)
+            sel1 = (t1 == t1_near).unsqueeze(-1)
+            hit1 = torch.where(sel1, hit1_near, hit1_far)
+            lxy1 = torch.where(sel1, lxy1_near, lxy1_far)
 
             t2_near = torch.where(v2_near, t2_near, inf)
             t2_far = torch.where(v2_far, t2_far, inf)
             t2 = torch.minimum(t2_near, t2_far)
             v2 = t2 < inf
-            hit2 = torch.where((t2 == t2_near).unsqueeze(-1), hit2_near, hit2_far)
+            sel2 = (t2 == t2_near).unsqueeze(-1)
+            hit2 = torch.where(sel2, hit2_near, hit2_far)
+            lxy2 = torch.where(sel2, lxy2_near, lxy2_far)
 
             # Don't hit the same mirror twice in a row
             v1 = v1 & (last_hit_mirror != 1)
@@ -471,14 +534,17 @@ class HerriottSim:
             hit_m1 = hit_m1 & any_hit
             hit_m2 = hit_m2 & any_hit
 
-            # Ray ends here; flag it if it leaves through the M1 hole
-            exited_hole = exited_hole | (
-                active
-                & ~any_hit
-                & in_hole1
-                & (last_hit_mirror != 1)
-                & (td1 < t_block)
-            )
+            # Ray ends here; flag it if it leaves through the M1 hole, otherwise
+            # it was blocked (a back-side hit is nearest) or missed
+            stopping = active & ~any_hit
+            exit_now = stopping & in_hole1 & (last_hit_mirror != 1) & (td1 < t_block)
+            exited_hole = exited_hole | exit_now
+            reason = torch.where(
+                exit_now,
+                STOP_HOLE,
+                torch.where(t_block < inf, STOP_BLOCKED, STOP_MISSED),
+            ).to(torch.int8)
+            stop_reason = torch.where(stopping, reason, stop_reason)
 
             active = active & any_hit
             if not active.any():
@@ -493,8 +559,13 @@ class HerriottSim:
             normals = torch.where(hit_m1.unsqueeze(-1), n1, n2)
 
             # Store
-            hit_sequence[:, bounce] = torch.where(
-                active.unsqueeze(-1), hit_points, hit_sequence[:, bounce]
+            act3 = active.unsqueeze(-1)
+            hit_sequence[:, bounce] = torch.where(act3, hit_points, 0.0)
+            hit_mirror[:, bounce] = torch.where(
+                active, torch.where(hit_m1, 1, 2), 0
+            ).to(torch.int8)
+            hit_local_xy[:, bounce] = torch.where(
+                act3, torch.where(hit_m1.unsqueeze(-1), lxy1, lxy2), 0.0
             )
             hit_counts = torch.where(active, hit_counts + 1, hit_counts)
             path_length = torch.where(active, path_length + t, path_length)
@@ -510,12 +581,14 @@ class HerriottSim:
             directions = F.normalize(directions - 2 * dot * normals, dim=-1)
             origins = hit_points + 1e-4 * directions
 
-            # Attenuate
+            # Attenuate (active rays only)
             refl = torch.where(
                 hit_m1, self.m1_cfg.reflectivity, self.m2_cfg.reflectivity
             )
-            intensity = intensity * refl
-            active = active & (intensity > self.sim_cfg.intensity_threshold)
+            intensity = torch.where(active, intensity * refl, intensity)
+            dimmed = active & ~(intensity > self.sim_cfg.intensity_threshold)
+            stop_reason = torch.where(dimmed, STOP_INTENSITY, stop_reason)
+            active = active & ~dimmed
 
         # Final positions
         batch_idx = torch.arange(B, device=self.device)
@@ -526,25 +599,13 @@ class HerriottSim:
             "hit_counts": hit_counts,
             "final_positions": final_positions,
             "total_path_length": path_length,
-            "hit_sequence": hit_sequence,
+            "hit_sequence": hit_sequence if store_world else None,
+            "hit_mirror": hit_mirror,
+            "hit_local_xy": hit_local_xy,
             "intensity": intensity,
+            "stop_reason": stop_reason,
             "exited_hole": exited_hole,
         }
-
-    def reward(self, state: torch.Tensor, target_bounces: int = 20) -> torch.Tensor:
-        """
-        Example reward function for RL.
-        Rewards configurations that achieve target bounce count.
-        """
-        result = self.simulate(state)
-
-        bounce_diff = (result["hit_counts"].float() - target_bounces).abs()
-        r = -bounce_diff
-
-        # Bonus for path length (longer = better gas absorption)
-        r = r + 0.01 * result["total_path_length"]
-
-        return r
 
 
 def make_state(

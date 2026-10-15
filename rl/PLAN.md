@@ -111,6 +111,6 @@ Stages 2-4 from README follow once stage 1 trains reliably.
   depends on. Eval adds: stop rate, final path at stop vs the oracle's best reachable, steps.
 - **D3 - camera view: M2 face** (the mirror without the laser window), plain mirror-plane
   view in M2-local coordinates. A real camera model comes with sim-to-real (stage 4).
-- **D4 - action ladder: `{0, +-1, +-3, +-10, +-30, +-100} x 0.01 deg` per axis.** Initial
-  M2 tilt range defaults to +-3 deg around nominal (the scanned area); M2 actuation limits
-  still to set from the real mount.
+- **D4 - action ladder: `{0, +-1, +-3, +-10, +-30, +-100} x 0.01 deg` per axis.** M2 tilts
+  +-2 deg on both axes (mount limit, absolute angles in the sim frame); initial tilts uniform
+  in that box. Nominal (-0.38, 0.27) and the 57 / 89 / trapped regions all lie inside it.
