@@ -1,5 +1,7 @@
 # Reinforcement learning branch (dormant)
 
+> **Superseded (2026-10-15):** the RL code moved to `rl/`; current description and plan are `rl/README.md` and `rl/PLAN.md`. Below describes the old implementation.
+>
 > **Not a current concern.** The paper being revised covers the supervised MLP/CNN stage only.
 > This exists so the RL code is not re-derived; expect drift and rough edges.
 

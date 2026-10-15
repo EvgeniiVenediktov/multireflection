@@ -13,29 +13,26 @@ Controls:
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button, TextBox
-from simulation.herriott_sim import create_sim, DEVICE
+from herriott_sim import DEVICE
+from herriott_env import HerriottEnv, EnvConfig, ObsMirror
 from policy import RecurrentPolicy
 import torch
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constants (drawing only; observation and action come from EnvConfig) ──────
 DIAMETER = 25.4
 HOLE_DIAMETER = 3.0
 HOLE_OFFSET = 7.0
-
-# Policy action scaling
-ACTION_SCALE = 0.5  # max degrees per step
-
-# Observation rendering
-OBS_SIZE = 64
-OBS_EXTENT = 15.0  # mm, half-width of the rendered region
-SPOT_SIGMA = 0.5
 
 
 class InteractiveHerriottCell:
     def __init__(
         self, checkpoint_path: str = None, obs_mirror="M2", policy_step_limit=16
     ):
-        self.sim = create_sim(mounted_laser=True)
+        # Single-env HerriottEnv: same sim, renderer and action scaling as training
+        self.env = HerriottEnv(
+            EnvConfig(num_envs=1, obs_mirror=ObsMirror[obs_mirror], device=DEVICE)
+        )
+        self.sim = self.env.sim
 
         # ── Policy state ──────────────────────────────────────────────
         self.policy = None
@@ -85,35 +82,13 @@ class InteractiveHerriottCell:
 
     # ── Observation rendering ─────────────────────────────────────────
 
-    def _render_obs(self, hits) -> torch.Tensor:
+    def _render_obs(self, result) -> torch.Tensor:
         """
-        Render current spot pattern as a (1, 1, OBS_SIZE, OBS_SIZE) tensor
-        for the policy's encoder. Single-channel Gaussian spots on M1.
+        Render the policy observation (1, 1, img_res, img_res) from a sim result
+        through the env's own conversion and GaussianRenderer.
         """
-        x = np.linspace(-OBS_EXTENT, OBS_EXTENT, OBS_SIZE)
-        X, Y = np.meshgrid(x, x)
-        img = np.zeros((OBS_SIZE, OBS_SIZE), dtype=np.float32)
-
-        m_hits = [
-            (h["point"][0], h["point"][1], 0.98 ** (i + 1))
-            for i, h in enumerate(hits)
-            if h["mirror"] == self.obs_mirror
-        ]
-        for px, py, intensity in m_hits:
-            img += intensity * np.exp(
-                -((X - px) ** 2 + (Y - py) ** 2) / (2 * SPOT_SIGMA**2)
-            )
-
-        # Clip and normalize to [0, 1]
-        img = np.clip(img, 0, None)
-        if img.max() > 0:
-            img /= img.max()
-
-        return (
-            torch.tensor(img, device=DEVICE, dtype=torch.float32)
-            .unsqueeze(0)
-            .unsqueeze(0)
-        )
+        env_out = self.env._convert_sim_output(result)
+        return self.env._observe_from_result(env_out)["image"]
 
     # ── Policy stepping ───────────────────────────────────────────────
 
@@ -129,20 +104,22 @@ class InteractiveHerriottCell:
         hits = self._result_to_hits(result)
 
         # 2. Render observation
-        obs = self._render_obs(hits)
+        obs = self._render_obs(result)
 
-        # 3. Policy forward pass
+        # 3. Policy forward pass (deterministic: tanh of the mean)
         with torch.no_grad():
-            action, log_prob, value, h_new = self.policy.act(
-                obs, self.prev_action, self.hidden
+            action, _, log_prob, value, h_new = self.policy.act(
+                obs, self.prev_action, self.hidden, deterministic=True
             )
 
-        # 4. Scale and apply action (adjust M2 pitch/yaw)
-        delta_pitch = action[0, 0].item() * ACTION_SCALE
-        delta_yaw = action[0, 1].item() * ACTION_SCALE
+        # 4. Scale and apply action (adjust M2 pitch/yaw), as HerriottEnv.step
+        cfg = self.env.cfg
+        delta_pitch = action[0, 0].item() * cfg.action_scale[0]
+        delta_yaw = action[0, 1].item() * cfg.action_scale[1]
 
-        new_m2_pitch = np.clip(self.s_m2_pitch.val + delta_pitch, -5, 5)
-        new_m2_yaw = np.clip(self.s_m2_yaw.val + delta_yaw, -5, 5)
+        lim = cfg.m2_angle_limit
+        new_m2_pitch = np.clip(self.s_m2_pitch.val + delta_pitch, -lim, lim)
+        new_m2_yaw = np.clip(self.s_m2_yaw.val + delta_yaw, -lim, lim)
 
         # Update sliders (this triggers self.update via on_changed)
         self.s_m2_pitch.set_val(new_m2_pitch)
@@ -224,26 +201,20 @@ class InteractiveHerriottCell:
     # ── Sim helpers ───────────────────────────────────────────────────
 
     def _current_state_tensor(self):
-        return torch.tensor(
-            [
-                [
-                    self.s_m1_pitch.val,
-                    self.s_m1_yaw.val,
-                    self.s_m2_pitch.val,
-                    self.s_m2_yaw.val,
-                    self.s_sep.val,
-                ]
-            ],
-            device=DEVICE,
-            dtype=torch.float32,
+        """(1, 13) sim state from the sliders, built by the env (zero offsets)."""
+        self.env.env_params[0] = torch.tensor(
+            [self.s_m1_pitch.val, self.s_m1_yaw.val, self.s_sep.val]
         )
+        self.env.m2_state[0] = torch.tensor([self.s_m2_pitch.val, self.s_m2_yaw.val])
+        return self.env._build_sim_state()
 
     def _result_to_hits(self, result):
+        # Mirror by bounce parity as in the env: first hit M2, then alternating
         n = result["hit_counts"][0].item()
         seq = result["hit_sequence"][0, :n].cpu().numpy()
-        sep = self.s_sep.val
         return [
-            {"point": pt, "mirror": "M1" if pt[2] < sep / 2 else "M2"} for pt in seq
+            {"point": pt, "mirror": "M2" if i % 2 == 0 else "M1"}
+            for i, pt in enumerate(seq)
         ]
 
     def _rotation_matrix(self, pitch, yaw):
@@ -335,7 +306,7 @@ class InteractiveHerriottCell:
         state = self._current_state_tensor()
         result = self.sim.simulate(state)
         hits = self._result_to_hits(result)
-        self.draw(hits, state)
+        self.draw(hits, state, result)
 
     def _render_gaussian_spots(self, ax, hits, spot_sigma=0.5):
         res, extent = 256, 15
@@ -376,7 +347,7 @@ class InteractiveHerriottCell:
         ax.set_ylim(-extent, extent)
         ax.set_aspect("equal")
 
-    def draw(self, hits, state):
+    def draw(self, hits, state, result):
         self.ax3d.cla()
         self.ax2d.cla()
         self.ax2d_real.cla()
@@ -461,15 +432,17 @@ class InteractiveHerriottCell:
         self.ax2d_real.set_yticks([])
 
         # ── Policy observation (what the agent sees) ──────────────────
-        obs = self._render_obs(hits)
+        obs = self._render_obs(result)
         obs_np = obs[0, 0].cpu().numpy()
+        ext = self.env.cfg.img_extent
+        res = self.env.cfg.img_res
         self.ax_obs.imshow(
             obs_np,
             cmap="hot",
             origin="lower",
-            extent=[-OBS_EXTENT, OBS_EXTENT, -OBS_EXTENT, OBS_EXTENT],
+            extent=[-ext, ext, -ext, ext],
         )
-        self.ax_obs.set_title(f"Policy Obs (64×64)  Step {self.step_count}")
+        self.ax_obs.set_title(f"Policy Obs ({res}×{res})  Step {self.step_count}")
         self.ax_obs.set_aspect("equal")
         self.ax_obs.set_xticks([])
         self.ax_obs.set_yticks([])

@@ -66,6 +66,6 @@ marginals, 2D slices, bounce histograms, tolerance/path tradeoff. Figures land i
 
 - `simulation/interactive_sim.py` / `interactive_sim_exp.py` - matplotlib sliders over the sim
   DOFs with a live 3D layout and mirror-face spot pattern. `_exp` is the experimental fork.
-- `interactive_policy_trial.py` (repo root) - same viewer plus a trained RL policy: "Run Policy",
+- `rl/interactive_policy_trial.py` - same viewer plus a trained RL policy: "Run Policy",
   "Step", "Reset", "Load Ckpt". See [rl.md](rl.md) for the caveat about it being out of sync
   with the current sim API.

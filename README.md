@@ -280,7 +280,7 @@ rationale are documented in [cluster/README.md](cluster/README.md).
 | `cluster/` | Pitt CRCD job scripts |
 | `utils/` | offline evaluation sweep, evaluation-log parsing and plotting |
 | `simulation/` | GPU ray-trace simulator, stability search, interactive viewers |
-| `herriott_env.py`, `policy.py`, `train_rl.py`, `config_sampler.py` | reinforcement-learning exploration, currently dormant |
+| `rl/` | reinforcement-learning alignment (see `rl/README.md`) |
 | `ai_context/` | condensed per-module notes on the codebase |
 | `graphs/` | figures used here and in the paper |
 | `hardware_design/` | bill of materials |

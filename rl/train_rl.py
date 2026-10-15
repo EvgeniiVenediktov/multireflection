@@ -17,6 +17,7 @@ from typing import Optional
 
 from policy import RecurrentPolicy
 from herriott_env import HerriottEnv, EnvConfig
+from herriott_sim import SimConfig
 
 # from herriott_env import HerriottEnv, EnvConfig
 # from policy import RecurrentPolicy
@@ -103,7 +104,7 @@ class CheckpointManager:
             "optimizer_state_dict": optimizer.state_dict(),
             "sampler_state_dict": sampler.state_dict(),
             "extra": extra or {},
-            "return": ret or None,
+            "return": ret,
         }
         path = self.ckpt_dir / f"ckpt_{iteration:07d}_{'best' if best else ''}.pt"
         torch.save(state, path)
@@ -215,14 +216,18 @@ def ppo_update(
     optimizer,
     cfg,
     obs,
-    actions,
+    raw_actions,
     old_lp,
-    old_val,
-    stored_hidden,
     stored_prev_act,
+    dones,
     advantages,
     returns,
 ):
+    """PPO epochs over whole-env trajectories.
+
+    raw_actions are the pre-tanh actions from the rollout. The GRU is replayed
+    from h=0 and zeroed after every done step, as in the rollout.
+    """
     T, B = advantages.shape
     adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -239,17 +244,20 @@ def ppo_update(
             mb_B = idx.shape[0]
 
             mb_obs = obs[:, idx]
-            mb_act = actions[:, idx]
+            mb_act = raw_actions[:, idx]
             mb_olp = old_lp[:, idx]
             mb_adv = adv[:, idx]
             mb_ret = returns[:, idx]
             mb_pa = stored_prev_act[:, idx]
+            mb_done = dones[:, idx]
 
             h = torch.zeros(mb_B, policy.hidden_dim, device=cfg.device, dtype=cfg.dtype)
 
             new_lp, new_val, ent = [], [], []
             for t in range(T):
                 lp, v, e, h = policy.evaluate(mb_obs[t], mb_act[t], mb_pa[t], h)
+                # Env was reset after a done step: start from a fresh hidden state
+                h = torch.where(mb_done[t].unsqueeze(-1), torch.zeros_like(h), h)
                 new_lp.append(lp)
                 new_val.append(v)
                 ent.append(e)
@@ -291,7 +299,15 @@ def train(
     dev = cfg.device
 
     # ── Init components ───────────────────────────────────────────────
-    env = HerriottEnv(EnvConfig(num_envs=cfg.num_envs))
+    env = HerriottEnv(
+        EnvConfig(
+            num_envs=cfg.num_envs,
+            max_steps=cfg.max_steps,
+            sim=SimConfig(device=dev, dtype=cfg.dtype),
+            device=dev,
+            dtype=cfg.dtype,
+        )
+    )
     policy = RecurrentPolicy().to(dev)
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
 
@@ -300,11 +316,13 @@ def train(
             sampler_cfg = SimpleSamplerConfig(
                 fixed_env_params=cfg.fixed_env_params,
                 fixed_m2_init=cfg.fixed_m2_init,
+                device=dev,
+                dtype=cfg.dtype,
             )
         sampler = SimpleConfigSampler(sampler_cfg)
     else:
         if sampler_cfg is None:
-            sampler_cfg = BinnedSamplerConfig()
+            sampler_cfg = BinnedSamplerConfig(device=dev, dtype=cfg.dtype)
         sampler = BinnedConfigSampler(sampler_cfg)
 
     ckpt_mgr = CheckpointManager(cfg.run_dir)
@@ -318,8 +336,10 @@ def train(
     # ── Resume from checkpoint ────────────────────────────────────────
     if cfg.resume_last or cfg.resume_best:
 
-        ckpt = ckpt_mgr.load_latest() if cfg.resume_last else None
+        # Best takes precedence; fall back to latest
         ckpt = ckpt_mgr.load_best() if cfg.resume_best else None
+        if ckpt is None and cfg.resume_last:
+            ckpt = ckpt_mgr.load_latest()
         if ckpt is not None:
             policy.load_state_dict(ckpt["policy_state_dict"])
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -333,12 +353,13 @@ def train(
     # ── Pre-allocate rollout buffers (GPU) ────────────────────────────
     img_res = env.cfg.img_res  # e.g. 64
     buf_obs = torch.empty(T, B, 1, img_res, img_res, device=dev)
-    buf_action = torch.empty(T, B, 2, device=dev)
+    buf_raw_action = torch.empty(T, B, 2, device=dev)  # pre-tanh
     buf_logprob = torch.empty(T, B, device=dev)
     buf_reward = torch.empty(T, B, device=dev)
+    # V(final obs) of episodes truncated at step t (time limit), else 0
+    buf_trunc_value = torch.empty(T, B, device=dev)
     buf_done = torch.empty(T, B, dtype=torch.bool, device=dev)
     buf_value = torch.empty(T, B, device=dev)
-    buf_hidden = torch.empty(T, B, policy.hidden_dim, device=dev)
     buf_prev_act = torch.empty(T, B, 2, device=dev)
 
     # ── Training loop ─────────────────────────────────────────────────
@@ -366,20 +387,22 @@ def train(
         with torch.no_grad():
             for t in range(T):
                 buf_obs[t] = obs["image"]
-                buf_hidden[t] = hidden
                 buf_prev_act[t] = prev_action
 
-                action, log_prob, value, h_new = policy.act(
+                action, raw_action, log_prob, value, h_new = policy.act(
                     obs["image"], prev_action, hidden
                 )
 
                 obs_next, reward, done, info = env.step(action)
 
-                buf_action[t] = action
+                buf_raw_action[t] = raw_action
                 buf_logprob[t] = log_prob
                 buf_reward[t] = reward
+                buf_trunc_value[t] = 0.0
                 buf_done[t] = done
                 buf_value[t] = value
+
+                prev_action = action.clone()
 
                 ep_returns += reward
                 ep_lengths += 1
@@ -396,6 +419,16 @@ def train(
                     ep_returns[done] = 0.0
                     ep_lengths[done] = 0.0
 
+                    # Episodes end on the time limit only (truncation): bootstrap
+                    # from V(final pre-reset obs); GAE still cuts the trace at done
+                    _, _, _, final_val, _ = policy.act(
+                        obs_next["image"][d_ids],
+                        action[d_ids],
+                        h_new[d_ids],
+                        deterministic=True,
+                    )
+                    buf_trunc_value[t, d_ids] = final_val
+
                     # Reset done envs — same config, fresh M2 jitter
                     fresh_m2 = batch_config.m2_init[d_ids] + (
                         torch.randn(d_ids.shape[0], 2, device=dev)
@@ -409,22 +442,24 @@ def train(
                         m2_init=fresh_m2,
                         env_ids=d_ids,
                     )
-                    # Merge reset obs into obs_next
+                    # Merge reset obs into obs_next (reset returns all B envs)
                     for k in obs_next:
-                        obs_next[k][d_ids] = obs_next_partial[k]
+                        obs_next[k][d_ids] = obs_next_partial[k][d_ids]
 
                     h_new[done] = 0.0
+                    prev_action[done] = 0.0
 
                 obs = obs_next
                 hidden = h_new
-                prev_action = action
 
             # Bootstrap
-            _, _, last_val, _ = policy.act(obs["image"], prev_action, hidden)
+            _, _, _, last_val, _ = policy.act(
+                obs["image"], prev_action, hidden, deterministic=True
+            )
 
-        # 4. GAE
+        # 4. GAE (truncated episodes get gamma * V(final obs) added to the reward)
         advantages, returns = compute_gae(
-            buf_reward,
+            buf_reward + cfg.gamma * buf_trunc_value,
             buf_value,
             buf_done,
             last_val,
@@ -438,11 +473,10 @@ def train(
             optimizer,
             cfg,
             buf_obs,
-            buf_action,
+            buf_raw_action,
             buf_logprob,
-            buf_value,
-            buf_hidden,
             buf_prev_act,
+            buf_done,
             advantages,
             returns,
         )

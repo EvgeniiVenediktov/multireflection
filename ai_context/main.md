@@ -33,7 +33,7 @@ before touching `train/`, `utils/eval_*.py` or `cluster/`. The per-module notes 
 | Supervised training: dataset, loop, augmentation | `train/train_resnet_direct.py` | [training.md](training.md) |
 | Deployed closed loop + evaluation harness | `app/`, `utils/graph_eval.py` | [alignment_loop.md](alignment_loop.md) |
 | Ray-trace simulator + parameter/stability search | `simulation/` | [simulation.md](simulation.md) |
-| RL (PPO, GRU policy, vectorized env) - dormant | `herriott_env.py`, `policy.py`, `train_rl.py`, `config_sampler.py` | [rl.md](rl.md) |
+| RL (PPO on the GPU sim), active since 2026-10-15 | `rl/` | `rl/README.md`, `rl/PLAN.md` |
 
 ## Repository layout
 

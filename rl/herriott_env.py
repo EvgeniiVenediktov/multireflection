@@ -8,7 +8,8 @@ Env/train contract:
     obs dict:     {'image': (B,1,H,W), 'state': (B,5)}
 
 Sim contract (unchanged):
-    sim.simulate(state: (B,5)) -> dict with hit_counts, hit_sequence, etc.
+    sim.simulate(state: (B,13)) -> dict with hit_counts, hit_sequence, etc.
+    Offsets and laser errors (state[:, 5:13]) are held at zero.
 """
 
 import torch
@@ -17,7 +18,19 @@ from enum import IntEnum
 from typing import Tuple, Optional, Dict
 from dataclasses import dataclass, field
 
-from simulation.herriott_sim import HerriottSim, SimConfig, MirrorConfig, DEVICE, DTYPE
+from herriott_sim import (
+    HerriottSim,
+    SimConfig,
+    MirrorConfig,
+    DEVICE,
+    DTYPE,
+    STATE_DIM,
+    S_M1_PITCH,
+    S_M1_YAW,
+    S_M2_PITCH,
+    S_M2_YAW,
+    S_SEP,
+)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -166,7 +179,6 @@ class HerriottEnv:
             m1_cfg=c.m1,
             m2_cfg=c.m2,
             sim_cfg=c.sim,
-            # mounted_laser=True,
         )
         self.renderer = GaussianRenderer(c)
 
@@ -200,7 +212,17 @@ class HerriottEnv:
     # ── State assembly ────────────────────────────────────────────────
 
     def _build_sim_state(self) -> torch.Tensor:
-        """Assemble (B, 5) state tensor for the sim."""
+        """Assemble (B, 13) state tensor for the sim; offsets/laser errors zero."""
+        state = torch.zeros(self.B, STATE_DIM, device=self.dev, dtype=self.dt)
+        state[:, S_M1_PITCH] = self.env_params[:, 0]
+        state[:, S_M1_YAW] = self.env_params[:, 1]
+        state[:, S_M2_PITCH] = self.m2_state[:, 0]
+        state[:, S_M2_YAW] = self.m2_state[:, 1]
+        state[:, S_SEP] = self.env_params[:, 2]
+        return state
+
+    def _full_state(self) -> torch.Tensor:
+        """Full 5D state for observation: [m1p, m1y, m2p, m2y, sep]."""
         return torch.cat(
             [
                 self.env_params[:, :2],  # m1_pitch, m1_yaw
@@ -209,10 +231,6 @@ class HerriottEnv:
             ],
             dim=-1,
         )
-
-    def _full_state(self) -> torch.Tensor:
-        """Full 5D state for observation: [m1p, m1y, m2p, m2y, sep]."""
-        return self._build_sim_state()
 
     # ── Reset ─────────────────────────────────────────────────────────
 
@@ -305,11 +323,11 @@ class HerriottEnv:
 
     def _simulate(self) -> Dict[str, torch.Tensor]:
         """
-        Call sim with (B, 5) state, convert output to env contract.
+        Call sim with (B, 13) state, convert output to env contract.
 
         Sim returns:
             hit_counts, final_positions, total_path_length,
-            hit_sequence (B, N, 3), intensity
+            hit_sequence (B, N, 3), intensity, exited_hole
 
         Env needs:
             hit_xy (B,N,2), hit_intensity (B,N), hit_mirrors (B,N),
@@ -322,7 +340,6 @@ class HerriottEnv:
     def _convert_sim_output(self, raw: dict) -> Dict[str, torch.Tensor]:
         """Bridge sim output dict → env output dict. All GPU, no copies."""
         B = raw["hit_counts"].shape[0]
-        N = self.cfg.sim.max_bounces
 
         # ── hit_valid: bounce b is valid if b < hit_counts[i] ─────────
         hit_valid = self._bounce_idx.unsqueeze(0) < raw["hit_counts"].unsqueeze(1)
@@ -339,15 +356,8 @@ class HerriottEnv:
         hit_intensity = self._intensity_template.unsqueeze(0).expand(B, -1)
         hit_intensity = hit_intensity * hit_valid.float()
 
-        # ── exited: beam reached hole (stopped early, not from decay) ─
-        # If bounce count < max AND final intensity > threshold,
-        # the ray likely hit the hole rather than missing the mirror
-        final_intensity = self._intensity_template[raw["hit_counts"].clamp(min=1) - 1]
-        exited = (
-            (raw["hit_counts"] > 0)
-            & (raw["hit_counts"] < N)
-            & (final_intensity > self.cfg.sim.intensity_threshold)
-        )
+        # ── exited: sim flags rays that left through the M1 hole ──────
+        exited = raw["exited_hole"]
 
         return {
             "hit_xy": hit_xy,

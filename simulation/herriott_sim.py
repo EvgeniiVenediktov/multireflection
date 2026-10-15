@@ -214,8 +214,13 @@ class HerriottSim:
         sag: float,
         hole_radius: float = 0,
         hole_offset: torch.Tensor = None,
-    ) -> torch.Tensor:
-        """Check if hit is within mirror aperture and not in hole."""
+        return_hole: bool = False,
+    ):
+        """Check if hit is within mirror aperture and not in hole.
+
+        With return_hole=True, returns (valid, in_hole) where in_hole marks hits
+        inside the aperture that fall in the hole.
+        """
         rel = hit - position
 
         local_x_axis = R[:, :, 0]  # (B, 3)
@@ -227,14 +232,32 @@ class HerriottSim:
 
         dot_normal = (rel * normal).sum(dim=-1)
         valid = (r < aperture) & (dot_normal >= 0) & (dot_normal < sag + 1)
+        in_hole = torch.zeros_like(valid)
 
         if hole_radius > 0 and hole_offset is not None:
             hole_dist = torch.sqrt(
                 (lx - hole_offset[0]) ** 2 + (ly - hole_offset[1]) ** 2
             )
-            valid = valid & (hole_dist >= hole_radius)
+            in_hole = valid & (hole_dist < hole_radius)
+            valid = valid & ~in_hole
 
+        if return_hole:
+            return valid, in_hole
         return valid
+
+    @staticmethod
+    def _front_side(
+        hit: torch.Tensor,
+        directions: torch.Tensor,
+        center: torch.Tensor,
+    ) -> torch.Tensor:
+        """True if the ray arrives on the reflective (concave) face.
+
+        The outward normal of the reflective face points from the surface toward
+        the centre of curvature, n = (center - hit) / roc; the incoming direction
+        must point into the face, dot(direction, n) < 0.
+        """
+        return (directions * (center - hit)).sum(dim=-1) < 0
 
     def simulate(self, state: torch.Tensor) -> dict:
         """
@@ -250,6 +273,8 @@ class HerriottSim:
                 - total_path_length: (B,) total optical path
                 - hit_sequence: (B, max_bounces, 3) all hit positions (padded)
                 - intensity: (B,) remaining beam intensity
+                - exited_hole: (B,) bool, the ray ended by leaving through the
+                  M1 hole (reached the hole from the reflective side)
         """
         B = state.shape[0]
         assert (
@@ -321,6 +346,8 @@ class HerriottSim:
         intensity = torch.ones(B, device=self.device, dtype=self.dtype)
         path_length = torch.zeros(B, device=self.device, dtype=self.dtype)
         last_hit_mirror = torch.zeros(B, dtype=torch.long, device=self.device)
+        exited_hole = torch.zeros(B, dtype=torch.bool, device=self.device)
+        inf = torch.tensor(float("inf"), device=self.device)
 
         for bounce in range(self.sim_cfg.max_bounces):
             if not active.any():
@@ -340,8 +367,8 @@ class HerriottSim:
             hit2_near = origins + t2_near.unsqueeze(-1) * directions
             hit2_far = origins + t2_far.unsqueeze(-1) * directions
 
-            # Aperture check each candidate
-            v1_near = v1_near & self._check_aperture(
+            # Aperture check each candidate (M1 also reports hole crossings)
+            ap1_near, hole1_near = self._check_aperture(
                 hit1_near,
                 m1_pos,
                 m1_R,
@@ -350,8 +377,9 @@ class HerriottSim:
                 self.m1_sag,
                 self.m1_cfg.hole_radius,
                 self.m1_hole_offset,
+                return_hole=True,
             )
-            v1_far = v1_far & self._check_aperture(
+            ap1_far, hole1_far = self._check_aperture(
                 hit1_far,
                 m1_pos,
                 m1_R,
@@ -360,7 +388,12 @@ class HerriottSim:
                 self.m1_sag,
                 self.m1_cfg.hole_radius,
                 self.m1_hole_offset,
+                return_hole=True,
             )
+            hole1_near = v1_near & hole1_near
+            hole1_far = v1_far & hole1_far
+            v1_near = v1_near & ap1_near
+            v1_far = v1_far & ap1_far
             v2_near = v2_near & self._check_aperture(
                 hit2_near,
                 m2_pos,
@@ -378,8 +411,37 @@ class HerriottSim:
                 self.m2_sag,
             )
 
+            # Incidence side: a mirror reflects only when hit on its reflective
+            # face. A hit on the back of a mirror blocks the ray (no reflection).
+            f1_near = self._front_side(hit1_near, directions, m1_center)
+            f1_far = self._front_side(hit1_far, directions, m1_center)
+            f2_near = self._front_side(hit2_near, directions, m2_center)
+            f2_far = self._front_side(hit2_far, directions, m2_center)
+            t_block = torch.minimum(
+                torch.minimum(
+                    torch.where(v1_near & ~f1_near, t1_near, inf),
+                    torch.where(v1_far & ~f1_far, t1_far, inf),
+                ),
+                torch.minimum(
+                    torch.where(v2_near & ~f2_near, t2_near, inf),
+                    torch.where(v2_far & ~f2_far, t2_far, inf),
+                ),
+            )
+            v1_near = v1_near & f1_near
+            v1_far = v1_far & f1_far
+            v2_near = v2_near & f2_near
+            v2_far = v2_far & f2_far
+
+            # Nearest front-side M1 disk crossing lies in the hole -> exit
+            hole1_near = hole1_near & f1_near
+            hole1_far = hole1_far & f1_far
+            td1_near = torch.where(v1_near | hole1_near, t1_near, inf)
+            td1_far = torch.where(v1_far | hole1_far, t1_far, inf)
+            td1 = torch.minimum(td1_near, td1_far)
+            in_hole1 = torch.where(td1 == td1_near, hole1_near, hole1_far)
+            in_hole1 = in_hole1 & (td1 < inf)
+
             # For each mirror, pick the closer valid hit (prefer near, fallback far)
-            inf = torch.tensor(float("inf"), device=self.device)
             t1_near = torch.where(v1_near, t1_near, inf)
             t1_far = torch.where(v1_far, t1_far, inf)
             t1 = torch.minimum(t1_near, t1_far)
@@ -403,6 +465,20 @@ class HerriottSim:
             hit_m1 = (t1 <= t2) & v1
             hit_m2 = (t2 < t1) & v2
             any_hit = hit_m1 | hit_m2
+
+            # Back-side hit in front of the nearest reflection blocks the ray
+            any_hit = any_hit & (torch.minimum(t1, t2) < t_block)
+            hit_m1 = hit_m1 & any_hit
+            hit_m2 = hit_m2 & any_hit
+
+            # Ray ends here; flag it if it leaves through the M1 hole
+            exited_hole = exited_hole | (
+                active
+                & ~any_hit
+                & in_hole1
+                & (last_hit_mirror != 1)
+                & (td1 < t_block)
+            )
 
             active = active & any_hit
             if not active.any():
@@ -452,6 +528,7 @@ class HerriottSim:
             "total_path_length": path_length,
             "hit_sequence": hit_sequence,
             "intensity": intensity,
+            "exited_hole": exited_hole,
         }
 
     def reward(self, state: torch.Tensor, target_bounces: int = 20) -> torch.Tensor:

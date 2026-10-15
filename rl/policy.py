@@ -14,6 +14,15 @@ from torch.distributions import Normal
 from typing import Tuple, Iterator, Optional
 
 
+# GroupNorm groups in the encoder. GroupNorm (not BatchNorm) keeps rollout,
+# PPO update and eval the same function of the input: no batch statistics.
+GN_GROUPS = 8
+
+# Bounds on the policy log-std
+LOG_STD_MIN = -5.0
+LOG_STD_MAX = 1.0
+
+
 # ── Default Encoder ───────────────────────────────────────────────────────────
 
 class ResBlock(nn.Module):
@@ -21,9 +30,9 @@ class ResBlock(nn.Module):
 
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
         super().__init__()
-        self.bn1 = nn.BatchNorm2d(in_ch)
+        self.norm1 = nn.GroupNorm(GN_GROUPS, in_ch)
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.norm2 = nn.GroupNorm(GN_GROUPS, out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
 
         self.shortcut = nn.Identity()
@@ -31,8 +40,8 @@ class ResBlock(nn.Module):
             self.shortcut = nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv1(F.relu(self.bn1(x), inplace=True))
-        out = self.conv2(F.relu(self.bn2(out), inplace=True))
+        out = self.conv1(F.relu(self.norm1(x), inplace=True))
+        out = self.conv2(F.relu(self.norm2(out), inplace=True))
         return out + self.shortcut(x)
 
 
@@ -53,7 +62,7 @@ class SpotPatternEncoder(nn.Module):
         # Stem: initial conv to get to base channels
         self.stem = nn.Sequential(
             nn.Conv2d(img_channels, 32, 3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(GN_GROUPS, 32),
             nn.ReLU(inplace=True),
         )
 
@@ -169,7 +178,8 @@ class RecurrentPolicy(nn.Module):
         """Build squashed Gaussian from GRU output."""
         h = self.pi_net(gru_out)
         mean = self.pi_mean(h)
-        std = self.pi_log_std.exp().expand_as(mean)
+        log_std = self.pi_log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
+        std = log_std.exp().expand_as(mean)
         return Normal(mean, std)
 
     def _get_value(self, gru_out: torch.Tensor) -> torch.Tensor:
@@ -199,12 +209,15 @@ class RecurrentPolicy(nn.Module):
         obs_image: torch.Tensor,    # (B, C, H, W)
         prev_action: torch.Tensor,  # (B, 2)
         hidden: torch.Tensor,       # (B, hidden_dim)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample action during rollout (under torch.no_grad externally).
+        With deterministic=True the action is tanh of the distribution mean.
 
         Returns:
             action:     (B, 2)          tanh-squashed, in (-1, 1)
+            raw_action: (B, 2)          pre-tanh sample (store it for evaluate())
             log_prob:   (B,)
             value:      (B,)
             hidden_new: (B, hidden_dim)
@@ -212,19 +225,19 @@ class RecurrentPolicy(nn.Module):
         gru_out, h_new = self._encode_and_step_gru(obs_image, prev_action, hidden)
 
         dist = self._get_dist(gru_out)
-        raw = dist.rsample()              # pre-tanh
+        raw = dist.mean if deterministic else dist.rsample()  # pre-tanh
         action = torch.tanh(raw)          # squashed to (-1, 1)
         log_prob = self._tanh_log_prob(dist, raw)
         value = self._get_value(gru_out)
 
-        return action, log_prob, value, h_new
+        return action, raw, log_prob, value, h_new
 
     # ── Public API: PPO update ────────────────────────────────────────
 
     def evaluate(
         self,
         obs_image: torch.Tensor,    # (B, C, H, W)
-        action: torch.Tensor,       # (B, 2)  — the squashed action from buffer
+        raw_action: torch.Tensor,   # (B, 2)  — the pre-tanh action from buffer
         prev_action: torch.Tensor,  # (B, 2)
         hidden: torch.Tensor,       # (B, hidden_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -241,19 +254,12 @@ class RecurrentPolicy(nn.Module):
 
         dist = self._get_dist(gru_out)
 
-        # Invert tanh to get raw action for log_prob computation
-        raw = self._atanh(action)
-        log_prob = self._tanh_log_prob(dist, raw)
+        # Log-prob from the stored pre-tanh action (no atanh round trip)
+        log_prob = self._tanh_log_prob(dist, raw_action)
         entropy = self._tanh_entropy(dist)
         value = self._get_value(gru_out)
 
         return log_prob, value, entropy, h_new
-
-    @staticmethod
-    def _atanh(x: torch.Tensor) -> torch.Tensor:
-        """Numerically stable inverse tanh."""
-        x = x.clamp(-0.999, 0.999)
-        return 0.5 * (x.log1p() - (-x).log1p())
 
     # ── Modularity API ────────────────────────────────────────────────
 
@@ -311,13 +317,13 @@ class RecurrentPolicy(nn.Module):
     # ── Init ──────────────────────────────────────────────────────────
 
     def _init_weights(self):
-        # CNN encoder: Kaiming for conv, standard for BN
+        # CNN encoder: Kaiming for conv, standard for GroupNorm
         for m in self.encoder.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, nn.GroupNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
@@ -367,14 +373,15 @@ def _test():
     h = torch.zeros(B, policy.hidden_dim, device=dev)
 
     # ── 1. Shape test ─────────────────────────────────────────────────
-    action, lp, val, h_new = policy.act(img, pa, h)
+    action, raw, lp, val, h_new = policy.act(img, pa, h)
     assert action.shape == (B, 2), f"action {action.shape}"
+    assert raw.shape == (B, 2), f"raw {raw.shape}"
     assert lp.shape == (B,), f"lp {lp.shape}"
     assert val.shape == (B,), f"val {val.shape}"
     assert h_new.shape == (B, 128), f"h_new {h_new.shape}"
     print("[PASS] 1. act() shapes")
 
-    lp2, val2, ent, h_new2 = policy.evaluate(img, action, pa, h)
+    lp2, val2, ent, h_new2 = policy.evaluate(img, raw, pa, h)
     assert lp2.shape == (B,)
     assert val2.shape == (B,)
     assert ent.shape == (B,)
@@ -383,7 +390,7 @@ def _test():
 
     # ── 2. Action bounds ──────────────────────────────────────────────
     for _ in range(100):
-        a, _, _, _ = policy.act(img, pa, h)
+        a, _, _, _, _ = policy.act(img, pa, h)
         assert (a.abs() < 1.0).all(), f"action out of bounds: {a.min()}, {a.max()}"
     print("[PASS] 3. action bounds (-1, 1)")
 
@@ -403,8 +410,8 @@ def _test():
     print("[PASS] 5. gradient flow through all params")
 
     # ── 5. GRU state propagation ──────────────────────────────────────
-    a1, _, _, h1 = policy.act(img, pa, h)
-    a2, _, _, h2 = policy.act(img, pa, h1)  # different hidden
+    a1, _, _, _, h1 = policy.act(img, pa, h)
+    a2, _, _, _, h2 = policy.act(img, pa, h1)  # different hidden
     assert not torch.allclose(h1, h2), "GRU hidden didn't change"
     print("[PASS] 6. GRU state propagation")
 
@@ -412,8 +419,8 @@ def _test():
     sd = policy.state_dict()
     policy2 = RecurrentPolicy(hidden_dim=128, feat_dim=128).to(dev)
     policy2.load_state_dict(sd)
-    a_orig, _, _, _ = policy.act(img, pa, h)
-    a_load, _, _, _ = policy2.act(img, pa, h)
+    a_orig, _, _, _, _ = policy.act(img, pa, h)
+    a_load, _, _, _, _ = policy2.act(img, pa, h)
     # Note: rsample is stochastic, so compare deterministic parts
     with torch.no_grad():
         g1, _ = policy._encode_and_step_gru(img, pa, h)
@@ -440,7 +447,7 @@ def _test():
         assert torch.equal(gru_before[k], gru_after[k]), f"GRU changed: {k}"
     assert policy.input_proj.in_features == 258  # 256 + 2
     # Verify forward still works
-    a, _, _, _ = policy.act(img, pa, h)
+    a, _, _, _, _ = policy.act(img, pa, h)
     assert a.shape == (B, 2)
     print("[PASS] 9. encoder swap (different feat_dim) rebuilds input_proj, GRU intact")
 
@@ -467,7 +474,7 @@ def _test():
     # ── 11. Gradient isolation when frozen ────────────────────────────
     policy.freeze_core()
     policy.zero_grad()
-    lp3, val3, ent3, _ = policy.evaluate(img, action.detach(), pa, h)
+    lp3, val3, ent3, _ = policy.evaluate(img, raw.detach(), pa, h)
     (lp3.sum() + val3.sum() + ent3.sum()).backward()
     for name, p in policy.named_parameters():
         if 'encoder' in name or 'input_proj' in name:
@@ -476,6 +483,54 @@ def _test():
             assert p.grad is None or (p.grad == 0).all(), f"grad leaked to frozen: {name}"
     policy.unfreeze_all()
     print("[PASS] 12. gradient isolation when core frozen")
+
+    # ── 12. act/evaluate log-prob consistency, incl. saturated raw ────
+    policy.zero_grad()
+    with torch.no_grad():
+        _, raw_s, lp_s, _, _ = policy.act(img, pa, h)
+        lp_e, _, _, _ = policy.evaluate(img, raw_s, pa, h)
+        assert torch.allclose(lp_s, lp_e, atol=1e-4), "act/evaluate log-prob mismatch"
+        g, _ = policy._encode_and_step_gru(img, pa, h)
+        dist = policy._get_dist(g)
+        big = torch.full((B, 2), 6.0, device=dev)  # tanh(6) rounds past 0.999
+        lp_big, _, _, _ = policy.evaluate(img, big, pa, h)
+        assert torch.allclose(lp_big, policy._tanh_log_prob(dist, big), atol=1e-4)
+        assert torch.isfinite(lp_big).all(), "lp for saturated raw not finite"
+    print("[PASS] 13. act/evaluate log-prob consistent, saturated raw handled")
+
+    # ── 13. Deterministic action ──────────────────────────────────────
+    with torch.no_grad():
+        a_d1, raw_d, _, _, _ = policy.act(img, pa, h, deterministic=True)
+        a_d2, _, _, _, _ = policy.act(img, pa, h, deterministic=True)
+        g, _ = policy._encode_and_step_gru(img, pa, h)
+        mean = policy._get_dist(g).mean
+    assert torch.equal(a_d1, a_d2), "deterministic act not repeatable"
+    assert torch.allclose(a_d1, torch.tanh(mean)) and torch.allclose(raw_d, mean)
+    print("[PASS] 14. deterministic act = tanh(mean)")
+
+    # ── 14. log-std clamp ─────────────────────────────────────────────
+    with torch.no_grad():
+        policy.pi_log_std.fill_(10.0)
+        std_hi = policy._get_dist(g).stddev
+        policy.pi_log_std.fill_(-20.0)
+        std_lo = policy._get_dist(g).stddev
+        policy.pi_log_std.fill_(-0.5)
+    assert torch.allclose(std_hi, torch.full_like(std_hi, math.exp(LOG_STD_MAX)))
+    assert torch.allclose(std_lo, torch.full_like(std_lo, math.exp(LOG_STD_MIN)))
+    print("[PASS] 15. log-std clamped to [LOG_STD_MIN, LOG_STD_MAX]")
+
+    # ── 15. train/eval mode give the same output (no batch statistics) ─
+    with torch.no_grad():
+        policy.train()
+        f_train = policy.encoder(img)
+        f_train_half = policy.encoder(img[: B // 2])
+        policy.eval()
+        f_eval = policy.encoder(img)
+    policy.train()
+    # Loose tolerance: cuDNN may pick TF32 kernels that differ per batch size
+    assert torch.allclose(f_train, f_eval, atol=1e-2), "train/eval encoder mismatch"
+    assert torch.allclose(f_train[: B // 2], f_train_half, atol=1e-2), "batch dependence"
+    print("[PASS] 16. encoder independent of mode and batch composition")
 
     print("\n=== ALL TESTS PASSED ===")
 
