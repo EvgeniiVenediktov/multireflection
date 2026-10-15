@@ -66,26 +66,73 @@ correct; they go away only because the action space changes (P1) and the GRU is 
 
 ## Phases
 
-1. **Baseline commit.** Commit the move into `rl/` together with the current RL working-tree
-   changes, so the rewrite has a reference point.
-2. **Simulator** (S1-S6). `geometry.py` with the measured cell; fused kernel; per-hit mirror,
-   local coordinates, stop reason. Tests: nominal 31 bounces / 2733 mm / hole exit; fused
-   kernel matches the PyTorch reference on the landscape scan in README. Target: < 2 ms
-   per step at B = 256 for any bounce count.
-3. **Environment** `env.py` (E1-E8). Splat renderer, discrete actions with not move, path
-   reward, auto-reset, history stack kept in the env. Target: < 5 ms per step at B = 256.
-   Scripted checks: renders of nominal, 57, 89 and 1-3 bounce states.
+1. **Baseline commit.** Done, `bb31707`.
+2. **Simulator** (S1-S6). Done, `5bb72c2`: fused Triton kernel, 0.09-0.72 ms per call at
+   B = 256, bit-identical to the PyTorch reference.
+3. **Environment** (E1-E8). Done, `76aaabe`: `env.py`, 3 ms per step at B = 256, 64 px.
 4. **Baselines** before trusting PPO: random policy, always-not-move, and a sim-access oracle
-   (greedy search on true path with the same action ladder) to get the reachable path and the
-   step count the agent should match.
-5. **Policy and PPO** `policy.py`, `train.py` (P1-P6, T1-T6). Sanity order: one fixed initial
+   (knows the true tilt; walks to the best reachable tilt with the same action ladder) for the
+   reachable path and the step count to match. Also a scripted image-only heuristic (fixed
+   search pattern until a second spot appears, then climb on spot count) to show how much
+   the blind region costs without learning.
+5. **Encoder and history pretraining**, see the section below. Starts with the single-frame
+   encoder benchmark (CNN vs ViT), which is independent of phase 4.
+6. **Policy and PPO** `policy.py`, `train.py` (P1-P6, T1-T6). Sanity order: one fixed initial
    tilt (must solve), a small radius around nominal, then the full range (curriculum on the
-   initial-tilt radius). Path head trained from the start as an auxiliary loss; check its
-   error on its own before relying on it.
-6. **Viewer** - rewrite `interactive_policy_trial.py` on the new env and policy, then delete
+   initial-tilt radius). Path head and the other auxiliary heads trained from the start.
+7. **Viewer** - rewrite `interactive_policy_trial.py` on the new env and policy, then delete
    the old files.
 
 Stages 2-4 from README follow once stage 1 trains reliably.
+
+## Phase 5 - encoder and history pretraining
+
+**Identifiability.** In 41.5 % of the +-2 deg box (1-2 bounces) the M2 image is one spot at
+(8.6, 1.4) mm, constant to 0.05 mm (0.1 px at 64 px): the first hit, set by the laser, not by
+M2. The 1-bounce part (34.7 %) is blank on M1 as well. One frame cannot give the tilt there;
+the history gives only displacement since the episode start. The policy has to search and
+remember where it has looked, so K = 8 may be too short: try 16-32 with a causal transformer
+over time. (Edge scattering on the real cell may make part of this region visible.)
+
+**One network:** frame encoder -> token (frame embedding, applied action) per step -> causal
+transformer over the last K steps -> heads: policy (incl. not move), value, path, auxiliary.
+"Pretraining" is a training signal for this network, not a separate model.
+
+**Level 1 - frame encoder, single-image targets only** (what is in the picture):
+- spot map: narrow peak at each M2 spot centre, peak height = incident intensity
+  (reflectivity^k); order-free, handles overlap, forces a position-preserving encoder (no
+  global average pooling);
+- spot count, classified into bins (overlap makes it noisy);
+- ellipse fitted to the spots (centre, axes, angle).
+Not targets here: tilt, laser tilt, separation, path in mm.
+
+Nuisance randomization on the input only, targets unchanged: blur sigma and shape plus a
+scatter halo (surface finish), gain, gamma, black level, noise (camera), channel response
+(laser color), camera pose (homography; render the mirror rim so mirror-frame targets stay
+identifiable), small geometry jitter. Added to `SpotRenderer` as a randomized mode.
+
+Candidates, compared on this supervised benchmark before any RL:
+- CNN with spatial-softmax keypoints (or flatten) instead of global pooling;
+- small ViT: 4-6 layers, width 128-192, pre-LN, 4-8 px patches, 2D position embeddings.
+Metrics: spot-map and count error, 89 vs trapped discrimination, robustness on held-out
+render parameters, inference speed (deployment hardware undecided; minimizing model size comes later).
+
+**Level 2 - history targets** (same network, need several steps):
+- M2 tilt as mean + variance (Gaussian NLL), so the model can say "unknown" while the
+  history is blind; stage 2: laser tilt and separation (RMA-style inference from history);
+- forward dynamics: next spot map given the next action; inverse dynamics: action between
+  two frames;
+- current path / bounces (path head).
+Trained on simulated trajectories with exploratory actions (random and scripted search).
+
+**Order.** Default: one phase, these heads as auxiliary losses from the first PPO update.
+Fallback (PPO slow to start, or ViT unstable): supervised warm-up of the same network, then
+PPO with the encoder frozen, unfrozen later at ~10x lower learning rate.
+
+**Real data (stage 4).** Spot pseudo-labels from the classical extraction in
+`tools/count_reflections.py` / `tools/fit_extract_spots.py`; the 228k real raster (0.01 deg,
+known motor positions, M1 tilt) as real trajectories for the dynamics targets; MAE on mixed
+sim and real images. None of this needs laser-tilt labels.
 
 ## Stage 2 - scenario sampling (replaces `config_sampler.py`)
 
