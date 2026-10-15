@@ -55,7 +55,7 @@ files. Timings: local RTX A2000 under WSL2, B = 256 envs.
 | # | Finding | Action |
 |---|---|---|
 | T1 | Rollout length = episode length and all envs reset at each iteration, so the mid-rollout reset path only fires at the last step (one wasted sim + render of all B) and episodes never span iterations. | Rollout length independent of episode length; envs persist across iterations with their history stacks. |
-| T2 | All 256 envs share one sampled geometry per iteration. Harmless for stage 1, wrong for stage 2. | Per-env geometry sampling. |
+| T2 | All 256 envs share one sampled geometry per iteration. Harmless for stage 1, wrong for stage 2. | Per-env scenario sampling; sampler rewritten, see Stage 2. |
 | T3 | "Best" checkpoint = best noisy training return; every improvement writes a new file. | Periodic deterministic eval on a fixed seeded set of initial tilts; keep `latest` and `best` (by eval) only. |
 | T4 | No success metrics. | Eval: final path, fraction ending at >= 31 / 57 / 89 bounces, steps to first reach each, not-move rate, path-head error. |
 | T5 | Per-env `.item()` loop on episode end; hyperparameters edited in `__main__`; W&B run name `None`. | Vectorized episode stats; CLI arguments; W&B name built at start from the config. |
@@ -86,6 +86,42 @@ correct; they go away only because the action space changes (P1) and the GRU is 
    the old files.
 
 Stages 2-4 from README follow once stage 1 trains reliably.
+
+## Stage 2 - scenario sampling (replaces `config_sampler.py`)
+
+Problem: many (separation, laser tilt) pairs give no pattern, or only 1-2 bounces, anywhere
+in the M2 box. Uniform sampling makes the reward scarce and fills batches with scenarios
+that have nothing to learn. The old `BinnedConfigSampler` (one config per batch, priority
+from raw return) does not address this; it is replaced.
+
+Prior work weights scenarios by learning potential: Goal GAN (goals of intermediate
+difficulty), Teacher-Student curriculum (learning progress), PAIRED / PLR / Robust PLR /
+ACCEL (regret-based level generation and replay), ADR (widen randomization ranges while
+performance holds), reverse curriculum (start near the goal); PopArt for per-task scale,
+RMA for inferring the scenario from history. They estimate the achievable return; with the
+Triton kernel we compute it exactly.
+
+1. **Scenario atlas** (`scenarios.py`, built offline, cached to disk): grid over separation x
+   laser pitch / yaw (laser offset and mirror offsets later). Per scenario, scan the M2 box
+   (0.01 deg, 2-4 ms each): best path P_max and its tilt, area of the box above fractions of
+   P_max, bounce histogram.
+2. **Per-scenario reward scale:** `r = dP / P_max(scenario) - step_cost`, replacing P_nom.
+   Best possible return is about `1 - P_0 / P_max`.
+3. **Impossible scenarios** (P_max below a threshold, e.g. 10 bounces) stay at a small share
+   (~10 %). The right behavior is to stop at once; on the real cell that is the signal that
+   separation or laser need a human.
+4. **Sampler**, per env (not one scenario per batch):
+   - ADR-style range: start at the stage-1 geometry; widen each parameter's range when
+     performance at its boundary stays above a threshold, shrink it when below;
+   - inside the range, PLR-style replay prioritized by exact regret `P_max - P_final`
+     (rank-based, with a staleness term), plus a share of fresh uniform samples;
+   - the initial-tilt radius curriculum from stage 1 stays.
+5. **Scenario inference:** the agent has to infer the scenario from its image/action
+   history (implicit system identification, as in RMA); the optional privileged critic
+   would get the scenario parameters.
+6. **Metrics:** normalized final path `P_final / P_max` per scenario, success rate at
+   >= 0.9 P_max, stop rate on impossible scenarios, regret distribution over the atlas.
+7. **Bounce cap:** the intensity cutoff (~456) once separation varies (see D1).
 
 ## Decisions (2026-10-15)
 
