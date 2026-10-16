@@ -12,11 +12,14 @@ Run from rl/:
                                     [--laser-range -8 8] [--laser-offset-radius 1.5]
                                     [--laser-mode landing] [--n 4096] [--impossible 0.1]
                                     [--seed 0] [--force]
+    uv run python scenarios.py region [--tables-dir DIR] [ranges as cont] [--n 4096]
+                                      [--seed 0] [--force]
 Default atlas path runs/atlas/atlas_v1.pt (gitignored); ppo.py --setups full builds it
 there (or at --atlas) when the file is missing and loads it otherwise. The off-grid eval
 tables go to runs/eval_sets/<kind>_v1.pt (offgrid, extrap_short, extrap_long), the
-continuous eval table to runs/eval_sets/<ranges tag>_n<n>_seed<seed>_v1.pt, likewise
-built by ppo.py / eval_policy.py if missing.
+continuous eval table to runs/eval_sets/<ranges tag>_n<n>_seed<seed>_v1.pt, the region
+table to runs/eval_sets/<ranges tag>_region<edges>_n<n>_seed<seed>_v1.pt, likewise built
+by ppo.py / eval_policy.py if missing.
 
 Scenario = (separation, laser pitch, laser yaw); laser offset, mirror offsets, mirrors and
 M1 as in the measured cell (geometry.CellGeometry). Grid: separation 50-200 mm step 2 x
@@ -99,6 +102,18 @@ Continuous eval table (ContConfig, build_cont_table; ppo.py eval_cont/): the val
 candidates of the shortest prefix of STREAM_EVAL (seeded) that holds n x 0.9 good and n x
 0.1 impossible scenarios; loads as an Atlas (params (n, 5)); offgrid_eval_scenarios picks
 the episodes; separation bins cont_sep_bins (20-50, 50-100, ..., 350-400).
+
+Target-region size (region_area): area of the box cells with path >= 0.9 P_max (near_cells
+x 0.01^2 deg^2; where an episode counts as success), from the same scan as P_max (every
+table, the pool slots; AlignEnv.box_stats for the named setups); best_area: the cells at
+the highest bounce count (in practice a subset of the target region). Bins REGION_EDGES
+(tiny < 0.02, small 0.02-0.1, medium 0.1-0.5, large >= 0.5 deg^2; region_bin_masks).
+Region eval table (RegionConfig, build_region_table; ppo.py eval_region/): n good valid
+scenarios of the continuous distribution, n / 4 per bin, each the first good ones of its
+bin in the seeded stream STREAM_REGION (sample_valid_scenarios, box-scanned); cached in
+EVAL_TABLES_DIR (<ranges tag>_region<edges>_n<n>_seed<seed>_v1.pt) with the region sizes
+of every good scenario of the used prefix (region_sample: the training distribution's
+region sizes, region_stats in the build info).
 
 ScenarioSampler (all on the device; draw() and observe() have no host syncs):
     draws      one categorical over [impossible | fresh good | replay good] segments
@@ -503,8 +518,9 @@ def table_stats(at: Atlas, rows: Optional[torch.Tensor] = None, bins=SEP_BINS) -
     an off-grid table): count, good share, P_max of the good ones (m: mean, quantiles),
     share of good ones whose P_max is at the bounce cap, mean share of the box cells at
     the cap (all and good scenarios), median success-region area (cells >= 0.9 P_max,
-    deg^2), mean blind share of the box; per separation bin (bins) count, good share,
-    median good P_max and cap shares."""
+    deg^2) and region_stats of the good ones (target-region bins), mean blind share of
+    the box; per separation bin (bins) count, good share, median good P_max and cap
+    shares."""
     if rows is None:
         rows = torch.arange(at.n_grid, device=at.device)
     rows = rows.to(at.device)
@@ -532,7 +548,8 @@ def table_stats(at: Atlas, rows: Optional[torch.Tensor] = None, bins=SEP_BINS) -
             cap_cells_share_good=mean(cap_cells[rg]),
             near_area_deg2_median=float(at.near_cells[rg].double().median()) * cell
             if rg.numel() else nan,
-            blind_share_mean=mean(at.blind_cells[rg].double() / G))
+            blind_share_mean=mean(at.blind_cells[rg].double() / G),
+            region=region_stats(at.near_cells[rg].double() * cell))
         return out
 
     out = part(rows, good)
@@ -1005,6 +1022,204 @@ def load_or_build_cont(path: str, ccfg: Optional[ContConfig] = None,
     want, have = ccfg.key(scan), d.get("key") or {}
     bad = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
     assert not bad, f"table {path} does not match the ContConfig / scan settings: {bad}"
+    return Atlas(d, device, path)
+
+
+# ── Target-region size, region eval table (eval_region) ─────────────────────
+
+
+STREAM_REGION = 4  # Candidate stream of the region eval table
+REGION_VERSION = 1
+# Target-region bins (deg^2, [lo, hi)): round values. Region sizes of the good scenarios of
+# the training distribution (cont20-400, landing mode, offsets over the 1.5 mm disk): the
+# 16,241 good candidates of the region table (seed 0) q05 0.013, q10 0.046, q35 0.51, q50
+# 1.18, q65 2.29 deg^2 (14,746 good pool slots of run 4410759: 0.045, 0.52, 1.18, 2.33);
+# shares of the bins below 6.3 / 8.9 / 19.3 / 65.5 %. Success of run 4410759 (it 1600,
+# argmax) on the 3686 good eval_cont episodes per bin: 26 / 61 / 79 / 96 %, each bin
+# holding about a quarter of the failures; edges at the percentiles (round: 0.05 / 0.5 /
+# 2.0) would put three quarters of them in the two lowest bins and leave the top bin at
+# 98 %. The measured cell (0.016) and sep169 (0.011) fall in tiny, sep116 (0.23) and
+# sep144 (0.20) in medium.
+REGION_EDGES = (0.02, 0.1, 0.5)
+REGION_BINS = ("tiny", "small", "medium", "large")
+REGION_QS = (0.01, 0.05, 0.1, 0.25, 0.35, 0.5, 0.65, 0.75, 0.9, 0.95, 0.99)
+
+
+def cell_area(t: Atlas) -> float:
+    """Area of one box cell of a table's scan (deg^2)."""
+    return float(t.key["step"]) ** 2
+
+
+def region_area(t: Atlas) -> torch.Tensor:
+    """(N,) float64 target-region size per scenario (deg^2): the box cells with path >=
+    near_frac x P_max (near_cells: where an episode counts as success) x cell area."""
+    return t.near_cells.double() * cell_area(t)
+
+
+def best_area(t: Atlas) -> torch.Tensor:
+    """(N,) float64 area of the box cells at the highest bounce count (deg^2)."""
+    return t.best_cells.double() * cell_area(t)
+
+
+def region_bin(area: torch.Tensor, edges=REGION_EDGES) -> torch.Tensor:
+    """(n,) int64 target-region bin of sizes area (deg^2): j for edges[j - 1] <= area <
+    edges[j] (0 below the first edge, len(edges) from the last one)."""
+    e = torch.tensor(edges, dtype=area.dtype, device=area.device)
+    return torch.bucketize(area, e, right=True)
+
+
+def region_bin_masks(area: torch.Tensor, edges=REGION_EDGES,
+                     names=REGION_BINS) -> Dict[str, torch.Tensor]:
+    """Target-region bins: region_<name> -> mask (region_bin)."""
+    assert len(names) == len(edges) + 1, "one name per bin"
+    b = region_bin(area, edges)
+    return {f"region_{nm}": b == j for j, nm in enumerate(names)}
+
+
+def region_bin_labels(edges=REGION_EDGES, names=REGION_BINS) -> Dict[str, str]:
+    """region_<name> -> range text in deg^2 (< 0.02, 0.02-0.1, ..., >= 0.5)."""
+    e = list(edges)
+    out = {}
+    for j, nm in enumerate(names):
+        out[f"region_{nm}"] = (f"< {e[0]:g}" if j == 0 else f">= {e[-1]:g}" if j == len(e)
+                               else f"{e[j - 1]:g}-{e[j]:g}")
+    return out
+
+
+def region_stats(area: torch.Tensor, edges=REGION_EDGES, names=REGION_BINS) -> Dict[str, Any]:
+    """Distribution of target-region sizes (deg^2): count, mean, quantiles REGION_QS and
+    the share of each bin."""
+    a = area.double().cpu()
+    out: Dict[str, Any] = {"n": int(a.numel())}
+    if not a.numel():
+        return out
+    q = torch.quantile(a, torch.tensor(REGION_QS, dtype=torch.float64)).tolist()
+    out["mean"] = float(a.mean())
+    out.update({f"q{round(100 * x):02d}": v for x, v in zip(REGION_QS, q)})
+    out["bin_share"] = {k: float(m.double().mean()) for k, m in region_bin_masks(a, edges, names).items()}
+    return out
+
+
+@dataclass
+class RegionConfig:
+    """Region eval table: n good valid scenarios of the continuous distribution (ranges),
+    stratified by target-region size (region_bin of edges): counts()[j] per bin, each the
+    first good scenarios of its bin in the seeded stream STREAM_REGION (within a bin the
+    training distribution restricted to it)."""
+
+    ranges: ContRanges = field(default_factory=ContRanges)
+    n: int = 4096
+    seed: int = 0
+    edges: Tuple[float, ...] = REGION_EDGES
+    round_n: int = 8192  # Valid scenarios per round, 2 x n for small tables (no effect on the table)
+
+    def counts(self) -> List[int]:
+        """Scenarios per bin (n / bins, the remainder to the first bins)."""
+        k = len(self.edges) + 1
+        return [self.n // k + (j < self.n % k) for j in range(k)]
+
+    def key(self, scan: AtlasConfig) -> Dict[str, Any]:
+        """Scan settings (AtlasConfig.key without the grid) plus the table settings."""
+        d = {k: v for k, v in scan.key().items() if k not in ("sep", "pitch", "yaw", "named")}
+        d["region"] = {"version": REGION_VERSION, "ranges": asdict(self.ranges), "n": self.n,
+                       "seed": self.seed, "edges": [float(e) for e in self.edges]}
+        return d
+
+
+def region_table_path(rcfg: RegionConfig, directory: str = "") -> str:
+    """<directory or EVAL_TABLES_DIR>/<ranges tag>_region<edges>_n<n>_seed<seed>_v1.pt."""
+    e = "-".join(f"{x:g}" for x in rcfg.edges)
+    return os.path.join(directory or EVAL_TABLES_DIR,
+                        f"{rcfg.ranges.tag()}_region{e}_n{rcfg.n}_seed{rcfg.seed}_v{REGION_VERSION}.pt")
+
+
+@torch.no_grad()
+def build_region_table(rcfg: Optional[RegionConfig] = None, scan: Optional[AtlasConfig] = None,
+                       device: Optional[torch.device] = None, log=print) -> Dict[str, Any]:
+    """Region eval table (RegionConfig): valid scenarios of the seeded stream STREAM_REGION
+    in rounds (sample_valid_scenarios), box scan of each (Scanner.scan: P_max and the
+    target-region size from the same scan), the good ones assigned to their bin; a bin
+    keeps its first counts()[j] in stream order (the table does not depend on the round
+    size), generation stops when every bin is full. Returns the atlas fields (CPU tensors,
+    params (n, 5)) of the kept scenarios in stream order, candidate_index (stream
+    position), region_bin (int8) and region_sample (float32: the target-region sizes of
+    every good scenario of the used prefix, the distribution the bins cut), and the build
+    info under "offgrid" (kind "region": candidates of the prefix, STAGES counts, good,
+    region_stats of the sample, counts per bin)."""
+    rcfg = rcfg or RegionConfig()
+    scan = scan or AtlasConfig()
+    dev = torch.device(device) if device is not None else DEVICE
+    sc = Scanner(scan, dev)
+    need = rcfg.counts()
+    tag = rcfg.ranges.tag()
+    cell = float(scan.step) ** 2
+    rn = min(rcfg.round_n, max(256, 2 * rcfg.n))  # Small tables: small rounds
+    log(f"region table {tag}: valid scenarios of the seeded stream (seed {rcfg.seed}) in rounds "
+        f"of {rn}, box scans until {'/'.join(map(str, need))} good ones per target-region bin "
+        f"(edges {', '.join(f'{e:g}' for e in rcfg.edges)} deg^2)")
+    _sync(dev)
+    t0 = time.perf_counter()
+    parts: Dict[str, list] = {}
+    at = 0
+    while any(k > 0 for k in need):
+        prm, info = sample_valid_scenarios(rn, rcfg.ranges, rcfg.seed, STREAM_REGION, scanner=sc,
+                                           start=at)
+        d = {k: v.cpu() for k, v in sc.scan(torch.from_numpy(prm)).items()}
+        b = region_bin(d["near_cells"].double() * cell, rcfg.edges)
+        keep = torch.zeros(prm.shape[0], dtype=torch.bool)
+        for j in range(len(need)):
+            rows = torch.nonzero(d["good"] & (b == j)).squeeze(1)[:need[j]]
+            keep[rows] = True
+            need[j] -= rows.numel()
+        d.update(candidate_index=torch.from_numpy(info["positions"]), region_bin=b.to(torch.int8),
+                 keep=keep)
+        for k, v in d.items():
+            parts.setdefault(k, []).append(v)
+        at = info["next"]
+        assert at < 20000 * max(rcfg.n, 1), "the ranges hold almost no scenarios of a region bin"
+    _sync(dev)
+    build_s = time.perf_counter() - t0
+    d = {k: torch.cat(v) for k, v in parts.items()}
+    keep, pos = d.pop("keep"), d["candidate_index"]
+    L = int(pos[keep].max()) + 1  # Used prefix: up to the last kept scenario
+    pre = pos < L
+    sample = d["near_cells"][pre & d["good"]].double() * cell
+    st = stage_counts(candidate_batch(rcfg.ranges, rcfg.seed, 0, L, STREAM_REGION, sc), L)
+    assert st["valid"] == int(pre.sum()), "valid scenarios of the prefix != scanned"
+    rs = region_stats(sample, rcfg.edges)
+    info = {"kind": "region", "lattice": None, "candidates": L, "scanned": at, **st,
+            "good": int((pre & d["good"]).sum()), "region": rs, "n_per_bin": rcfg.counts(),
+            "edges": [float(e) for e in rcfg.edges], "seed": rcfg.seed, "short": False,
+            "ranges": asdict(rcfg.ranges)}
+    d = {k: v[keep] for k, v in d.items()}
+    d.update(version=ATLAS_VERSION, key=rcfg.key(scan), named={}, n_grid=int(keep.sum()),
+             build_s=build_s, device_name=_device_name(dev), date=time.strftime("%Y-%m-%d"),
+             offgrid=info, region_sample=sample.float())
+    log(f"region table {tag}: {L} candidates in {build_s:.1f} s on {d['device_name']}: angles out "
+        f"of bounds {100 * st['angle_rejected'] / L:.1f} %, clipped {100 * st['clipped'] / L:.1f} %, "
+        f"missed M2 {100 * st['missed'] / L:.1f} %, {st['valid']} valid (box-scanned), "
+        f"{info['good']} good; their target-region size (deg^2) q10 / q50 / q90 "
+        f"{rs['q10']:.3f} / {rs['q50']:.3f} / {rs['q90']:.3f}, bin shares "
+        + " / ".join(f"{100 * v:.1f}" for v in rs["bin_share"].values()) + " %")
+    return d
+
+
+def load_or_build_region(path: str, rcfg: Optional[RegionConfig] = None,
+                         scan: Optional[AtlasConfig] = None, device: Optional[torch.device] = None,
+                         log=print) -> Atlas:
+    """Region eval table at path (build_region_table; built and saved there if the file is
+    missing). A file built with other settings is an error."""
+    rcfg = rcfg or RegionConfig()
+    scan = scan or AtlasConfig()
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        log(f"region table: {path} missing, building")
+        save_atlas(build_region_table(rcfg, scan, device, log), path)
+        log(f"region table: saved {path}")
+    d = torch.load(path, map_location="cpu", weights_only=False)
+    want, have = rcfg.key(scan), d.get("key") or {}
+    bad = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+    assert not bad, f"table {path} does not match the RegionConfig / scan settings: {bad}"
     return Atlas(d, device, path)
 
 
@@ -1494,7 +1709,7 @@ def table_summary(st: Dict[str, Any], label: str) -> str:
 def main():
     ap = argparse.ArgumentParser(description="Scenario atlas (build / summary) and the off-grid "
                                              "eval tables (offgrid)")
-    ap.add_argument("cmd", choices=("build", "summary", "offgrid", "cont"))
+    ap.add_argument("cmd", choices=("build", "summary", "offgrid", "cont", "region"))
     ap.add_argument("--atlas", default=DEFAULT_ATLAS, help="Atlas file")
     d = AtlasConfig()
     ap.add_argument("--sep", type=float, nargs=3, default=list(d.sep), metavar=("LO", "HI", "STEP"))
@@ -1520,6 +1735,24 @@ def main():
     ap.add_argument("--laser-mode", choices=("landing", "angle"), default=r.mode,
                     help="cont: laser angles from a uniform M2 landing point, or uniform")
     args = ap.parse_args()
+    if args.cmd == "region":
+        rcfg = RegionConfig(ranges=cont_ranges(args.sep_range, args.laser_range,
+                                               args.laser_offset_radius, args.laser_mode),
+                            n=args.n, seed=args.seed)
+        path = region_table_path(rcfg, args.tables_dir)
+        if args.force and os.path.exists(path):
+            os.remove(path)
+        t = load_or_build_region(path, rcfg)
+        b = t.offgrid
+        rs = b["region"]
+        print(f"region ({path}): {t.n} scenarios, per bin "
+              + ", ".join(f"{k} {lab} {int(m.sum())}" for (k, m), lab in zip(
+                  region_bin_masks(region_area(t)).items(), region_bin_labels().values())))
+        print(f"  {b['candidates']} candidates, {b['valid']} valid (box-scanned), {b['good']} good; "
+              f"target-region size of the good ones (deg^2): "
+              + ", ".join(f"{k} {v:.4f}" for k, v in rs.items() if k.startswith("q"))
+              + "; bin shares " + ", ".join(f"{k} {100 * v:.1f} %" for k, v in rs["bin_share"].items()))
+        return
     if args.cmd == "cont":
         ccfg = ContConfig(ranges=cont_ranges(args.sep_range, args.laser_range,
                                              args.laser_offset_radius, args.laser_mode),

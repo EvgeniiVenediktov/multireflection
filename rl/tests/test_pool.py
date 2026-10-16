@@ -538,7 +538,7 @@ def test_init_from(tmp: str):
     assert tr.agent.n_scen == 5 and tr.agent.cfg.scen_lo == (80.0, -8.0, -8.0, -1.5, -1.5)
     assert tr.init_info["scen_reinit"] and tr.best_metric == "eval_cont/all/pct_oracle"
     assert tr.name.startswith("ppo_cnn-pregrid16384_k6_cont80-120-plr_b16_s0_ft4407578_"), tr.name
-    assert eval_set_names(cfg) == ["cont", "full", "offgrid", "extrap_short", "extrap_long", "set4"]
+    assert eval_set_names(cfg) == ["cont", "region", "set4"]
     m, s = tr.vnorm.stats()
     assert torch.equal(m, vn.stats()[0]) and torch.equal(s, vn.stats()[1])
     tr.sampler.refresh(0)

@@ -215,6 +215,20 @@ changes); `ppo.py --scenarios pool --sep-range --laser-range --laser-offset-radi
 (best.pt), the grid sets kept as fixed benchmarks; `pretrain_encoder.py --init` (fine-tune)
 with continuous scenarios, `eval_encoder.py` per separation bin; tests `tests/test_pool.py`.
 
+**Implemented (2026-10-16), target-region evaluation:** target-region size of a scenario =
+area of the M2 box cells with path >= 0.9 P_max (where an episode counts as success), from
+the P_max scan (tables, pool slots; `AlignEnv.box_stats` for the named setups); bins tiny
+< 0.02, small 0.02-0.1, medium 0.1-0.5, large >= 0.5 deg^2 (training distribution: 6.3 /
+8.9 / 19.3 / 65.5 %, median 1.18 deg^2; measured cell 0.016 and sep169 0.011 tiny, sep116
+0.23 and sep144 0.20 medium). New set `eval_region/` (4096 good continuous scenarios, 1024
+per bin, `scenarios.py region`), region splits in `eval_cont/` and `eval/`, early-stop
+metrics (stop below 0.9 P_ref and its final P / P_ref). Pool runs evaluate by default
+`cont`, `cont_samp`, `region`, `set4` (`--eval-sets`; the grid sets on request, older
+checkpoints keep their sets). Run 4410759 at iteration 1600 (argmax, region set): success
+31 / 56 / 75 / 94 % per bin; nearly every failure is a stop on a lower-order pattern
+(final P / P_max 0.55-0.65, step-limit failures < 2 %); set4 17 % success (measured cell
+0 %, stops at 0.43 P_max). Report `reports/eval_region_r3_it1600.md`.
+
 ## Decisions (2026-10-15)
 
 - **D1 - trapped beams: bounce cap, default 128.** A 0.001 deg scan around the 89 island
@@ -288,3 +302,14 @@ with continuous scenarios, `eval_encoder.py` per separation bin; tests `tests/te
     `eval_cont/` (4096 seeded continuous scenarios, best.pt) plus the grid sets of run
     4407578 as fixed benchmarks; the encoder fine-tuned from the grid encoder on 16,384
     continuous scenarios (8k steps, lr 3e-4); transformer and heads from 4407578.
+
+## Future fine-tuning (2026-10-16)
+
+- **Near-best starts** (reverse curriculum), planned as a fine-tuning stage on a trained policy:
+  a share of resets (e.g. 20 %) starts within 0.2-0.5 deg of the scenario's best tilt, so the
+  agent learns the last precise steps onto small targets and when not to stop. Motivation
+  (reports/eval_region_r3_it1600.md): success falls from 94 % on large targets (>= 0.5 deg^2)
+  to 31 % on tiny ones (< 0.02 deg^2); the failures are deliberate stops on a lower-order
+  pattern at 0.55-0.65 of P_ref after 8-10 moves.
+- Option not yet decided: fill the pool stratified by target-region size (tiny / small /
+  medium / large 25 % each instead of the natural 6 / 9 / 19 / 66 %).

@@ -33,7 +33,9 @@ B independent episodes, all state on the device, no host syncs in step() / reset
                (scenario mode: from the table; otherwise EnvConfig.path_ref):
                "nominal" = path at the setup's nominal tilt
                (2733.27 mm for the measured cell, the stage-1 P_nom), "max" = longest
-               path in the +-limit box (0.01 deg scan at construction); the default
+               path in the +-limit box (0.01 deg scan at construction, box_stats: the
+               same scan gives the target-region size, cells with path >= NEAR_FRAC x
+               P_max, and the cells at the highest bounce count); the default
                "auto" is nominal for one setup and max for several. The return is
                (P_final - P_0) / P_ref - step_cost * moves
     truncation the step count reaches max_steps without termination
@@ -78,6 +80,7 @@ SCEN_NAMES = ("separation", "laser_pitch", "laser_yaw", "laser_dx", "laser_dy")
 AUTO_SIGMA_PX = 2.5  # Auto oversampling: spot sigma >= this many splat-grid pixels
 PATH_REFS = ("auto", "nominal", "max")
 DEAD_LASER_PITCH = 89.0  # deg: the laser misses M2, the ray stops before the first bounce
+NEAR_FRAC = 0.9  # Target region: path >= this x P_max (= evaluation.SUCCESS_FRAC)
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -515,7 +518,7 @@ class AlignEnv:
         self.img_shape = (1, c.img_res, c.img_res)
 
         # ── Reward scale per setup ──
-        self._path_max: Optional[torch.Tensor] = None
+        self._box: Optional[Dict[str, torch.Tensor]] = None  # box_stats, computed once
         if pool is not None:
             self.path_ref_mode = "scenario"
             self.path_refs = pool.atlas.path_ref  # Current pool content (live)
@@ -585,28 +588,41 @@ class AlignEnv:
         return out
 
     @torch.no_grad()
-    def path_max(self) -> torch.Tensor:
-        """(S,) float32 longest path per setup over the +-limit box on the ref_scan_step
-        grid (computed once, cached)."""
-        if self._path_max is None:
+    def box_stats(self) -> Dict[str, torch.Tensor]:
+        """Per setup (S,), from one scan of the +-limit box on the ref_scan_step grid
+        (computed once, cached): pmax (float32, longest path), near_cells (cells with path
+        >= NEAR_FRAC x pmax: the target region, where an episode counts as success),
+        best_bounces (highest bounce count), best_cells (its cells), all but pmax int64."""
+        if self._box is None:
             L, h = self.limit, self.cfg.ref_scan_step
             n = int(round(2 * L / h)) + 1
             ax = torch.tensor([-L + h * i for i in range(n)], dtype=torch.float32,
                               device=self.device)
             P, Y = torch.meshgrid(ax, ax, indexing="ij")
             grid = torch.stack((P.flatten(), Y.flatten()), 1)
-            best = []
+            rows: Dict[str, List[torch.Tensor]] = {}
             chunk = 1 << 16
             for s in range(self.n_setups):
-                m = torch.zeros((), device=self.device)
+                p, b = [], []
                 for i in range(0, grid.shape[0], chunk):
                     g = grid[i : i + chunk]
                     st = self.states(g, torch.full((g.shape[0],), s, device=self.device))
-                    m = torch.maximum(m, self.sim.simulate(st, store_world=False)
-                                      ["total_path_length"].max())
-                best.append(m)
-            self._path_max = torch.stack(best)
-        return self._path_max
+                    out = self.sim.simulate(st, store_world=False)
+                    p.append(out["total_path_length"])
+                    b.append(out["hit_counts"])
+                p, b = torch.cat(p), torch.cat(b)
+                m = torch.maximum(torch.zeros((), device=self.device), p.max())
+                bb = b.max()
+                for k, v in (("pmax", m), ("near_cells", (p >= NEAR_FRAC * m).sum()),
+                             ("best_bounces", bb.long()), ("best_cells", (b == bb).sum())):
+                    rows.setdefault(k, []).append(v)
+            self._box = {k: torch.stack(v) for k, v in rows.items()}
+        return self._box
+
+    def path_max(self) -> torch.Tensor:
+        """(S,) float32 longest path per setup over the +-limit box on the ref_scan_step
+        grid (box_stats)."""
+        return self.box_stats()["pmax"]
 
     def ref_of(self, setup: torch.Tensor) -> torch.Tensor:
         """(n,) float32 P_ref of setup indices (n,)."""

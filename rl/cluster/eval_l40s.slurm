@@ -5,17 +5,20 @@
 #   cd /ihome/kchen/evv13/multireflection
 #   sbatch --export=ALL,CKPT=/ix1/kchen/evv/multireflection/rl_runs/4407578/best.pt rl/cluster/eval_l40s.slurm
 #
-# Sets (eval_policy.py --sets; default the run's own sets: full,offgrid,extrap_short,
-# extrap_long,set4 for atlas runs, cont first for pool runs (continuous scenarios of the
-# run's ranges, D7); add holdout for runs trained with --holdout-frac > 0): full = the training grid (seen),
-# offgrid = midpoints between grid points (unseen, interpolation), extrap_short /
-# extrap_long = separation 20-49 / 201-350 mm (unseen, extrapolation), set4 = the four
-# named setups. Both policies (argmax, sampled), N episodes per set. The off-grid tables
-# are built once in TABLES if missing (~1 min on the L40S for the three, estimate from
-# 43 s on an RTX A2000) and loaded otherwise; the oracles are cached in the checkpoint's
-# run dir (oracle_full.pt / oracle_eval.pt of the run are reused; new: oracle_offgrid.pt,
-# oracle_extrap_short.pt, oracle_extrap_long.pt; a few s each). Evaluation: ~4 s per set
-# and policy on the L40S (run 4407578's evals), so the job takes a few minutes.
+# Sets (eval_policy.py --sets; default cont,region,set4, the run's own set for --setups all
+# / measured runs): cont = 4096 seeded continuous scenarios of the run's ranges (D7; 90 / 10
+# good / impossible), region = 4096 good continuous scenarios, 1024 per target-region bin
+# (area of the M2 box cells with path >= 0.9 P_max: < 0.02, 0.02-0.1, 0.1-0.5, >= 0.5
+# deg^2), set4 = the four named setups (per setup and target-region bin). The grid
+# benchmarks of the atlas runs with SETS (e.g. cont,region,set4,full,offgrid,extrap_short,
+# extrap_long; add holdout for runs trained with --holdout-frac > 0): full = the training
+# grid of the atlas runs, offgrid = midpoints between grid points, extrap_short /
+# extrap_long = separation 20-49 / 201-350 mm. Both policies (argmax, sampled), N episodes
+# per set. The tables are built once in TABLES if missing (cont ~10 s, region ~35 s on an
+# RTX A2000; off-grid ~1 min for the three) and loaded otherwise; the oracles are cached in
+# the checkpoint's run dir (oracle_cont.pt / oracle_region.pt / oracle_eval.pt of the run
+# are reused; a few s each when new). Evaluation: ~4 s per set and policy on the L40S (run
+# 4407578's evals), so the job takes a few minutes.
 #
 # Output: OUT/eval_<run id>_<ckpt stem>.json and .md (run id = the checkpoint's directory
 # name, e.g. eval_4407578_best.md).
@@ -23,13 +26,14 @@
 # Environment variables (sbatch --export=ALL,NAME=value,...):
 #   CKPT        ppo.py checkpoint (required), e.g. <run dir>/best.pt or latest.pt
 #   OUT         report directory (default: the checkpoint's run dir)
-#   SETS        default empty = the run's sets (see above)
+#   SETS        default empty = cont,region,set4 (see above)
 #   POLICY      default argmax,sampled
 #   N           episodes per set (default 4096 = the runs' eval_n, so the cached oracles of
 #               the run are reused; another N caches its oracles in OUT/oracles_n<N>)
 #   ATLAS       scenario atlas, default /ix1/kchen/evv/multireflection/rl_runs/atlas/atlas_v1.pt
-#   TABLES      off-grid tables dir, default /ix1/kchen/evv/multireflection/rl_runs/eval_sets
-#   EXTRA_ARGS  appended to eval_policy.py (word-split), e.g. "--tag it1200 --compile"
+#   TABLES      eval tables dir, default /ix1/kchen/evv/multireflection/rl_runs/eval_sets
+#   EXTRA_ARGS  appended to eval_policy.py (word-split), e.g. "--tag it1200 --compile" or
+#               "--name eval_region_r3_it1600 --compare <other report>.json"
 #
 # Several checkpoints, one job each:
 #   for c in best latest; do sbatch --export=ALL,CKPT=/ix1/kchen/evv/multireflection/rl_runs/4407578/$c.pt rl/cluster/eval_l40s.slurm; done
@@ -88,7 +92,7 @@ echo "python      : $VENV_PY ($($VENV_PY --version 2>&1))"
 $VENV_PY -c "import torch, triton; print('torch       :', torch.__version__, '| cuda', torch.version.cuda, '| triton', triton.__version__, '| available', torch.cuda.is_available())"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 echo "checkpoint  : $CKPT"
-echo "sets        : ${SETS:-run defaults} ($N episodes, policies $POLICY)"
+echo "sets        : ${SETS:-cont,region,set4} ($N episodes, policies $POLICY)"
 echo "atlas       : $ATLAS"
 echo "tables      : $TABLES"
 echo "out         : $OUT"

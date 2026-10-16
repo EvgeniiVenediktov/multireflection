@@ -12,11 +12,14 @@
 # it, 10 % impossible scenarios), B = 1024 envs, rollout 128, K = 16, frozen encoder
 # initialized from ENCODER_INIT, 1e9 env steps (the 1-day limit and a resume job handle
 # the rest), lr warmup 20 iterations then cosine to 10 %, adaptive entropy (target 2.0 ->
-# 0.7 nats over 80 % of the steps), eval every 200 iterations on eval_cont/ (4096 seeded
-# continuous scenarios of the training ranges; best.pt is selected on it) and the fixed
-# benchmarks of run 4407578 (grid atlas eval_full/, eval_offgrid/, eval_extrap_short/,
-# eval_extrap_long/, the four setups eval/; measured laser offsets; --no-eval-offgrid /
-# --no-eval-extrap / --no-eval-set4 to skip), deterministic and sampled policies,
+# 0.7 nats over 80 % of the steps), eval every 200 iterations (--eval-sets, default
+# cont,cont_samp,region,set4): eval_cont/ and eval_cont_samp/ (4096 seeded continuous
+# scenarios of the training ranges, deterministic and sampled; best.pt is selected on
+# eval_cont/), eval_region/ (4096 good continuous scenarios, 1024 per target-region bin:
+# area of the M2 box cells with path >= 0.9 P_max < 0.02, 0.02-0.1, 0.1-0.5, >= 0.5 deg^2)
+# and eval/ (the four setups), deterministic; the grid benchmarks of run 4407578 (eval_full/,
+# eval_offgrid/, eval_extrap_short/, eval_extrap_long/; measured laser offsets) only when
+# listed, e.g. --eval-sets cont,cont_samp,region,set4,full,offgrid,extrap_short,extrap_long,
 # latest.pt every 15 min, W&B project herriott-rl (auth from ~/.netrc; add --no-wandb to
 # EXTRA_ARGS for an unlogged run). The W&B display name is built at start, e.g.
 # ppo_cnn-ftcont_k16_cont20-400-plr_b1024_s0_ft4407578_<jobid> (encoder origin, scenario
@@ -32,13 +35,14 @@
 #
 # Startup of a new pool run: the pool is filled (16,384 slots: ~39k candidates, ~32k box
 # scans of 401^2 M2 cells; estimate ~10 s on the L40S, logged as "pool: ... filled in
-# ... s"); the atlas ATLAS is loaded for the fixed benchmark sets (built once if missing:
-# 82,768 scenarios, 22 s on the L40S); the continuous eval table is built once in
-# EVAL_TABLES if missing (cont20-400_n4096_seed0_v1.pt, ~13k candidates, seconds) and
-# loaded otherwise, the off-grid tables likewise; the oracles of all sets (4096 x 401^2
-# states each) are computed once and cached in the run dir (oracle_cont.pt,
-# oracle_full.pt, oracle_offgrid.pt, oracle_extrap_*.pt, oracle_eval.pt; logged as
-# "oracle plan (...): ... s"). A grid hold-out (atlas runs only):
+# ... s"); the atlas ATLAS is loaded only for grid benchmark sets (built once if missing:
+# 82,768 scenarios, 22 s on the L40S); the continuous and region eval tables are built
+# once in EVAL_TABLES if missing (cont20-400_n4096_seed0_v1.pt, ~10k candidates, seconds;
+# cont20-400_region0.02-0.1-0.5_n4096_seed0_v1.pt, ~43k candidates, 35k box scans, ~33 s
+# on an RTX A2000) and loaded otherwise, the off-grid tables likewise; the oracles of the
+# sets (4096 x 401^2 states each) are computed once and cached in the run dir
+# (oracle_cont.pt, oracle_region.pt, oracle_eval.pt, ...; logged as "oracle plan (...):
+# ... s"). A grid hold-out (atlas runs only):
 # EXTRA_ARGS="--holdout-frac 0.05" (seeded by --holdout-seed; adds eval_holdout/ and the
 # -ho5 marker to the run name; best.pt stays selected on eval_full/, which then draws from
 # the training scenarios only).
@@ -120,12 +124,13 @@
 # Resume / continue (same run dir; the config comes from latest.pt, only the run-control
 # flags total-env-steps, eval-every, ckpt-minutes, wandb, wandb-project, unfreeze-at,
 # encoder-lr-scale, encoder-epochs, encoder-train-until, compile, target-kl, eval-sampled,
-# enc-checkpoint, eval-offgrid, eval-extrap, eval-tables may change; ATLAS, INIT_FROM,
+# enc-checkpoint, eval-sets, eval-tables may change; ATLAS, INIT_FROM,
 # SCENARIOS, the ranges and pool-refresh are not passed (the pool's slots, refresh share
 # and stream position come from latest.pt; a changed total-env-steps moves the
-# encoder-train-until step with it, like the lr schedule); a run started
-# before the off-grid sets evaluates them from the resume on, in W&B only: eval.csv keeps
-# its header):
+# encoder-train-until step with it, like the lr schedule); a run started before
+# --eval-sets keeps the sets it evaluated (cont, full, offgrid, extrap_*, set4, each also
+# sampled) unless EXTRA_ARGS="--eval-sets cont,cont_samp,region,set4" is given; new keys
+# (e.g. eval_region/) of a resumed run go to W&B only: eval.csv keeps its header):
 #   sbatch --export=ALL,RUN_ID=<jobid of the first job> rl/cluster/ppo_l40s.slurm
 #   sbatch --export=ALL,RUN_ID=<jobid>,EXTRA_ARGS="--total-env-steps 300000000 --unfreeze-at 1600" rl/cluster/ppo_l40s.slurm
 #

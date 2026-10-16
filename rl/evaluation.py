@@ -25,7 +25,9 @@ Metrics (summarize): the aggregate over all episodes and split by the start regi
 blind start = 1-2 bounces at the initial tilt (one M2 spot at a fixed place), informative
 start = >= 3 bounces; with several setups also one split per setup. Per episode the final
 path is also compared with the env's P_ref of its setup (path_frac_pref, success = final
-path >= SUCCESS_FRAC * P_ref; with path_ref "max" P_ref is the setup's P_max).
+path >= SUCCESS_FRAC * P_ref; with path_ref "max" P_ref is the setup's P_max); the
+failures split into stop_low (ended by not move below SUCCESS_FRAC * P_ref, with their
+mean P / P_ref stop_low_path_frac) and trunc_low (step limit below it).
 """
 
 import time
@@ -263,6 +265,10 @@ def split_metrics(ep: Dict[str, torch.Tensor], m: torch.Tensor, cap: int) -> Dic
         r = ep["final_path_mm"][m].double() / ep["path_ref"][m].double()
         out["path_frac_pref_mean"] = _mean(r)
         out["success"] = _frac(r >= SUCCESS_FRAC)
+        low = ep["terminated"][m] & (r < SUCCESS_FRAC)  # Stopped (not move) short of success
+        out["stop_low"] = _frac(low)
+        out["stop_low_path_frac"] = _mean(r[low])
+        out["trunc_low"] = _frac(ep["truncated"][m] & (r < SUCCESS_FRAC))
     if "ref_path_mm" in ep:
         r = ep["final_path_mm"][m].double() / ep["ref_path_mm"][m].double()
         out["path_frac_ref_mean"] = _mean(r)
