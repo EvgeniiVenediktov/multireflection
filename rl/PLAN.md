@@ -77,7 +77,7 @@ correct; they go away only because the action space changes (P1) and the GRU is 
    CNN with spatial-softmax keypoints beats ViT-p8 / p4 on every metric; ViT trained stably but
    learned ~3x slower and missed the rare 89 / trapped frames. Level 2 targets go into phase 6
    as auxiliary heads.
-6. **Policy and PPO** `policy.py`, `train.py` (P1-P6, T1-T6). Sanity order: one fixed initial
+6. **Policy and PPO** `agent.py`, `ppo.py`, `cluster/ppo_l40s.slurm` (P1-P6, T1-T6). Sanity order: one fixed initial
    tilt (must solve), a small radius around nominal, then the full range (curriculum on the
    initial-tilt radius). Path head and the other auxiliary heads trained from the start.
 7. **Viewer** - rewrite `interactive_policy_trial.py` on the new env and policy, then delete

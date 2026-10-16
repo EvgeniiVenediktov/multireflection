@@ -2,22 +2,26 @@
 frame_data.py - Online single-frame data for encoder pretraining (PLAN phase 5, Level 1)
 
 Every training batch is new (infinite data), generated on the GPU:
-    M2 tilt   cell_frac (50 %) uniform over the 0.01 deg cells with >= 4 bounces (from
-              a nominal-geometry scan of the +-2 deg box, computed once), the rest
-              uniform in the box
+    setup     DataConfig.setups (e.g. geometry.SETUPS), uniform per sample; empty = the
+              single DataConfig.geometry (the measured cell, the original behavior, same
+              random stream)
+    M2 tilt   cell_frac (50 %) uniform over the 0.01 deg cells with >= 4 bounces of the
+              sample's setup (from a nominal-geometry scan of the +-2 deg box per setup,
+              computed once), the rest uniform in the box
     jitter    physical, per sample: separation +-0.5 mm, laser pitch / yaw +-0.05 deg,
               laser offset and M2 offset +-0.05 mm (both axes); the targets see it
     render    RandomRenderer with the training NuisanceRanges
-    targets   TargetBuilder (canonical M2 frame), plus the true M2 tilt (probe label)
+    targets   TargetBuilder (canonical M2 frame), plus the true M2 tilt and the setup
+              index (probe labels)
 
 Fixed, seeded evaluation sets: one set of states rendered three ways - clean
 (SpotRenderer, no nuisances), in-distribution (training ranges) and OOD (one held-out
 factor per sample) - and a balanced 89 vs trapped probe set rendered the same three
-ways.
+ways (always of the first setup, the measured cell: 89 and trapped are its patterns).
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -51,6 +55,7 @@ class DataConfig:
 
     batch_size: int = 256
     geometry: CellGeometry = field(default_factory=CellGeometry)
+    setups: Tuple[CellGeometry, ...] = ()  # Uniform per sample; empty = (geometry,)
     max_bounces: int = 128  # Bounce cap (D1)
 
     # ── Camera (SpotRenderer, as EnvConfig) ──
@@ -82,7 +87,13 @@ class FrameData:
     def __init__(self, cfg: Optional[DataConfig] = None, device: Optional[torch.device] = None):
         self.cfg = c = cfg or DataConfig()
         self.device = dev = torch.device(device) if device is not None else DEVICE
-        g = c.geometry
+        self.setups: Tuple[CellGeometry, ...] = tuple(c.setups) or (c.geometry,)
+        self.n_setups = len(self.setups)
+        g = self.setups[0]
+        for s in self.setups[1:]:
+            assert s.mirror_configs() == g.mirror_configs(), "setups must share the mirrors"
+            assert s.m2_tilt_limit == g.m2_tilt_limit, "setups must share the tilt limit"
+        self.setup_base = torch.cat([s.base_state(1, dev) for s in self.setups])  # (S, 13)
         self.limit = g.m2_tilt_limit
         self.sim = g.make_sim(dev, max_bounces=c.max_bounces)
         self.base = SpotRenderer(
@@ -95,45 +106,77 @@ class FrameData:
         self._scan()
 
     def _scan(self):
-        """Nominal-geometry scan of the box: cell centres by bounce class."""
+        """Nominal-geometry scan of the box per setup: cell centres by bounce class.
+        cells / cells_89 / cells_trapped / scan_bounces: the first setup; cells_all
+        (all setups' >= min_cell_bounces cells, concatenated), cell_start / cell_count
+        (S,) index it per setup."""
         c, dev = self.cfg, self.device
         n = int(round(2 * self.limit / c.scan_step)) + 1
         ax = torch.linspace(-self.limit, self.limit, n, device=dev)
         P, Y = torch.meshgrid(ax, ax, indexing="ij")
         centres = torch.stack((P.reshape(-1), Y.reshape(-1)), 1)
-        out = self.sim.simulate(self._states(centres), store_world=False)
-        b, stop = out["hit_counts"], out["stop_reason"]
-        self.scan_bounces = b
-        self.cells = centres[b >= c.min_cell_bounces]
-        self.cells_89 = centres[b == 89]
-        self.cells_trapped = centres[stop == STOP_CAP]
+        cells = []
+        for k in range(self.n_setups):
+            setup = torch.full((centres.shape[0],), k, dtype=torch.long, device=dev)
+            out = self.sim.simulate(self._states(centres, setup), store_world=False)
+            b, stop = out["hit_counts"], out["stop_reason"]
+            cells.append(centres[b >= c.min_cell_bounces])
+            if k == 0:
+                self.scan_bounces = b
+                self.cells = cells[0]
+                self.cells_89 = centres[b == 89]
+                self.cells_trapped = centres[stop == STOP_CAP]
+        self.cells_all = torch.cat(cells)
+        self.cell_count = torch.tensor([x.shape[0] for x in cells], device=dev)
+        self.cell_start = torch.cumsum(self.cell_count, 0) - self.cell_count
 
     # ── States ──
 
-    def _states(self, tilts: torch.Tensor) -> torch.Tensor:
-        s = self.cfg.geometry.base_state(tilts.shape[0], self.device)
+    def _states(self, tilts: torch.Tensor, setup: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(n, 13) nominal states of the setups (n,) (default the first) at the M2 tilts."""
+        if setup is None:
+            s = self.setup_base[0].expand(tilts.shape[0], -1).clone()
+        else:
+            s = self.setup_base[setup]
         s[:, S_M2_PITCH] = tilts[:, 0]
         s[:, S_M2_YAW] = tilts[:, 1]
         return s
 
+    def sample_setups(self, n: int, gen: torch.Generator) -> Optional[torch.Tensor]:
+        """(n,) int64 setup per sample, uniform; None with one setup (no draw, so the
+        single-setup random stream is unchanged)."""
+        if self.n_setups == 1:
+            return None
+        return torch.randint(0, self.n_setups, (n,), generator=gen, device=self.device)
+
     def sample_tilts(self, n: int, gen: torch.Generator, cells: Optional[torch.Tensor] = None,
-                     cell_frac: Optional[float] = None) -> torch.Tensor:
-        """(n, 2) M2 tilts: cell_frac uniform over cells (default the >= 4 bounce
-        cells), the rest uniform in the box."""
+                     cell_frac: Optional[float] = None,
+                     setup: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(n, 2) M2 tilts: cell_frac uniform over cells (default the >= 4 bounce cells
+        of each sample's setup (n,), the first setup if None), the rest uniform in the
+        box."""
         c, dev = self.cfg, self.device
-        cells = self.cells if cells is None else cells
         frac = c.cell_frac if cell_frac is None else cell_frac
         box = self.limit * (2.0 * torch.rand(n, 2, generator=gen, device=dev) - 1.0)
-        i = torch.randint(0, cells.shape[0], (n,), generator=gen, device=dev)
+        if cells is None and setup is not None:
+            cells = self.cells_all
+            u = torch.rand(n, generator=gen, device=dev)
+            cnt = self.cell_count[setup]
+            i = self.cell_start[setup] + (u * cnt).long().clamp(max=cnt - 1)
+        else:
+            cells = self.cells if cells is None else cells
+            i = torch.randint(0, cells.shape[0], (n,), generator=gen, device=dev)
         inside = c.scan_step * (torch.rand(n, 2, generator=gen, device=dev) - 0.5)
         cell = (cells[i] + inside).clamp(-self.limit, self.limit)
         pick = torch.rand(n, 1, generator=gen, device=dev) < frac
         return torch.where(pick, cell, box)
 
-    def states(self, tilts: torch.Tensor, gen: torch.Generator, jitter: bool = True) -> torch.Tensor:
-        """(n, 13) states at the M2 tilts, with the physical jitter."""
+    def states(self, tilts: torch.Tensor, gen: torch.Generator, jitter: bool = True,
+               setup: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(n, 13) states of the setups (n,) (default the first) at the M2 tilts, with
+        the physical jitter."""
         c = self.cfg
-        s = self._states(tilts)
+        s = self._states(tilts, setup)
         if not jitter:
             return s
         u = lambda: 2.0 * torch.rand(s.shape[0], generator=gen, device=self.device) - 1.0
@@ -148,12 +191,16 @@ class FrameData:
 
     # ── Frames ──
 
-    def simulate(self, states: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Sim output and targets of (n, 13) states (no image)."""
+    def simulate(self, states: torch.Tensor,
+                 setup: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """Sim output and targets of (n, 13) states of the setups (n,) (default the
+        first; the index is a label only, the state carries the geometry) (no image)."""
         out = self.sim.simulate(states, store_world=False)
         d = self.builder(out)
         d["tilt"] = states[:, [S_M2_PITCH, S_M2_YAW]]
         d["state"] = states
+        d["setup"] = setup if setup is not None else torch.zeros(
+            states.shape[0], dtype=torch.long, device=states.device)
         d["_hits"] = (out["hit_mirror"], out["hit_local_xy"])
         return d
 
@@ -173,9 +220,11 @@ class FrameData:
         raise ValueError(f"unknown mode {mode!r}, expected one of {MODES}")
 
     def batch(self, gen: torch.Generator, n: Optional[int] = None, mode: str = "id") -> Dict[str, torch.Tensor]:
-        """One training batch: fresh tilts, jitter, render, targets."""
+        """One training batch: fresh setups, tilts, jitter, render, targets."""
         n = n or self.cfg.batch_size
-        d = self.simulate(self.states(self.sample_tilts(n, gen), gen))
+        setup = self.sample_setups(n, gen)
+        d = self.simulate(self.states(self.sample_tilts(n, gen, setup=setup), gen, setup=setup),
+                          setup)
         d.update(self.render(d, mode, gen))
         return d
 
@@ -200,13 +249,15 @@ class FrameData:
         image_clean / image_id / image_ood."""
         gen = torch.Generator(device=self.device)
         gen.manual_seed(seed)
-        states = self.states(self.sample_tilts(n, gen), gen)
-        d = self.simulate(states)
+        setup = self.sample_setups(n, gen)
+        states = self.states(self.sample_tilts(n, gen, setup=setup), gen, setup=setup)
+        d = self.simulate(states, setup)
         return self._render_modes(d, seed, chunk)
 
     def probe_set_89_trapped(self, n_per_class: int, seed: int, chunk: int = 1024) -> Dict[str, torch.Tensor]:
-        """Balanced 89 vs trapped set: tilts from the nominal 89 / trapped cells plus the
-        physical jitter, kept where the jittered sim gives 89 bounces or the cap."""
+        """Balanced 89 vs trapped set of the first setup (the measured cell): tilts from
+        its nominal 89 / trapped cells plus the physical jitter, kept where the jittered
+        sim gives 89 bounces or the cap."""
         gen = torch.Generator(device=self.device)
         gen.manual_seed(seed)
         r89, rtr = REGIONS.index("89"), REGIONS.index("trapped")

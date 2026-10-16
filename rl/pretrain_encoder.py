@@ -8,7 +8,9 @@ Run from rl/:
     uv run python pretrain_encoder.py --arch cnn --seed 0
     uv run python pretrain_encoder.py --arch vit --patch 8 --seed 0
     uv run python pretrain_encoder.py --arch vit --patch 4 --seed 0
-Outputs in runs/encoder/<name>/: config.json, train.csv, val.csv, model.pt.
+    uv run python pretrain_encoder.py --arch cnn --steps 8000 --setups all   # 4 setups
+Outputs in runs/encoder/<name>/ (or <--runs-dir>/<name>/): config.json, train.csv,
+val.csv, model.pt.
 Evaluation: eval_encoder.py.
 
 Loss = w_map L_map + w_count L_count + w_ell L_ell:
@@ -38,6 +40,7 @@ import torch.nn.functional as F
 
 from encoders import EncoderConfig, FrameModel, count_params, model_name
 from frame_data import DataConfig, FrameData
+from geometry import SETUPS
 
 RL_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(RL_DIR, "runs", "encoder")
@@ -132,12 +135,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--w-count", type=float, default=0.1)
     ap.add_argument("--w-ell", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--setups", choices=("measured", "all"), default="measured",
+                    help="Frames of the measured cell only, or of all geometry.SETUPS "
+                         "(uniform; run name suffix _set4)")
     ap.add_argument("--no-amp", action="store_true", help="fp32 instead of bf16 autocast")
     ap.add_argument("--no-compile", action="store_true", help="eager model (no torch.compile)")
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--val-n", type=int, default=1024)
     ap.add_argument("--tag", default="", help="Suffix for the run name")
+    ap.add_argument("--runs-dir", default=RUNS_DIR, help="Parent of the run directory")
     ap.add_argument("--wandb", action="store_true", help="Log to W&B (project rl-encoder)")
     return ap.parse_args()
 
@@ -148,7 +155,14 @@ def run_name(args: argparse.Namespace, cfg: EncoderConfig) -> str:
     steps = f"{k:g}k" if args.steps >= 1000 else str(args.steps)
     name = f"{model_name(cfg)}_w{cfg.width if cfg.arch == 'vit' else cfg.cnn_widths[-1]}" \
            f"_lr{args.lr:g}_b{args.batch}_{steps}_s{args.seed}"
+    if args.setups == "all":
+        name += f"_set{len(SETUPS)}"
     return name + (f"_{args.tag}" if args.tag else "")
+
+
+def data_config(setups: str, batch_size: int = 256) -> DataConfig:
+    """DataConfig of the --setups choice."""
+    return DataConfig(batch_size=batch_size, setups=SETUPS if setups == "all" else ())
 
 
 def main():
@@ -161,10 +175,10 @@ def main():
         args.lr = 1e-3 if args.arch == "cnn" else 5e-4
     cfg = EncoderConfig(arch=args.arch, patch=args.patch)
     name = run_name(args, cfg)
-    run_dir = os.path.join(RUNS_DIR, name)
+    run_dir = os.path.join(args.runs_dir, name)
     os.makedirs(run_dir, exist_ok=True)
 
-    data = FrameData(DataConfig(batch_size=args.batch), dev)
+    data = FrameData(data_config(args.setups, args.batch), dev)
     gen = torch.Generator(device=dev)
     gen.manual_seed(1_000_003 * (args.seed + 1))
     val = data.eval_set(args.val_n, VAL_SEED)
@@ -177,7 +191,9 @@ def main():
     info = {"name": name, "args": vars(args), "encoder": asdict(cfg),
             "params_encoder": n_enc, "params_heads": n_heads,
             "data": {"batch_size": args.batch, "cell_frac": data.cfg.cell_frac,
-                     "n_cells": int(data.cells.shape[0])}}
+                     "n_cells": int(data.cells.shape[0]),
+                     "setups": [g.name for g in data.setups],
+                     "n_cells_per_setup": data.cell_count.tolist()}}
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(info, f, indent=1)
     print(f"{name}: encoder {n_enc / 1e6:.2f} M params, heads {n_heads / 1e6:.2f} M -> {run_dir}")
@@ -243,7 +259,8 @@ def main():
                   f"count {v['count']:.3f} (acc {v['count_acc']:.3f}) ell {v['ellipse']:.4f}  "
                   f"skipped {skipped}", flush=True)
             torch.save({"cfg": asdict(cfg), "model": model.state_dict(), "step": step,
-                        "name": name}, os.path.join(run_dir, "model.pt"))
+                        "name": name, "data_setups": [g.name for g in data.setups]},
+                       os.path.join(run_dir, "model.pt"))
 
     elapsed = time.time() - t0
     info.update(train_time_s=round(elapsed, 1), skipped_steps=skipped,

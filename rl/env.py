@@ -609,6 +609,30 @@ class AlignEnv:
             "sim": out,
         }
 
+    # ── State (checkpoint / resume) ──
+
+    _STATE_KEYS = ("tilt", "setup", "episode", "idle", "path", "bounces", "stop", "image",
+                   "prev_action", "step_count", "ep_return", "ep_moves", "path0",
+                   "init_center", "init_radius")
+
+    def get_state(self) -> Dict[str, torch.Tensor]:
+        """Per-env episode state and the init box (tensors, for a checkpoint); with the
+        same config and seed, set_state() continues the same episode stream."""
+        st = {k: getattr(self, k) for k in self._STATE_KEYS}
+        if self.history is not None:
+            st["hist_images"], st["hist_actions"], st["hist_count"] = (
+                self.history.images, self.history.actions, self.history.count)
+        return st
+
+    def set_state(self, st: Dict[str, torch.Tensor]):
+        """Restore get_state() output (same num_envs and config)."""
+        for k in self._STATE_KEYS:
+            setattr(self, k, st[k].to(self.device))
+        if self.history is not None and "hist_images" in st:
+            self.history.images = st["hist_images"].to(self.device)
+            self.history.actions = st["hist_actions"].to(self.device)
+            self.history.count = st["hist_count"].to(self.device)
+
     # ── Gym-style API ──
 
     def observe(self) -> Dict[str, torch.Tensor]:

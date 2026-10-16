@@ -224,6 +224,55 @@ and it misses the rare high-order patterns. Patch 4 bought nothing over patch 8
 at 2.6x the training time. Revisit a ViT only with much longer training or
 oversampling of the rare regions (89: 0.15 %, trapped: 0.05 % of the frames).
 
+## Four-setup pretraining (phase 6)
+
+The CNN above saw frames of the measured cell only. For the four-setup stage-1 env (D5) it
+was retrained with frames from all of `geometry.SETUPS`: `frame_data.py` with
+`DataConfig(setups=SETUPS)` draws the setup uniformly per sample, then the tilt (50 %
+uniform in the box, 50 % uniform over the >= 4 bounce cells of that setup's own scan:
+69 240 / 53 483 / 82 925 / 90 988 cells), with the same physical jitter and nuisances.
+The default (no setups) is the old data stream, bit-identical. Same recipe:
+`pretrain_encoder.py --arch cnn --steps 8000 --seed 0 --setups all` ->
+`runs/encoder/cnn_w160_lr0.001_b256_8k_s0_set4/model.pt` (12.0 min locally, final
+validation loss 2.9e-3 on the four-setup validation set). Evaluated with
+`eval_encoder.py --setups all` (sets from all four setups; the 89 vs trapped set stays on
+the measured cell) and on the measured-cell sets above; tables in
+[encoder_tables_set4.md](encoder_tables_set4.md) and [encoder_tables.md](encoder_tables.md)
+(row `cnn-pre4`). Seed-0 runs, n = 8192 per set; "tilt" is the linear probe RMSE on z
+(>= 3 bounces; on the four-setup sets one probe for all setups).
+
+| sets | encoder | set | precision | recall | loc err (mm) | count exact | ell centre (mm) | tilt (deg) | bounces MAE |
+|---|---|---|---|---|---|---|---|---|---|
+| four setups (ceiling recall 0.847) | measured-only | id | 0.372 | 0.322 | 0.104 | 0.425 | 0.649 | 0.209 | 6.42 |
+| | | clean | 0.379 | 0.314 | 0.173 | 0.435 | 0.710 | 0.128 | 4.66 |
+| | | OOD | 0.374 | 0.323 | 0.123 | 0.423 | 0.653 | 0.226 | 6.68 |
+| | four-setup | id | 0.977 | **0.825** | 0.106 | **0.999** | **0.045** | **0.093** | **2.79** |
+| | | clean | 0.965 | 0.821 | 0.152 | 1.000 | 0.069 | 0.056 | 1.74 |
+| | | OOD | 0.965 | 0.818 | 0.128 | 0.981 | 0.055 | 0.113 | 3.40 |
+| measured (ceiling recall 0.937) | measured-only | id | 0.981 | 0.930 | 0.066 | 1.000 | 0.035 | 0.043 | 1.14 |
+| | | clean | 0.976 | 0.925 | 0.152 | 1.000 | 0.091 | 0.024 | 0.71 |
+| | | OOD | 0.971 | 0.928 | 0.086 | 0.991 | 0.045 | 0.050 | 1.59 |
+| | four-setup | id | 0.977 | 0.921 | 0.089 | 1.000 | 0.047 | 0.053 | 1.22 |
+| | | clean | 0.965 | 0.917 | 0.140 | 1.000 | 0.084 | 0.026 | 0.75 |
+| | | OOD | 0.960 | 0.914 | 0.114 | 0.983 | 0.060 | 0.058 | 1.74 |
+
+- **The measured-only CNN does not transfer**: on the other setups' frames it finds a third
+  of the spots and gets 43 % of the counts right. The four-setup CNN reaches 97 % of the
+  detector ceiling there (0.825 / 0.847; long patterns of the other setups have more
+  overlapping spots, hence the lower ceiling).
+- **Cost on the measured cell is small**: recall -0.009, localization +0.023 mm
+  in-distribution, counts unchanged. The largest loss is on the rare high-order patterns:
+  89 / trapped count exact 0.981 / 0.899 in-distribution (was 0.990 / 0.955) and 0.768 /
+  0.732 OOD (was 0.829 / 0.827); the linear 89 vs trapped probe on z stays at 0.998.
+- **The setup is visible in a single frame**, blind frames included: a 4-way linear probe
+  on z gets >= 0.997 for both encoders on every set (raw 32 x 32 pixels 0.95-1.0). In the
+  blind region the one M2 spot is the laser's first hit, whose position depends on the
+  setup's laser tilt and separation. So setup-blind homing (0.276) is not a bound for an
+  image-reading agent; identifying the setup from the first frame and then homing
+  (setup-aware homing, 0.828) is available to it.
+- The forward-time column of these two rows was measured while other GPU work ran and is
+  not comparable with the table above (same architecture, same speed).
+
 ## Deviations and choices beyond the spec
 
 - **Randomized spot rendering** is an exact dense Gaussian per spot (`torch.compile`,

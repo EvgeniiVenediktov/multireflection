@@ -12,6 +12,8 @@ Run from rl/:  uv run python tests/test_encoder.py
        recovered exactly
     4. encoder output shapes (CNN, ViT-p8, ViT-p4) and parameter counts
     5. 50-step overfit smoke test on a fixed batch of 16 per encoder
+    6. four-setup frame data: setups uniform per sample, each sample's state carries
+       its setup's geometry, cell-drawn tilts lie in that setup's >= 4 bounce cells
 """
 
 import math
@@ -26,6 +28,8 @@ import torch.nn.functional as F  # noqa: E402
 
 from encoders import ELL_DIM, N_COUNT, EncoderConfig, FrameModel, count_params, model_name  # noqa: E402
 from frame_data import DataConfig, FrameData  # noqa: E402
+from geometry import SETUPS  # noqa: E402
+from herriott_sim import S_LASER_PITCH, S_SEP  # noqa: E402
 from pretrain_encoder import frame_loss  # noqa: E402
 from render_random import pose_warp  # noqa: E402
 from targets import ellipse_to_vec, fit_ellipse, vec_to_ellipse  # noqa: E402
@@ -216,6 +220,33 @@ def test_overfit(data: FrameData):
         assert last["total"] < 0.3 * first["total"] and last["map"] < 0.5 * first["map"]
 
 
+def test_multi_setup():
+    print("\n== 6. four-setup frame data ==")
+    data = FrameData(DataConfig(setups=SETUPS), DEV)
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(4)
+    n = 8192
+    d = data.batch(gen, n=n, mode="clean")
+    cnt = torch.bincount(d["setup"], minlength=4).float()
+    print(f"  {n} samples, per setup " + ", ".join(
+        f"{g.name} {int(c)}" for g, c in zip(SETUPS, cnt)))
+    assert float((cnt / n - 0.25).abs().max()) < 0.02
+    for k, g in enumerate(SETUPS):
+        st = d["state"][d["setup"] == k]
+        assert float((st[:, S_SEP] - g.separation).abs().max()) <= data.cfg.jitter_sep + 1e-4
+        assert float((st[:, S_LASER_PITCH] - g.laser_pitch).abs().max()) <= (
+            data.cfg.jitter_laser_tilt + 1e-4)
+    setup = data.sample_setups(4096, gen)
+    t = data.sample_tilts(4096, gen, cell_frac=1.0, setup=setup)
+    out = data.sim.simulate(data.states(t, gen, jitter=False, setup=setup), store_world=False)
+    ok = float((out["hit_counts"] >= data.cfg.min_cell_bounces).float().mean())
+    print(f"  cells per setup {data.cell_count.tolist()}; cell-drawn tilts with >= 4 bounces "
+          f"in their own setup (no jitter): {ok:.4f}")
+    assert ok > 0.98
+    print(f"  max M2 spot count {int(d['count'].max())} (classes 0-{N_COUNT - 1})")
+    assert int(d["count"].max()) < N_COUNT
+
+
 if __name__ == "__main__":
     print(f"device {torch.cuda.get_device_name()}")
     data = FrameData(DataConfig(), DEV)
@@ -224,4 +255,5 @@ if __name__ == "__main__":
     test_targets(data)
     test_shapes()
     test_overfit(data)
+    test_multi_setup()
     print("\nall tests passed")

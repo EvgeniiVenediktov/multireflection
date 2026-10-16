@@ -5,6 +5,7 @@ Run from rl/:
     uv run python eval_encoder.py                      # all runs in runs/encoder/
     uv run python eval_encoder.py runs/encoder/<run>   # selected runs
     uv run python eval_encoder.py --figures-only       # figures from existing metrics
+    uv run python eval_encoder.py --setups all --no-figures <runs>   # four-setup sets
 
 Per run, on fixed seeded sets (FrameData.eval_set(EVAL_N, EVAL_SEED): the same states
 rendered clean, in-distribution and OOD; FrameData.probe_set_89_trapped):
@@ -20,7 +21,11 @@ rendered clean, in-distribution and OOD; FrameData.probe_set_89_trapped):
                (accuracy); the same probes on raw pixels as a reference
     speed      encoder forward time per batch of 256 (eager bf16 / fp32, compiled bf16)
 Writes runs/encoder/<run>/metrics.json, reports/encoder_tables.md, and the figures
-figures/encoder_examples.png and figures/encoder_training.png.
+figures/encoder_examples.png and figures/encoder_training.png. With --setups all the sets
+are drawn from all geometry.SETUPS (uniform; the 89 vs trapped set stays on the measured
+cell), a linear setup probe is added, and the outputs are metrics_set4.json and
+reports/encoder_tables_set4.md. Models trained on several setups are labeled
+<model>-pre<S> in the tables.
 """
 
 import argparse
@@ -37,8 +42,8 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from encoders import EncoderConfig, FrameModel, count_params, model_name
-from frame_data import MODES, DataConfig, FrameData
-from pretrain_encoder import ELL_SCALE_MM, RUNS_DIR
+from frame_data import MODES, FrameData
+from pretrain_encoder import ELL_SCALE_MM, RUNS_DIR, data_config
 from render_random import OOD_FACTORS
 from targets import REGIONS, vec_to_ellipse
 
@@ -221,6 +226,14 @@ def probes(feat: torch.Tensor, ev: Dict[str, torch.Tensor], feat89: torch.Tensor
     y = (pr["region"] == REGIONS.index("trapped")).float()
     h = feat89.shape[0] // 2
     out["89_vs_trapped"] = logistic_probe(feat89[:h], y[:h], feat89[h:], y[h:])
+    S = int(ev["setup"].max()) + 1
+    if S > 1:  # Setup from one frame: ridge on one-hot, argmax accuracy (all frames / >= 3 bounces)
+        Y = F.one_hot(ev["setup"], S).float()
+        Xtr, Xte = _standardize(feat[tr].double(), feat[~tr].double())
+        pred = _ridge_pred(Xte, _ridge_fit(Xtr, Y[tr].double(), 1.0)).argmax(1)
+        hit = (pred == ev["setup"][~tr]).double()
+        out["setup"] = {"accuracy": float(hit.mean()), "accuracy_ge3": float(hit[sel[~tr]].mean()),
+                        "accuracy_blind": float(hit[~sel[~tr]].mean())}
     return out
 
 
@@ -271,12 +284,22 @@ def count_metrics(logits: torch.Tensor, count: torch.Tensor) -> Dict[str, float]
             "within1": float(((pc - count).abs() <= 1).float().mean())}
 
 
+def run_label(run_dir: str) -> str:
+    """Model tag for the tables: cnn / vit-p8 / vit-p4, + -pre<S> if trained on S > 1 setups."""
+    with open(os.path.join(run_dir, "config.json")) as f:
+        c = json.load(f)
+    m = "cnn" if c["encoder"]["arch"] == "cnn" else f"vit-p{c['encoder']['patch']}"
+    n = len(c.get("data", {}).get("setups", ["measured"]))
+    return m + (f"-pre{n}" if n > 1 else "")
+
+
 def evaluate_run(run_dir: str, data: FrameData, ev, pr, oracle, pix_probes) -> Dict:
     dev = data.device
     model = load_run(run_dir, dev)
     xs, ys = data.base.xs, data.base.ys
     region = ev["region"].cpu().numpy()
     res = {"run": os.path.basename(run_dir), "model": model_name(model.cfg),
+           "label": run_label(run_dir), "eval_setups": [g.name for g in data.setups],
            "params_encoder": count_params(model.encoder), "params_heads": count_params(model.heads),
            "sets": {}, "probes": {}}
     for mode in MODES:
@@ -349,8 +372,11 @@ def _mean_std(vals: List[float], fmt: str) -> str:
 
 def tables(results: List[Dict]) -> str:
     """Markdown tables: per model (mean +- std over seeds), per set."""
-    models = [m for m in ("cnn", "vit-p8", "vit-p4") if any(r["model"] == m for r in results)]
-    by = {m: [r for r in results if r["model"] == m] for m in models}
+    lab = lambda r: r.get("label", r["model"])
+    seen = list(dict.fromkeys(lab(r) for r in results))
+    models = [m for m in ("cnn", "vit-p8", "vit-p4") if m in seen] + [
+        m for m in seen if m not in ("cnn", "vit-p8", "vit-p4")]
+    by = {m: [r for r in results if lab(r) == m] for m in models}
     L = []
     L.append("| model | seeds | encoder params | train min | fwd ms (bf16 eager / fp32 / compiled) |")
     L.append("|---|---|---|---|---|")
@@ -431,6 +457,17 @@ def tables(results: List[Dict]) -> str:
                      f"{_mean_std(g(lambda p: p['bounces']['r2']), '.3f')} | "
                      f"{_mean_std(g(lambda p: p['bounces']['mae']), '.2f')} | "
                      f"{_mean_std(g(lambda p: p['89_vs_trapped']['accuracy']), '.3f')} |")
+    if "setup" in results[0]["probes"]["id"]:
+        L.append("\n**Linear setup probe on z** (4-way, test half; all frames / >= 3 bounces / "
+                 "blind)\n")
+        L.append("| model | set | all | >= 3 bounces | blind |")
+        L.append("|---|---|---|---|---|")
+        for m, rs, get in rows:
+            for mode in MODES:
+                g = lambda f: [f(get(r, mode)) for r in rs]
+                L.append(f"| {m} | {mode} | {_mean_std(g(lambda p: p['setup']['accuracy']), '.3f')} | "
+                         f"{_mean_std(g(lambda p: p['setup']['accuracy_ge3']), '.3f')} | "
+                         f"{_mean_std(g(lambda p: p['setup']['accuracy_blind']), '.3f')} |")
     return "\n".join(L) + "\n"
 
 
@@ -528,14 +565,21 @@ def main():
     ap.add_argument("--figures-only", action="store_true")
     ap.add_argument("--fig-seed", type=int, default=0, help="Seed of the runs shown in the example figure")
     ap.add_argument("--eval-n", type=int, default=EVAL_N, help="Eval set size (debug: smaller)")
+    ap.add_argument("--setups", choices=("measured", "all"), default="measured",
+                    help="Eval sets of the measured cell, or of all geometry.SETUPS")
+    ap.add_argument("--no-figures", action="store_true")
+    ap.add_argument("--out", default=os.path.join(RL_DIR, "reports"),
+                    help="Directory for the tables (default rl/reports)")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
     dev = torch.device("cuda")
     runs = args.runs or sorted(d for d in glob.glob(os.path.join(RUNS_DIR, "*"))
                                if os.path.exists(os.path.join(d, "model.pt")))
     runs = [os.path.abspath(r) for r in runs]
-    data = FrameData(DataConfig(), dev)
-    os.makedirs(os.path.join(RL_DIR, "reports"), exist_ok=True)
+    data = FrameData(data_config(args.setups), dev)
+    sfx = f"_set{data.n_setups}" if args.setups == "all" else ""
+    metrics_name = f"metrics{sfx}.json"
+    os.makedirs(args.out, exist_ok=True)
     os.makedirs(os.path.join(RL_DIR, "figures"), exist_ok=True)
 
     if not args.figures_only:
@@ -546,7 +590,7 @@ def main():
         for rd in runs:
             t0 = time.time()
             res = evaluate_run(rd, data, ev, pr, oracle, pix)
-            with open(os.path.join(rd, "metrics.json"), "w") as f:
+            with open(os.path.join(rd, metrics_name), "w") as f:
                 json.dump(res, f, indent=1)
             s = res["sets"]
             print(f"{res['run']}: id P/R {s['id']['detection']['precision']:.3f}/"
@@ -555,15 +599,18 @@ def main():
                   f"89/trapped {res['probes']['id']['89_vs_trapped']['accuracy']:.3f} "
                   f"({time.time() - t0:.0f} s)", flush=True)
 
-    results = []
-    for rd in runs:
-        p = os.path.join(rd, "metrics.json")
+    results = []  # Tables over the given runs and every run in runs/encoder with metrics
+    for rd in dict.fromkeys(runs + sorted(os.path.abspath(d) for d in glob.glob(os.path.join(RUNS_DIR, "*")))):
+        p = os.path.join(rd, metrics_name)
         if os.path.exists(p):
             with open(p) as f:
                 results.append(json.load(f))
     if results:
-        with open(os.path.join(RL_DIR, "reports", "encoder_tables.md"), "w") as f:
+        with open(os.path.join(args.out, f"encoder_tables{sfx}.md"), "w") as f:
             f.write(tables(results))
+    if args.no_figures:
+        print(f"tables: {os.path.join(args.out, f'encoder_tables{sfx}.md')}")
+        return
     figure_training(runs, os.path.join(RL_DIR, "figures", "encoder_training.png"))
     sel = {}
     for rd in runs:
