@@ -7,11 +7,18 @@ B independent episodes, all state on the device, no host syncs in step() / reset
                empty = the single EnvConfig.geometry (default: the measured cell). Each
                env samples a setup per episode (EnvConfig.setup_weights)
     scenarios  alternative to setups (AlignEnv(cfg, scenarios=Scenarios(...)), stage 2):
-               a table of N (separation, laser pitch, laser yaw) on EnvConfig.geometry
-               with a P_ref per scenario (scenarios.Atlas.table(): max(P_max, P_floor));
-               the setup index is then the scenario index. Draws uniform over the table,
-               or from a sampler (AlignEnv(..., sampler=...): draw(u (B,)) -> (index,
-               source), e.g. scenarios.ScenarioSampler; no host syncs)
+               a table of N scenarios (separation, laser pitch, laser yaw[, laser dx,
+               laser dy]; without the offsets: those of EnvConfig.geometry) on
+               EnvConfig.geometry with a P_ref per scenario (scenarios.Atlas.table():
+               max(P_max, P_floor)); the setup index is then the scenario index. Draws
+               uniform over the table, or from a sampler (AlignEnv(..., sampler=...):
+               draw(u (B,)) -> (index, source), e.g. scenarios.ScenarioSampler; no host
+               syncs)
+    pool       continuous scenarios (AlignEnv(cfg, pool=scenarios.ScenarioPool(...))): the
+               pool is table and sampler at once, its slots are replaced between
+               iterations, so each env copies the parameters, P_ref and slot generation
+               of its episode's scenario at the draw (scen_params (B, 5), scen_ref (B,),
+               scen_gen (B,)); the setup index is the pool slot. No host syncs
     state      13-DOF base state of the episode's setup; the controlled DOFs (default
                M2 pitch, M2 yaw) move, every other DOF stays at the setup value
     action     (B, 2) int64, per-axis index into the step ladder
@@ -61,9 +68,13 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from geometry import NOMINAL_PATH_MM, CellGeometry
-from herriott_sim import DEVICE, S_LASER_PITCH, S_LASER_YAW, S_M2_PITCH, S_M2_YAW, S_SEP
+from herriott_sim import (DEVICE, S_LASER_DX, S_LASER_DY, S_LASER_PITCH, S_LASER_YAW, S_M2_PITCH,
+                          S_M2_YAW, S_SEP)
 
 M2_ID = 2  # hit_mirror value of an M2 hit
+# Scenario parameters (setup_params, info["scenario_params"]): state indices and names
+SCEN_STATE = (S_SEP, S_LASER_PITCH, S_LASER_YAW, S_LASER_DX, S_LASER_DY)
+SCEN_NAMES = ("separation", "laser_pitch", "laser_yaw", "laser_dx", "laser_dy")
 AUTO_SIGMA_PX = 2.5  # Auto oversampling: spot sigma >= this many splat-grid pixels
 PATH_REFS = ("auto", "nominal", "max")
 DEAD_LASER_PITCH = 89.0  # deg: the laser misses M2, the ray stops before the first bounce
@@ -119,8 +130,18 @@ class Scenarios:
     """Scenario table (scenarios.Atlas.table()): EnvConfig.geometry with separation and
     laser tilt replaced per scenario, and the reward scale of each."""
 
-    params: torch.Tensor  # (N, 3) separation (mm), laser pitch, laser yaw (deg)
+    params: torch.Tensor  # (N, 3) separation (mm), laser pitch, laser yaw (deg); or (N, 5)
+    #                       with laser dx, dy (mm, from the M1 hole centre)
     path_ref: torch.Tensor  # (N,) P_ref (mm)
+
+
+def set_scenario(states: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+    """Write scenario parameters (n, 3) or (n, 5) (SCEN_STATE order) into states (n, 13)
+    in place; returns states."""
+    p = params.to(torch.float32)
+    for j, k in enumerate(SCEN_STATE[:p.shape[1]]):
+        states[:, k] = p[:, j]
+    return states
 
 
 # ── Counter-based random numbers ────────────────────────────────────────────
@@ -414,17 +435,18 @@ class AlignEnv:
     where an episode ended (no data-dependent indexing, no host syncs).
 
     Setup attributes: setups (tuple of CellGeometry; empty in scenario mode), n_setups
-    (setups or scenarios), setup_params (S, 3) separation / laser pitch / laser yaw,
-    setup_probs (S,), path_refs (S,) float32 tensor (P_ref per setup), path_ref_mode
-    ("nominal" / "max" / "scenario"), p_nom (float, P_ref of setup 0: 2733.27 mm by
-    default), scenario_mode, sampler. Per env: setup (B,) int64 index of the episode's
-    setup (scenario), scen_src (B,) int8 sampler source of the episode's draw (-1: no
+    (setups, scenarios or pool slots), setup_params (S, 5) separation / laser pitch /
+    laser yaw / laser dx / laser dy (SCEN_NAMES; pool: the template only), setup_probs
+    (S,), path_refs (S,) float32 tensor (P_ref per setup), path_ref_mode ("nominal" /
+    "max" / "scenario"), p_nom (float, P_ref of setup 0: 2733.27 mm by default),
+    scenario_mode, sampler, pool. Per env: setup (B,) int64 index of the episode's setup
+    (scenario, pool slot), scen_src (B,) int8 sampler source of the episode's draw (-1: no
     sampler or explicit), episode (B,) int64 episode counter, idle (B,) bool (only without
-    auto-reset).
+    auto-reset); pool mode: scen_params (B, 5), scen_ref (B,), scen_gen (B,).
     """
 
     def __init__(self, cfg: Optional[EnvConfig] = None, scenarios: Optional[Scenarios] = None,
-                 sampler=None):
+                 sampler=None, pool=None):
         self.cfg = c = cfg or EnvConfig()
         self.device = dev = torch.device(c.device) if c.device is not None else DEVICE
         self.num_envs = B = c.num_envs
@@ -433,19 +455,28 @@ class AlignEnv:
         assert c.path_ref in PATH_REFS, f"path_ref {c.path_ref!r} not in {PATH_REFS}"
         self.ctrl = tuple(int(i) for i in c.controlled)
 
-        # ── Setups or scenarios ──
-        self.scenario_mode = scenarios is not None
+        # ── Setups, scenarios or pool ──
+        self.pool = pool
+        self.scenario_mode = scenarios is not None or pool is not None
         self.sampler = sampler
-        if self.scenario_mode:
-            assert not c.setups, "scenarios replace EnvConfig.setups"
+        if pool is not None:
+            assert scenarios is None and sampler is None, "the pool is table and sampler"
+            assert not c.setups, "the pool replaces EnvConfig.setups"
             g = c.geometry
             self.setups: Tuple[CellGeometry, ...] = ()
+            self.sampler = pool
+            S = self.n_setups = pool.atlas.n
+            self.setup_base = g.base_state(1, dev)  # Template; parameters per env
+            self.setup_params = self.setup_base[:, list(SCEN_STATE)].clone()
+        elif self.scenario_mode:
+            assert not c.setups, "scenarios replace EnvConfig.setups"
+            g = c.geometry
+            self.setups = ()
             prm = scenarios.params.to(device=dev, dtype=torch.float32)
+            assert prm.shape[1] in (3, 5), "scenario parameters (N, 3) or (N, 5)"
             S = self.n_setups = prm.shape[0]
-            base = g.base_state(S, dev)
-            base[:, S_SEP], base[:, S_LASER_PITCH], base[:, S_LASER_YAW] = prm.unbind(1)
-            self.setup_base = base  # (S, 13)
-            self.setup_params = prm
+            self.setup_base = set_scenario(g.base_state(S, dev), prm)  # (S, 13)
+            self.setup_params = self.setup_base[:, list(SCEN_STATE)].clone()
         else:
             assert sampler is None, "a sampler needs a scenario table"
             self.setups = tuple(c.setups) or (c.geometry,)
@@ -456,9 +487,7 @@ class AlignEnv:
                 assert s.m2_tilt_limit == g.m2_tilt_limit, "setups must share the tilt limit"
                 assert s.intensity_threshold == g.intensity_threshold
             self.setup_base = torch.cat([s.base_state(1, dev) for s in self.setups])  # (S, 13)
-            self.setup_params = torch.tensor(
-                [[s.separation, s.laser_pitch, s.laser_yaw] for s in self.setups],
-                dtype=torch.float32, device=dev)
+            self.setup_params = self.setup_base[:, list(SCEN_STATE)].clone()
         self.limit = float(g.m2_tilt_limit if c.tilt_limit is None else c.tilt_limit)
         self._dead = self.setup_base[0].clone()
         self._dead[S_LASER_PITCH] = DEAD_LASER_PITCH
@@ -487,7 +516,11 @@ class AlignEnv:
 
         # ── Reward scale per setup ──
         self._path_max: Optional[torch.Tensor] = None
-        if self.scenario_mode:
+        if pool is not None:
+            self.path_ref_mode = "scenario"
+            self.path_refs = pool.atlas.path_ref  # Current pool content (live)
+            self.p_nom = float(self.path_refs[0])
+        elif self.scenario_mode:
             self.path_ref_mode = "scenario"
             self.path_refs = scenarios.path_ref.to(device=dev, dtype=torch.float32)
             assert self.path_refs.shape == (S,), "one P_ref per scenario"
@@ -511,6 +544,7 @@ class AlignEnv:
         self._env_key = hash32(k ^ torch.arange(B, device=dev))
         self._setup0 = torch.zeros(B, dtype=torch.long, device=dev)
         self._src0 = torch.full((B,), -1, dtype=torch.int8, device=dev)
+        self._gen0 = torch.zeros(B, dtype=torch.long, device=dev)
         self.set_init_box(c.init_center, c.init_radius)
 
         # ── Per-env state ──
@@ -528,6 +562,10 @@ class AlignEnv:
         self.ep_return = torch.zeros(B, device=dev)
         self.ep_moves = torch.zeros(B, dtype=torch.long, device=dev)
         self.path0 = torch.zeros(B, device=dev)  # Path at episode start
+        if pool is not None:  # The episode's scenario, copied from its pool slot at the draw
+            self.scen_params = self.setup_params[0].expand(B, -1).clone()
+            self.scen_ref = torch.ones(B, device=dev)
+            self.scen_gen = torch.zeros(B, dtype=torch.long, device=dev)
         self.history = (
             HistoryStack(B, c.history_len, self.img_shape, dev) if c.history_len > 0 else None
         )
@@ -574,8 +612,12 @@ class AlignEnv:
         """(n,) float32 P_ref of setup indices (n,)."""
         return self.path_refs[setup]
 
-    def _norm(self, path: torch.Tensor, setup: torch.Tensor) -> torch.Tensor:
-        """path / P_ref of the setup (one setup: division by the float p_nom, as stage 1)."""
+    def _norm(self, path: torch.Tensor, setup: torch.Tensor,
+              ref: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """path / P_ref of the setup (one setup: division by the float p_nom, as stage 1);
+        ref (n,): this P_ref instead (pool mode: the episode's copy)."""
+        if ref is not None:
+            return path / ref
         if self.n_setups == 1:
             return path / self.p_nom
         return path / self.path_refs[setup]
@@ -605,6 +647,12 @@ class AlignEnv:
         s = torch.searchsorted(self._setup_cdf, u[:, 2].contiguous(), right=True)
         return t, s.clamp(max=self.n_setups - 1), self._src0
 
+    def _pool_rows(self, slot: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Parameters (n, 5), P_ref (n,) and generation (n,) of pool slots (n,) (gathers,
+        no sync)."""
+        p = self.pool
+        return p.atlas.params[slot], p.atlas.path_ref[slot], p.slot_gen[slot]
+
     def _draw(self, episode: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Initial tilts (B, 2) and setups (B,) of the given per-env episode indices."""
         t, s, _ = self._draw_src(episode)
@@ -618,8 +666,10 @@ class AlignEnv:
 
     def states(self, tilts: torch.Tensor, setup: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(n, 13) states: base of each row's setup (default 0) with the controlled DOFs
-        set to tilts (n, 2)."""
+        set to tilts (n, 2). Pool mode: the current content of the slots setup."""
         n = tilts.shape[0]
+        if self.pool is not None and setup is not None:
+            return self.scenario_states(tilts, self.pool.atlas.params[setup])
         if setup is None:
             s = self.setup_base[0].expand(n, -1).clone()
         else:
@@ -632,9 +682,9 @@ class AlignEnv:
 
     def scenario_states(self, tilts: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """(n, 13) states of explicit scenarios params (n, 3) (separation, laser pitch,
-        laser yaw; every other DOF as setup 0) at the controlled tilts (n, 2)."""
-        s = self.setup_base[0].expand(tilts.shape[0], -1).clone()
-        s[:, S_SEP], s[:, S_LASER_PITCH], s[:, S_LASER_YAW] = params.to(torch.float32).unbind(1)
+        laser yaw) or (n, 5) (and laser dx, dy; every other DOF as setup 0) at the
+        controlled tilts (n, 2)."""
+        s = set_scenario(self.setup_base[0].expand(tilts.shape[0], -1).clone(), params)
         s[:, self.ctrl[0]] = tilts[:, 0]
         s[:, self.ctrl[1]] = tilts[:, 1]
         return s
@@ -644,10 +694,12 @@ class AlignEnv:
         tilts: torch.Tensor,
         setup: Optional[torch.Tensor] = None,
         live: Optional[torch.Tensor] = None,
+        params: Optional[torch.Tensor] = None,
     ) -> dict:
-        """Sim of (n, 2) tilts of setups (n,) (default 0). live (n,) bool: the other rows
-        are traced as the dead state (0 bounces, blank image; no sync)."""
-        s = self.states(tilts, setup)
+        """Sim of (n, 2) tilts of setups (n,) (default 0), or of explicit scenario
+        parameters params (n, 3 | 5). live (n,) bool: the other rows are traced as the
+        dead state (0 bounces, blank image; no sync)."""
+        s = self.states(tilts, setup) if params is None else self.scenario_states(tilts, params)
         if live is not None:
             s = torch.where(live[:, None], s, self._dead)
         return self.sim.simulate(s, store_world=False)
@@ -680,10 +732,13 @@ class AlignEnv:
                    "prev_action", "step_count", "ep_return", "ep_moves", "path0",
                    "init_center", "init_radius", "scen_src")
 
+    _POOL_KEYS = ("scen_params", "scen_ref", "scen_gen")
+
     def get_state(self) -> Dict[str, torch.Tensor]:
         """Per-env episode state and the init box (tensors, for a checkpoint); with the
         same config and seed, set_state() continues the same episode stream."""
-        st = {k: getattr(self, k) for k in self._STATE_KEYS}
+        keys = self._STATE_KEYS + (self._POOL_KEYS if self.pool is not None else ())
+        st = {k: getattr(self, k) for k in keys}
         if self.history is not None:
             st["hist_images"], st["hist_actions"], st["hist_count"] = (
                 self.history.images, self.history.actions, self.history.count)
@@ -691,7 +746,7 @@ class AlignEnv:
 
     def set_state(self, st: Dict[str, torch.Tensor]):
         """Restore get_state() output (same num_envs and config)."""
-        for k in self._STATE_KEYS:
+        for k in self._STATE_KEYS + (self._POOL_KEYS if self.pool is not None else ()):
             if k in st:  # scen_src: absent in older checkpoints
                 setattr(self, k, st[k].to(self.device))
         if self.history is not None and "hist_images" in st:
@@ -710,14 +765,15 @@ class AlignEnv:
 
     def state_info(self) -> Dict[str, torch.Tensor]:
         """Privileged quantities of the current frame: tilt, setup, scenario_params
-        (B, 3), path_ref, path_mm, path_norm, bounces, stop_reason, step, idle."""
+        (B, 5), path_ref, path_mm, path_norm, bounces, stop_reason, step, idle."""
+        pool = self.pool is not None
         return {
             "tilt": self.tilt,
             "setup": self.setup,
-            "scenario_params": self.setup_params[self.setup],
-            "path_ref": self.ref_of(self.setup),
+            "scenario_params": self.scen_params if pool else self.setup_params[self.setup],
+            "path_ref": self.scen_ref if pool else self.ref_of(self.setup),
             "path_mm": self.path,
-            "path_norm": self._norm(self.path, self.setup),
+            "path_norm": self._norm(self.path, self.setup, self.scen_ref if pool else None),
             "bounces": self.bounces,
             "stop_reason": self.stop,
             "step": self.step_count,
@@ -734,9 +790,10 @@ class AlignEnv:
         """Start new episodes for the masked envs (all if None).
 
         tilts (B, 2): explicit initial tilts (clamped to the limits); setups (B,):
-        explicit setup indices; default: drawn for the env's next episode. Simulates
-        only the masked envs (no host sync). Returns obs, or (obs, info) with
-        return_info (state_info() plus reset (B,) = mask).
+        explicit setup indices (pool mode: slots, their current content); default:
+        drawn for the env's next episode. Simulates only the masked envs (no host sync).
+        Returns obs, or (obs, info) with return_info (state_info() plus reset (B,) =
+        mask).
         """
         B = self.num_envs
         if mask is None:
@@ -751,7 +808,14 @@ class AlignEnv:
         tilt = torch.where(m1, new, self.tilt)
         setup = torch.where(mask, new_s, self.setup)
         self.scen_src = torch.where(mask, new_src, self.scen_src)
-        out = self._simulate(tilt, setup, live=mask)
+        if self.pool is not None:
+            prm, ref, gen = self._pool_rows(new_s)
+            self.scen_params = torch.where(m1, prm, self.scen_params)
+            self.scen_ref = torch.where(mask, ref, self.scen_ref)
+            self.scen_gen = torch.where(mask, gen, self.scen_gen)
+            out = self._simulate(tilt, setup, live=mask, params=self.scen_params)
+        else:
+            out = self._simulate(tilt, setup, live=mask)
         img = self._render(out)
 
         self.tilt = tilt
@@ -782,9 +846,11 @@ class AlignEnv:
         (B,), computed before the auto-reset):
             final_image (B, 1, H, W) uint8, final_obs (obs dict of that frame, with
             its history stack), applied_action (B, 2), tilt (B, 2) true controlled
-            tilts, setup (= scenario index in scenario mode), scenario_params (B, 3),
-            scenario_src (B,) int8 sampler source of the episode (-1: none), path_ref
-            (privileged), path_mm, path_norm = path_mm / P_ref
+            tilts, setup (= scenario index in scenario mode, pool slot in pool mode),
+            scenario_params (B, 5), scenario_src (B,) int8 sampler source of the
+            episode (-1: none), scenario_gen (B,) pool slot generation at the episode's
+            draw (0 without a pool), path_ref (privileged), path_mm, path_norm =
+            path_mm / P_ref
             (path-head label of final_image), bounces, stop_reason, done, idle (env
             was idle: action ignored, reward 0, not done; only without auto-reset);
             ep_return, ep_length, ep_moves, ep_initial_path_mm, ep_final_path_mm,
@@ -815,15 +881,21 @@ class AlignEnv:
 
         # One sim + render pass over post-step and (with auto-reset) reset states
         setup = self.setup
+        pool = self.pool is not None
+        ref_cur = self.scen_ref if pool else None  # Pool: the episode's own copies
         if auto:
             ep_next = self.episode + 1
             reset_tilt, reset_setup, reset_src = self._draw_src(ep_next)
+            prm = None
+            if pool:
+                reset_prm, reset_ref, reset_gen = self._pool_rows(reset_setup)
+                prm = torch.cat((self.scen_params, reset_prm))
             out = self._simulate(
                 torch.cat((new, reset_tilt)), torch.cat((setup, reset_setup)),
-                live=torch.cat((move, done)),
+                live=torch.cat((move, done)), params=prm,
             )
         else:
-            out = self._simulate(new, setup, live=move)
+            out = self._simulate(new, setup, live=move, params=self.scen_params if pool else None)
         img = self._render(out)
         path_all = out["total_path_length"]
         count_all = out["hit_counts"]
@@ -834,7 +906,7 @@ class AlignEnv:
         bounces = torch.where(move, count_all[:B], self.bounces)
         stop = torch.where(move, stop_all[:B], self.stop)
         image = torch.where(move.view(-1, 1, 1, 1), img[:B], self.image)
-        reward = torch.where(move, self._norm(path - self.path, setup) - c.step_cost, 0.0)
+        reward = torch.where(move, self._norm(path - self.path, setup, ref_cur) - c.step_cost, 0.0)
         prev_action = applied if auto else torch.where(idle[:, None], self.prev_action, applied)
 
         ep_return = self.ep_return + reward
@@ -858,11 +930,12 @@ class AlignEnv:
             "applied_action": applied,
             "tilt": new,
             "setup": setup,
-            "scenario_params": self.setup_params[setup],
+            "scenario_params": self.scen_params if pool else self.setup_params[setup],
             "scenario_src": self.scen_src,
-            "path_ref": self.ref_of(setup),
+            "scenario_gen": self.scen_gen if pool else self._gen0,
+            "path_ref": ref_cur if pool else self.ref_of(setup),
             "path_mm": path,
-            "path_norm": self._norm(path, setup),
+            "path_norm": self._norm(path, setup, ref_cur),
             "bounces": bounces,
             "stop_reason": stop,
             "done": done,
@@ -881,6 +954,10 @@ class AlignEnv:
             self.tilt = torch.where(d1, reset_tilt, new)
             self.setup = torch.where(done, reset_setup, setup)
             self.scen_src = torch.where(done, reset_src, self.scen_src)
+            if pool:
+                self.scen_params = torch.where(d1, reset_prm, self.scen_params)
+                self.scen_ref = torch.where(done, reset_ref, self.scen_ref)
+                self.scen_gen = torch.where(done, reset_gen, self.scen_gen)
             self.episode = torch.where(done, ep_next, self.episode)
             self.path = torch.where(done, path_all[B:], path)
             self.bounces = torch.where(done, count_all[B:], bounces)
@@ -907,7 +984,11 @@ class AlignEnv:
 
         info["obs_tilt"] = self.tilt
         info["obs_setup"] = self.setup
-        info["obs_scenario_params"] = self.setup_params[self.setup]
-        info["obs_path_ref"] = self.ref_of(self.setup)
-        info["obs_path_norm"] = self._norm(self.path, self.setup)
+        if pool:
+            info["obs_scenario_params"] = self.scen_params
+            info["obs_path_ref"] = self.scen_ref
+        else:
+            info["obs_scenario_params"] = self.setup_params[self.setup]
+            info["obs_path_ref"] = self.ref_of(self.setup)
+        info["obs_path_norm"] = self._norm(self.path, self.setup, self.scen_ref if pool else None)
         return self.observe(), reward, terminated, truncated, info

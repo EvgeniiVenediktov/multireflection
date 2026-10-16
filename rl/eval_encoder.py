@@ -34,12 +34,25 @@ the atlas grid points (scenarios.GRID: separation 50-200 mm step 2, laser pitch 
 scenarios without >= 4 bounce cells draw from the box). The setup probe becomes a ridge
 probe of (separation, laser pitch, laser yaw); outputs metrics_full.json and
 reports/encoder_tables_full.md. --no-speed skips the forward timing.
+
+--scenarios N --sep-range MIN MAX [--laser-range -8 8] [--laser-offset-radius 1.5] (D7):
+the N scenarios are continuous (scenarios.sample_valid_scenarios: the distribution, beam
+filter and offset jitter (none) of pretrain_encoder.py's continuous mode, --laser-mode;
+hold out another --scenario-seed than the training run), plus the measured cell as setup
+0. Adds per separation bin
+(scenarios.cont_sep_bins, 20-50, 50-100, ..., 350-400; nominal separation of the frame's
+scenario): detection precision / recall, count exact, and the linear tilt (>= 3 bounces)
+and separation probes (fit on the first half over all bins, RMSE / MAE per bin on the
+second); outputs metrics_<ranges tag>.json and encoder_tables_<ranges tag>.md. Table
+labels: <model>-pre<S> (S setups), -grid<N> / -cont<N> (scenario runs), with -ft for
+fine-tuned runs (pretrain_encoder.py --init).
 """
 
 import argparse
 import csv
 import glob
 import json
+import math
 import os
 import time
 from typing import Dict, List, Optional
@@ -52,6 +65,7 @@ from scipy.optimize import linear_sum_assignment
 from encoders import EncoderConfig, FrameModel, count_params, model_name
 from frame_data import MODES, FrameData
 from geometry import CellGeometry
+from herriott_sim import S_SEP
 from pretrain_encoder import ELL_SCALE_MM, RUNS_DIR, data_config
 from render_random import OOD_FACTORS
 from targets import REGIONS, vec_to_ellipse
@@ -178,15 +192,22 @@ def _ridge_pred(X: torch.Tensor, Wt: torch.Tensor) -> torch.Tensor:
     return X @ Wt[:-1] + Wt[-1]
 
 
-def ridge_probe(Xtr, Ytr, Xte, Yte) -> Dict[str, float]:
-    """Ridge on standardized features, lambda from an inner 80 / 20 split; R^2 (mean
-    over outputs), RMSE and MAE on the test split."""
+def ridge_select_predict(Xtr, Ytr, Xte):
+    """Ridge on standardized features, lambda from an inner 80 / 20 split: predictions
+    on Xte (float64) and lambda."""
     Xtr, Xte = _standardize(Xtr.double(), Xte.double())
-    Ytr, Yte = Ytr.double(), Yte.double()
+    Ytr = Ytr.double()
     k = int(0.8 * Xtr.shape[0])
     best = min(RIDGE_GRID, key=lambda lam: float(
         ((_ridge_pred(Xtr[k:], _ridge_fit(Xtr[:k], Ytr[:k], lam)) - Ytr[k:]) ** 2).mean()))
-    P = _ridge_pred(Xte, _ridge_fit(Xtr, Ytr, best))
+    return _ridge_pred(Xte, _ridge_fit(Xtr, Ytr, best)), best
+
+
+def ridge_probe(Xtr, Ytr, Xte, Yte) -> Dict[str, float]:
+    """Ridge on standardized features, lambda from an inner 80 / 20 split; R^2 (mean
+    over outputs), RMSE and MAE on the test split."""
+    P, best = ridge_select_predict(Xtr, Ytr, Xte)
+    Yte = Yte.double()
     sse = ((P - Yte) ** 2).sum(0)
     sst = ((Yte - Yte.mean(0)) ** 2).sum(0)
     return {"r2": float((1 - sse / sst).mean()), "rmse": float(((P - Yte) ** 2).mean().sqrt()),
@@ -255,6 +276,41 @@ def probes(feat: torch.Tensor, ev: Dict[str, torch.Tensor], feat89: torch.Tensor
     return out
 
 
+def sep_bin_metrics(o: Dict[str, torch.Tensor], ev: Dict[str, torch.Tensor], det, sep: torch.Tensor,
+                    bins) -> Dict[str, Dict[str, float]]:
+    """Per separation bin (sep (n,) nominal separation of each frame): detection,
+    count exact, and the RMSE / MAE of the linear tilt (>= 3 bounces) and separation
+    probes fit on the first half (all bins) and evaluated per bin on the second half."""
+    from scenarios import sep_bin_masks
+
+    tp, npred, ntrue, dsum = det
+    n = sep.shape[0]
+    te = torch.arange(n, device=sep.device) >= n // 2
+    sel = ev["bounces"] >= 3
+    feat = o["z"]
+    pt, _ = ridge_select_predict(feat[~te & sel], ev["tilt"][~te & sel], feat[te & sel])
+    pt_full = torch.full((n, 2), math.nan, dtype=torch.float64, device=sep.device)
+    pt_full[te & sel] = pt
+    y = ev["scen"][:, :1]
+    ps, _ = ridge_select_predict(feat[~te], y[~te], feat[te])
+    ps_full = torch.full((n, 1), math.nan, dtype=torch.float64, device=sep.device)
+    ps_full[te] = ps
+    hit = (o["count"].argmax(1) == ev["count"]).float()
+    out = {}
+    for name, m in sep_bin_masks(sep, bins).items():
+        mm = m.cpu().numpy()
+        r = {**det_summary(tp, npred, ntrue, dsum, mm),
+             "count_exact": float(hit[m].mean()) if bool(m.any()) else math.nan}
+        mt = m & te & sel
+        r["tilt_rmse"] = float(((pt_full[mt] - ev["tilt"][mt].double()) ** 2).mean().sqrt()) \
+            if bool(mt.any()) else math.nan
+        r["n_tilt"] = int(mt.sum())
+        ms = m & te
+        r["sep_mae"] = float((ps_full[ms] - y[ms].double()).abs().mean()) if bool(ms.any()) else math.nan
+        out[name] = r
+    return out
+
+
 # ── Speed ───────────────────────────────────────────────────────────────────
 
 
@@ -303,16 +359,21 @@ def count_metrics(logits: torch.Tensor, count: torch.Tensor) -> Dict[str, float]
 
 
 def run_label(run_dir: str) -> str:
-    """Model tag for the tables: cnn / vit-p8 / vit-p4, + -pre<S> if trained on S > 1 setups."""
+    """Model tag for the tables: cnn / vit-p8 / vit-p4, + -grid<N> / -cont<N> (scenario
+    runs) or -pre<S> (trained on S > 1 setups), with -ft for fine-tuned runs (--init)."""
     with open(os.path.join(run_dir, "config.json")) as f:
         c = json.load(f)
     m = "cnn" if c["encoder"]["arch"] == "cnn" else f"vit-p{c['encoder']['patch']}"
+    a = c.get("args", {})
+    ft = "-ft" if a.get("init") else ""
+    if a.get("scenarios", 0) > 0:
+        return m + ft + (f"-cont{a['scenarios']}" if a.get("sep_range") else f"-grid{a['scenarios']}")
     n = len(c.get("data", {}).get("setups", ["measured"]))
-    return m + (f"-pre{n}" if n > 1 else "")
+    return m + ft + (f"-pre{n}" if n > 1 else "")
 
 
 def evaluate_run(run_dir: str, data: FrameData, ev, pr, oracle, pix_probes,
-                 scen: bool = False, speed: bool = True) -> Dict:
+                 scen: bool = False, speed: bool = True, bins=None) -> Dict:
     dev = data.device
     model = load_run(run_dir, dev)
     xs, ys = data.base.xs, data.base.ys
@@ -331,6 +392,9 @@ def evaluate_run(run_dir: str, data: FrameData, ev, pr, oracle, pix_probes,
              "count": count_metrics(o["count"], ev["count"]),
              "ellipse": ellipse_metrics(o["ellipse"], ev),
              "map_mse_sqrt": float(((o["map"] - ev["spot_map"].sqrt()) ** 2).mean())}
+        if bins is not None:  # Continuous sets: per separation bin
+            r["by_sep"] = sep_bin_metrics(o, ev, (tp, npred, ntrue, dsum),
+                                          data.setup_base[ev["setup"], S_SEP], bins)
         r["by_region"] = {
             name: {**det_summary(tp, npred, ntrue, dsum, region == i),
                    "count_exact": float((o["count"].argmax(1) == ev["count"])[ev["region"] == i].float().mean())}
@@ -496,6 +560,25 @@ def tables(results: List[Dict]) -> str:
                         rm = np.mean([get(r, mode)["scenario"][k + sfx]["rmse"] for r in rs])
                         cells.append(f"{r2:.3f} / {rm:.2f}")
                 L.append(f"| {m} | {mode} | " + " | ".join(cells) + " |")
+    if "by_sep" in results[0]["sets"]["id"]:
+        bn = list(results[0]["sets"]["id"]["by_sep"])
+        for mode, title in (("id", "in-distribution"), ("clean", "clean")):
+            L.append(f"\n**By separation bin, {title}** (nominal separation of the frame's "
+                     f"scenario; frames per bin: " + ", ".join(
+                         f"{b} {results[0]['sets'][mode]['by_sep'][b]['n']}" for b in bn) + ")\n")
+            for key, lab, fmt in (("recall", "detection recall", ".3f"),
+                                  ("precision", "detection precision", ".3f"),
+                                  ("count_exact", "count exact", ".3f"),
+                                  ("tilt_rmse", "tilt probe RMSE (deg, >= 3 bounces, test half)", ".3f"),
+                                  ("sep_mae", "separation probe MAE (mm, test half)", ".1f")):
+                L.append(f"{lab}:\n")
+                L.append("| model | " + " | ".join(bn) + " |")
+                L.append("|---|" + "---|" * len(bn))
+                for m in models:
+                    cells = [_mean_std([r["sets"][mode]["by_sep"][b][key] for r in by[m]], fmt)
+                             for b in bn]
+                    L.append(f"| {m} | " + " | ".join(cells) + " |")
+                L.append("")
     if "setup" in results[0]["probes"]["id"]:
         L.append("\n**Linear setup probe on z** (4-way, test half; all frames / >= 3 bounces / "
                  "blind)\n")
@@ -611,6 +694,16 @@ def main():
                     help="Sets from this many scenarios sampled uniformly from the atlas grid "
                          "(plus the measured cell); 0 = --setups")
     ap.add_argument("--scenario-seed", type=int, default=0)
+    ap.add_argument("--sep-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+                    help="--scenarios: continuous scenarios with this separation range (mm), "
+                         "per separation bin metrics")
+    ap.add_argument("--laser-range", type=float, nargs=2, default=[-8.0, 8.0],
+                    metavar=("MIN", "MAX"), help="Continuous: laser pitch and yaw range (deg)")
+    ap.add_argument("--laser-offset-radius", type=float, default=1.5,
+                    help="Continuous: laser offset disk radius (mm); 0 = the measured offsets")
+    ap.add_argument("--laser-mode", choices=("landing", "angle"), default="landing",
+                    help="Continuous: laser angles from a uniform M2 landing point (bounded by "
+                         "--laser-range) or uniform in angle")
     ap.add_argument("--no-speed", action="store_true", help="Skip the forward timing")
     ap.add_argument("--out", default=os.path.join(RL_DIR, "reports"),
                     help="Directory for the tables (default rl/reports)")
@@ -621,17 +714,35 @@ def main():
                                if os.path.exists(os.path.join(d, "model.pt")))
     runs = [os.path.abspath(r) for r in runs]
     scen = args.scenarios > 0
+    bins = None
     if scen:
         from dataclasses import replace
 
         from find_setups import setup_geometry
-        from scenarios import sample_grid
+        from scenarios import (cont_ranges, cont_sep_bins, sample_grid, sample_valid_scenarios,
+                               scenario_geometry)
 
-        pts = sample_grid(args.scenarios, args.scenario_seed)
-        setups = (CellGeometry(),) + tuple(setup_geometry(*p) for p in pts)
-        data = FrameData(replace(data_config("measured"), setups=setups, scan_step=0.05), dev)
-        sfx = "_full"
-        print(f"{args.scenarios} grid scenarios (seed {args.scenario_seed}): separation "
+        if args.sep_range is not None:
+            rng = cont_ranges(args.sep_range, args.laser_range, args.laser_offset_radius,
+                       args.laser_mode)
+            pts, rej = sample_valid_scenarios(args.scenarios, rng, args.scenario_seed, device=dev)
+            setups = (CellGeometry(),) + tuple(scenario_geometry(p) for p in pts)
+            bins = cont_sep_bins(*rng.sep)
+            sfx = f"_{rng.tag()}"
+            kind = (f"continuous scenarios ({rng.tag()}, {rng.mode} mode, laser bounds "
+                    f"{rng.pitch} deg, offsets r {rng.offset_radius} mm; of {rej['candidates']} "
+                    f"candidates angles out of bounds "
+                    f"{100 * rej['angle_rejected'] / rej['candidates']:.1f} %, clipped "
+                    f"{100 * rej['clipped'] / rej['candidates']:.1f} %, missed M2 "
+                    f"{100 * rej['missed'] / rej['candidates']:.1f} %)")
+        else:
+            pts = sample_grid(args.scenarios, args.scenario_seed)
+            setups = (CellGeometry(),) + tuple(setup_geometry(*p) for p in pts)
+            sfx = "_full"
+            kind = "grid scenarios"
+        jit = {"jitter_laser_offset": 0.0} if bins is not None and rng.offset_radius > 0 else {}
+        data = FrameData(replace(data_config("measured"), setups=setups, scan_step=0.05, **jit), dev)
+        print(f"{args.scenarios} {kind} (seed {args.scenario_seed}): separation "
               f"{pts[:, 0].min():g}-{pts[:, 0].max():g} mm, laser pitch {pts[:, 1].min():g}-"
               f"{pts[:, 1].max():g}, yaw {pts[:, 2].min():g}-{pts[:, 2].max():g} deg; "
               f"{int((data.cell_count[1:] == 0).sum())} without >= 4 bounce cells")
@@ -649,7 +760,7 @@ def main():
               f"oracle recall {oracle['recall']:.3f}")
         for rd in runs:
             t0 = time.time()
-            res = evaluate_run(rd, data, ev, pr, oracle, pix, scen, not args.no_speed)
+            res = evaluate_run(rd, data, ev, pr, oracle, pix, scen, not args.no_speed, bins)
             with open(os.path.join(rd, metrics_name), "w") as f:
                 json.dump(res, f, indent=1)
             s = res["sets"]

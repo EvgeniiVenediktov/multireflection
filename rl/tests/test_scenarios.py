@@ -125,7 +125,7 @@ def test_atlas(atlas: Atlas, d: dict):
     pm4 = env4.path_max()
     for k, g in enumerate(SETUPS):
         i = atlas.named[g.name]
-        assert torch.equal(atlas.params[i], env4.setup_params[k])
+        assert torch.equal(atlas.params[i], env4.setup_params[k, :3])
         assert float(atlas.pmax[i]) == float(pm4[k]), g.name
         assert abs(float(atlas.pmax[i]) - SETUP_INFO[g.name].pmax_mm) < 0.01
     # Chunking: one scenario per sim call gives the same atlas
@@ -258,9 +258,9 @@ def test_env_scenarios(atlas: Atlas):
         _, rew, term, trunc, info = env.step(a)
         sc = info["setup"]
         assert torch.equal(info["path_ref"], refs[sc])
-        assert torch.equal(info["scenario_params"], atlas.params[sc])
+        assert torch.equal(info["scenario_params"][:, :3], atlas.params[sc])
         assert torch.equal(info["path_norm"], info["path_mm"] / refs[sc])
-        assert torch.equal(info["obs_scenario_params"], atlas.params[env.setup])
+        assert torch.equal(info["obs_scenario_params"][:, :3], atlas.params[env.setup])
         src = info["scenario_src"]
         assert bool(((src == SRC_IMPOSSIBLE) == ~atlas.good[sc]).all())
         ret += rew.double()
@@ -379,7 +379,7 @@ def test_init_from():
         assert "_ft4398136_" in tr.name and tr.name.startswith("ppo_cnn-pre4_k6_set4"), tr.name
         tr.rollout()
         tr.update()  # Fresh optimizer state, runs
-        cf = replace(tc, setups="full", init_from=path, unfreeze_at=0)
+        cf = replace(tc, setups="full", scenarios="atlas", init_from=path, unfreeze_at=0)
         nm = run_name(cf, {"n_setups": 4})
         print(f"  trainer: value norm from the checkpoint (mean {float(m):.3f}, std {float(s):.3f}); "
               f"names {tr.name}, {nm}")
@@ -508,7 +508,8 @@ def test_full_resume(atlas_path: str):
     print("\n== 9. full-mode trainer: save / resume ==")
     d = tempfile.mkdtemp()
     try:
-        cfg = PPOConfig(setups="full", atlas=atlas_path, num_envs=16, rollout_len=24, max_steps=6,
+        cfg = PPOConfig(setups="full", scenarios="atlas", atlas=atlas_path, num_envs=16,
+                        rollout_len=24, max_steps=6,
                         history_len=6, d_model=64, n_layers=2, n_heads=4, mlp_ratio=2.0,
                         amp=False, compile=False, wandb=False, minibatches=4, eval_every=0,
                         seed=7, total_env_steps=10**6, plr_min_seen=2)

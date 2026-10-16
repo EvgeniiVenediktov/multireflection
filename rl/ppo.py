@@ -9,17 +9,26 @@ Cluster: cluster/ppo_l40s.slurm.
 
     env        AlignEnv, auto-reset, history_len 0 (the agent keeps the windows), max_steps
                64, step_cost 0.01, 64 px; envs persist across iterations (episodes span
-               rollouts). --setups full (default, stage 2): the scenario atlas
-               (scenarios.py; --atlas, built there if missing), P_ref per scenario =
-               max(P_max, P_floor), scenarios drawn per episode by the regret-prioritized
-               ScenarioSampler (--plr; --no-plr: uniform over the good set; 10 %
-               impossible either way). --setups all: the four geometry.SETUPS, P_ref =
-               per-setup P_max; measured: the measured cell
+               rollouts). --setups full (default, stage 2) with --scenarios pool
+               (default, D7): continuous scenarios (separation --sep-range, laser offset
+               uniform over the M1 hole disk of --laser-offset-radius, laser pitch / yaw
+               from a uniform M2 landing point within --laser-range, --laser-mode;
+               beams clipped by the hole or missing M2 discarded) from the ScenarioPool
+               (scenarios.py: --pool-size
+               slots, --pool-refresh of them rescanned per iteration, PLR within the
+               pool); --scenarios atlas: the grid atlas (--atlas, built there if
+               missing) and the ScenarioSampler. Either way P_ref per scenario =
+               max(P_max, P_floor), drawn per episode by the regret-prioritized sampler
+               (--plr; --no-plr: uniform over the good set; 10 % impossible either way).
+               --setups all: the four geometry.SETUPS, P_ref = per-setup P_max;
+               measured: the measured cell
     init       --encoder-init: encoder weights of a pretrain_encoder.py checkpoint.
                --init-from: a previous ppo.py checkpoint, every tensor whose name and
                shape match (encoder, token, core, policy / value / path / tilt heads; the
-               skipped and missing ones are printed and kept in config.json), its
-               value-norm statistics; fresh optimizer, counters, entropy coefficient
+               skipped and missing ones are printed and kept in config.json; the scenario
+               head is re-initialized when its normalization range differs, e.g. atlas
+               run -> pool run), its value-norm statistics; fresh optimizer, counters,
+               entropy coefficient
     rollout    T steps per env with agent.act(): one frame encoded per env and step,
                actions sampled per factor (Gumbel-max). Stored per env as a sequence of
                K - 1 context positions (the ring of the previous rollout) + T steps:
@@ -59,23 +68,43 @@ Cluster: cluster/ppo_l40s.slurm.
                auto-reset, deterministic (argmax) and sampled (one seeded sample per
                episode and step, --eval-sampled) policies; oracle reference
                (baselines.plan_oracle) computed once per set and cached in the run dir.
-               Sets: "full" (--setups full): --eval-n (initial tilt, scenario) pairs,
-               scenarios 90 % uniform over the good set and 10 % over the impossible set
-               (scenarios.eval_scenarios), splits all / blind / informative / good /
-               impossible / separation bins (good scenarios); "set4": the four setups'
-               set of run 4398136 (with --setups full only with --eval-set4); "measured"
-               with --setups measured. Prefixes: eval_full/, eval_full_samp/ and, for the
-               four-setup set, eval/ (the keys of run 4398136) and eval_samp/
+               Sets (eval_set_names; built by build_eval_sets, shared with
+               eval_policy.py): "full" (--setups full): --eval-n (initial tilt, scenario)
+               pairs, scenarios 90 % uniform over the good set and 10 % over the
+               impossible set (scenarios.eval_scenarios; with a hold-out: over the
+               training scenarios only), splits all / blind / informative / good /
+               impossible / separation bins (good scenarios); "cont" (--scenarios pool):
+               eval_n continuous scenarios of the training ranges, the same filter and
+               90 / 10 mix (scenarios.ContConfig, table cached in --eval-tables, seeded
+               by --eval-seed, one episode per scenario), separation bins 20-50,
+               50-100, ..., 350-400; with the pool the grid sets below stay as fixed
+               benchmarks (measured laser offsets); "holdout" (--holdout-frac
+               > 0): the same over the held-out grid scenarios only; "offgrid"
+               (--eval-offgrid, default on): scenarios between the grid points in all
+               three parameters, one episode per scenario (scenarios.py off-grid
+               tables, cached in --eval-tables, built if missing); "extrap_short" /
+               "extrap_long" (--eval-extrap, default on): separation 20-49 / 201-350 mm,
+               outside the trained range, own separation bins; "set4": the four
+               setups' set of run 4398136 (with --setups full only with --eval-set4);
+               "measured" with --setups measured. Every set uses the same initial tilts.
+               Prefixes: eval_cont/, eval_full/, eval_holdout/, eval_offgrid/,
+               eval_extrap_short/, eval_extrap_long/ (+ _samp for the sampled policy)
+               and, for the four-setup set, eval/ (the keys of run 4398136) and
+               eval_samp/
+    holdout    --holdout-frac F (default 0): a seeded (--holdout-seed) random share F of
+               the grid scenarios, stratified good / impossible, never drawn in
+               training (scenarios.holdout_mask, removed from the sampler's segments)
     logging    train.csv / eval.csv in the run dir; W&B (project herriott-rl) unless
                --no-wandb, display name built at start from the config
     checkpoint latest.pt (every --ckpt-minutes and at exit), best.pt (best deterministic
-               % of the oracle: on the full set with --setups full, else on the set of
-               the run): agent, optimizer, value norm, entropy coefficient, sampler,
-               counters, RNG, env and ring state, config. SIGTERM / SIGUSR1: abort the
-               current rollout, write latest.pt, exit 0
-Host syncs: none inside a rollout step; one per epoch (KL early stop) and a few per
-iteration for logging (sampler statistics); evaluation syncs per step
-(evaluation.evaluate).
+               % of the oracle: on the cont set with the pool, the full set with the
+               atlas, else on the set of the run): agent, optimizer, value norm, entropy
+               coefficient, sampler (with the pool: its slots), counters, RNG, env and
+               ring state, config. SIGTERM / SIGUSR1: abort the current rollout, write
+               latest.pt, exit 0
+Host syncs: none inside a rollout step; one per epoch (KL early stop), the pool refresh
+once per iteration (scans) and a few per iteration for logging (sampler statistics);
+evaluation syncs per step (evaluation.evaluate).
 """
 
 import argparse
@@ -101,6 +130,7 @@ from geometry import SETUPS, CellGeometry
 RL_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(RL_DIR, "runs", "ppo")
 SETUP_CHOICES = ("full", "all", "measured")
+SCENARIO_CHOICES = ("pool", "atlas")  # --setups full: continuous pool or grid atlas
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -111,8 +141,10 @@ class PPOConfig:
     """Trainer settings (CLI arguments with the same names)."""
 
     # ── Env ──
-    setups: str = "full"  # full = scenario atlas, all = geometry.SETUPS, measured = one cell
-    atlas: str = ""  # --setups full: atlas file ("" = scenarios.DEFAULT_ATLAS), built if missing
+    setups: str = "full"  # full = scenario range (--scenarios), all = geometry.SETUPS, measured
+    scenarios: str = "pool"  # --setups full: pool (continuous, D7) or atlas (grid)
+    atlas: str = ""  # Grid atlas ("" = scenarios.DEFAULT_ATLAS), built if missing: training
+    #                  with --scenarios atlas, the fixed benchmark sets (eval_full, off-grid)
     num_envs: int = 1024
     rollout_len: int = 128
     max_steps: int = 64
@@ -123,6 +155,14 @@ class PPOConfig:
     init_radius: float = 2.0
     seed: int = 0
 
+    # ── Continuous scenarios (--scenarios pool) ──
+    sep_range: Tuple[float, float] = (20.0, 400.0)  # mm
+    laser_range: Tuple[float, float] = (-8.0, 8.0)  # deg, laser pitch and yaw (bounds)
+    laser_offset_radius: float = 1.5  # mm, offset disk around the hole centre; 0 = measured
+    laser_mode: str = "landing"  # landing: angles from a uniform M2 landing point; angle
+    pool_size: int = 16384
+    pool_refresh: float = 0.125  # Share of the pool rescanned per iteration
+
     # ── Scenario sampler (--setups full) ──
     plr: bool = True  # Regret-prioritized replay; False: good scenarios uniform
     plr_impossible: float = 0.1  # Share of draws from the impossible set
@@ -131,6 +171,8 @@ class PPOConfig:
     plr_min_seen: int = 2048
     plr_beta: float = 1.0  # Rank temperature (0.3 put ~half of all episodes on one scenario)
     plr_rho: float = 0.1  # Staleness share
+    holdout_frac: float = 0.0  # Share of the grid scenarios never trained on (eval_holdout/)
+    holdout_seed: int = 0
 
     # ── Agent ──
     history_len: int = 16  # Window K of the agent (the env's own stack is off)
@@ -182,6 +224,9 @@ class PPOConfig:
     eval_seed: int = 0
     eval_impossible: float = 0.1  # Impossible share of the full eval set
     eval_set4: bool = True  # --setups full: also the four-setup set
+    eval_offgrid: bool = True  # --setups full: also the off-grid (interpolation) set
+    eval_extrap: bool = True  # --setups full: also the two extrapolation sets
+    eval_tables: str = ""  # Off-grid tables dir ("" = scenarios.EVAL_TABLES_DIR), built if missing
     eval_sampled: bool = True  # Also the sampled policy
     ckpt_minutes: float = 15.0
     wandb: bool = True
@@ -206,10 +251,27 @@ def env_config(c: PPOConfig, num_envs: int, auto_reset: bool, seed: int,
     )
 
 
+def pool_mode(c: PPOConfig) -> bool:
+    return c.setups == "full" and c.scenarios == "pool"
+
+
+def cont_ranges_of(c: PPOConfig):
+    """scenarios.ContRanges of the run (--sep-range, --laser-range, --laser-offset-radius,
+    --laser-mode)."""
+    from scenarios import cont_ranges
+
+    return cont_ranges(c.sep_range, c.laser_range, c.laser_offset_radius, c.laser_mode)
+
+
 def agent_config(c: PPOConfig, n_bins: int) -> AgentConfig:
+    """AgentConfig of the run; with the pool the scenario head covers its ranges (five
+    parameters, three with --laser-offset-radius 0), else the atlas grid (default)."""
+    kw = {}
+    if pool_mode(c):
+        kw["scen_lo"], kw["scen_hi"] = cont_ranges_of(c).head_range()
     return AgentConfig(window=c.history_len, d_model=c.d_model, n_layers=c.n_layers,
                        n_heads=c.n_heads, mlp_ratio=c.mlp_ratio, n_bins=n_bins, amp=c.amp,
-                       enc_chunk=c.enc_chunk, enc_checkpoint=c.enc_checkpoint)
+                       enc_chunk=c.enc_chunk, enc_checkpoint=c.enc_checkpoint, **kw)
 
 
 # ── Schedules ───────────────────────────────────────────────────────────────
@@ -321,7 +383,7 @@ class Rollout:
     """Preallocated per-iteration buffers (B envs, C = K - 1 context + T steps)."""
 
     def __init__(self, B: int, T: int, K: int, dz: int, res: int, n_slots: int,
-                 device: torch.device):
+                 device: torch.device, n_scen: int = 3):
         L = K - 1 + T
         z = lambda *s, **kw: torch.zeros(*s, device=device, **kw)
         self.B, self.T, self.K, self.C, self.S = B, T, K, K - 1, n_slots
@@ -338,7 +400,7 @@ class Rollout:
         self.trunc = z(B, T, dtype=torch.bool)
         self.path = z(B, T)  # Labels of the frame at each step
         self.tilt = z(B, T, 2)
-        self.scen = z(B, T, 3)  # Scenario parameters in scenario-head units
+        self.scen = z(B, T, n_scen)  # Scenario parameters in scenario-head units
         self.slot_t = z(B, n_slots, dtype=torch.long)  # Truncation step per slot, -1 = none
         self.slot_frame = z(B, n_slots, 1, res, res, dtype=torch.uint8)
         self.slot_a = z(B, n_slots, 2)
@@ -354,12 +416,22 @@ class Rollout:
 class EvalPolicy:
     """evaluation.Policy adapter through the agent's act() path; the state is the
     agent's Ring. gen: sampled actions (Gumbel-max from this generator), else argmax.
-    Accumulates head diagnostics over active steps."""
+    Accumulates head diagnostics over active steps and over the first frames (step 0:
+    the same initial tilts in every eval set, independent of the episode lengths); with
+    n_episodes > 0 also per episode (evaluation.evaluate's info["episode"]), for
+    diagnostics of any split."""
 
-    def __init__(self, agent: Agent, gen: Optional[torch.Generator] = None):
+    KEYS = ("n", "path_mae", "tilt_mae_deg", "n_seen", "tilt_mae_deg_ge3", "tilt_std_deg",
+            "sep_mae_mm", "laser_pitch_mae_deg", "laser_yaw_mae_deg", "laser_dx_mae_mm",
+            "laser_dy_mae_mm")
+    SCEN_KEYS = KEYS[6:]  # Per scenario parameter (env.SCEN_NAMES order)
+
+    def __init__(self, agent: Agent, gen: Optional[torch.Generator] = None, n_episodes: int = 0):
         self.agent = agent
         self.gen = gen
         self.sums: Dict[str, torch.Tensor] = {}
+        self.ep_sums: Optional[torch.Tensor] = None  # (n_episodes, 2 x len(KEYS)) float64
+        self.n_episodes = n_episodes
 
     def _acc(self, k: str, v: torch.Tensor):
         self.sums[k] = self.sums.get(k, 0.0) + v.double().sum()
@@ -370,31 +442,50 @@ class EvalPolicy:
         if state is None:
             state = ag.init_ring(obs["image"].shape[0], obs["image"].device)
         out, state = ag.act(obs["image"], obs["action"], info["reset"], state)
-        m = info["active"].float()
         pn = info["path_mm"] / info["path_ref"]
         tilt_err = (out["tilt_mu"] * ag.cfg.tilt_scale - info["tilt"]).abs().mean(-1)
-        scen_err = (ag.scen_denorm(out["scen_mu"]) - info["scenario_params"]).abs()
-        seen = (info["bounces"] >= 3).float() * m
-        self._acc("n", m)
-        self._acc("path_mae", (out["path"] - pn).abs() * m)
-        self._acc("tilt_mae_deg", tilt_err * m)
-        self._acc("n_seen", seen)
-        self._acc("tilt_mae_deg_ge3", tilt_err * seen)
-        self._acc("tilt_std_deg", (0.5 * out["tilt_logvar"]).exp().mean(-1) * ag.cfg.tilt_scale * m)
-        for j, k in enumerate(("sep_mae_mm", "laser_pitch_mae_deg", "laser_yaw_mae_deg")):
-            self._acc(k, scen_err[:, j] * m)
+        n_sc = ag.n_scen  # Parameters the head predicts (3 or 5); the rest count 0
+        scen_err = (ag.scen_denorm(out["scen_mu"]) - info["scenario_params"][:, :n_sc]).abs()
+        scen_err = torch.cat((scen_err, scen_err.new_zeros(scen_err.shape[0], 5 - n_sc)), 1)
+        ge3 = (info["bounces"] >= 3).float()
+        tilt_std = (0.5 * out["tilt_logvar"]).exp().mean(-1) * ag.cfg.tilt_scale
+        path_err = (out["path"] - pn).abs()
+        m = info["active"].float()
+        vals = []
+        for w in (m, m * (info["step"] == 0).float()):  # All active steps, first frames
+            vals += [w, path_err * w, tilt_err * w, ge3 * w, tilt_err * ge3 * w, tilt_std * w]
+            vals += [scen_err[:, j] * w for j in range(5)]
+        for j, v in enumerate(vals):
+            self._acc(self.KEYS[j % len(self.KEYS)] + ("_s0" if j >= len(self.KEYS) else ""), v)
+        if self.n_episodes > 0:
+            if self.ep_sums is None:
+                self.ep_sums = torch.zeros(self.n_episodes, len(vals), dtype=torch.float64,
+                                           device=m.device)
+            self.ep_sums.index_add_(0, info["episode"].clamp(min=0),
+                                    torch.stack(vals, 1).double())
         act = greedy(out["logits"]) if self.gen is None else sample(out["logits"], self.gen)
         return act, state
 
-    def diagnostics(self) -> Dict[str, float]:
-        s = {k: float(v) for k, v in self.sums.items()}
-        n, ns = max(s.get("n", 0.0), 1.0), max(s.get("n_seen", 0.0), 1.0)
-        out = {"head_path_mae": s.get("path_mae", 0) / n,
-               "head_tilt_mae_deg": s.get("tilt_mae_deg", 0) / n,
-               "head_tilt_mae_deg_ge3": s.get("tilt_mae_deg_ge3", 0) / ns,
-               "head_tilt_std_deg": s.get("tilt_std_deg", 0) / n}
-        for k in ("sep_mae_mm", "laser_pitch_mae_deg", "laser_yaw_mae_deg"):
-            out[f"head_{k}"] = s.get(k, 0) / n
+    def diagnostics(self, mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
+        """Head errors over the active steps (head_*) and over the first frames
+        (head_*_step0): all episodes, or the episodes of mask (n,) (needs n_episodes)."""
+        if mask is None:
+            s = {k: float(v) for k, v in self.sums.items()}
+        else:
+            assert self.ep_sums is not None, "per-episode diagnostics need n_episodes"
+            t = self.ep_sums[mask.to(self.ep_sums.device)].sum(0).tolist()
+            keys = list(self.KEYS) + [k + "_s0" for k in self.KEYS]
+            s = dict(zip(keys, t))
+        out = {}
+        for sfx, tag in (("", ""), ("_s0", "_step0")):
+            g = lambda k: s.get(k + sfx, 0.0)
+            n, ns = max(g("n"), 1.0), max(g("n_seen"), 1.0)
+            out.update({f"head_path_mae{tag}": g("path_mae") / n,
+                        f"head_tilt_mae_deg{tag}": g("tilt_mae_deg") / n,
+                        f"head_tilt_mae_deg_ge3{tag}": g("tilt_mae_deg_ge3") / ns,
+                        f"head_tilt_std_deg{tag}": g("tilt_std_deg") / n})
+            for j, k in enumerate(self.SCEN_KEYS):  # NaN for parameters the head lacks
+                out[f"head_{k}{tag}"] = g(k) / n if j < self.agent.n_scen else math.nan
         return out
 
 
@@ -402,7 +493,7 @@ class EvalPolicy:
 class EvalSet:
     """A fixed evaluation set: env, (initial tilt, setup / scenario) pairs, oracle."""
 
-    name: str  # full / set4 / measured
+    name: str  # full / holdout / offgrid / extrap_short / extrap_long / set4 / measured
     env: AlignEnv
     tilts: torch.Tensor
     setups: torch.Tensor
@@ -410,6 +501,8 @@ class EvalSet:
     prefix: str  # Deterministic policy
     prefix_samp: str  # Sampled policy
     splits: Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
+    table: Any = None  # Scenario table of the env (scenarios.Atlas), None for setups
+    bins: Any = None  # Separation bins of the splits (None: scenarios.SEP_BINS / none)
 
 
 def _digest(*ts: torch.Tensor) -> str:
@@ -417,6 +510,257 @@ def _digest(*ts: torch.Tensor) -> str:
     for t in ts:
         h.update(t.detach().cpu().contiguous().numpy().tobytes())
     return h.hexdigest()
+
+
+# ── Evaluation sets (shared by the Trainer and eval_policy.py) ──────────────
+
+
+TABLE_SETS = ("offgrid", "extrap_short", "extrap_long")  # scenarios.TABLE_KINDS
+EVAL_SET_NAMES = ("cont", "full", "holdout") + TABLE_SETS + ("set4", "measured")
+ATLAS_SETS = ("full", "holdout") + TABLE_SETS  # Need the grid atlas
+FLAT_METRICS = ("return", "oracle_return", "pct_oracle", "regret", "path_frac", "success",
+                "stop_rate", "stop_first", "length", "end_cap", "n")
+
+
+def eval_set_names(c: PPOConfig) -> List[str]:
+    """Sets a run evaluates: --setups full: cont (--scenarios pool), full, holdout
+    (holdout_frac > 0), offgrid (eval_offgrid), extrap_short / extrap_long (eval_extrap),
+    set4 (eval_set4); else the run's own set (set4 / measured)."""
+    if c.setups != "full":
+        return ["set4" if c.setups == "all" else c.setups]
+    names = (["cont"] if pool_mode(c) else []) + ["full"]
+    if c.holdout_frac > 0:
+        names.append("holdout")
+    if c.eval_offgrid:
+        names.append("offgrid")
+    if c.eval_extrap:
+        names += ["extrap_short", "extrap_long"]
+    if c.eval_set4:
+        names.append("set4")
+    return names
+
+
+def eval_init_tilts(c: PPOConfig, n: int, limit: float, device: torch.device) -> torch.Tensor:
+    """Seeded initial tilts mapped into the init box (the default box is the full +-limit
+    box, identical to eval_initial_tilts); the same for every set."""
+    u = eval_initial_tilts(n, c.eval_seed, limit)
+    center = torch.tensor(c.init_center, dtype=torch.float32)
+    return (center + (c.init_radius / limit) * u).clamp(-limit, limit).to(device)
+
+
+def cached_oracle(env: AlignEnv, tilts: torch.Tensor, setups: torch.Tensor, path: str,
+                  key: Dict[str, Any], label: str) -> Dict[str, Any]:
+    """Oracle plan of a set (baselines.plan_oracle), cached at path by key: ret,
+    target_path_mm, target_bounces, moves (a cached file without the last two is
+    recomputed and rewritten)."""
+    from baselines import plan_oracle
+
+    dev = env.device
+    if os.path.exists(path):
+        d = torch.load(path, map_location=dev)
+        if d.get("key") == key and "target_bounces" in d:
+            return d
+    t0 = time.time()
+    plan = plan_oracle(env, tilts, chunk=8, setups=setups)
+    oracle = {"key": key, "ret": plan.ret.float(), "target_path_mm": plan.target_path_mm,
+              "target_bounces": plan.target_bounces, "moves": plan.moves,
+              "plan_s": time.time() - t0}
+    tmp = f"{path}.tmp{os.getpid()}"
+    torch.save(oracle, tmp)
+    os.replace(tmp, path)
+    print(f"oracle plan ({label}, {tilts.shape[0]} episodes): {oracle['plan_s']:.1f} s, "
+          f"mean return {float(plan.ret.mean()):.4f}", flush=True)
+    return oracle
+
+
+def scenario_splits(table, bins=None) -> Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
+    """Splits of a scenario-table set: all / blind / informative / good / impossible and
+    separation bins (good scenarios; bins default scenarios.SEP_BINS)."""
+    from scenarios import SEP_BINS, sep_bin_masks
+
+    good_t, params = table.good, table.params
+    bins = bins or SEP_BINS
+
+    def splits(ep):
+        blind = ep["init_bounces"] <= BLIND_MAX_BOUNCES
+        good = good_t[ep["setup"]]
+        m = {"all": torch.ones_like(blind), "blind": blind, "informative": ~blind,
+             "good": good, "impossible": ~good}
+        for nm, sm in sep_bin_masks(params[ep["setup"], 0], bins).items():
+            m[nm] = sm & good
+        return m
+
+    return splits
+
+
+def setup_eval_set(c: PPOConfig, kind: str, cache_dir: str, device: torch.device) -> EvalSet:
+    """The four-setup (kind "all") or measured-cell set, as in run 4398136."""
+    env = AlignEnv(env_config(c, c.eval_envs, False, c.eval_seed + 12345, setups=kind))
+    tilts = eval_init_tilts(c, c.eval_n, env.limit, device)
+    setups = (eval_setups(c.eval_n, env.n_setups, c.eval_seed) if env.n_setups > 1
+              else torch.zeros(c.eval_n, dtype=torch.long)).to(device)
+    key = {"n": c.eval_n, "seed": c.eval_seed, "setups": kind,
+           "center": list(c.init_center), "radius": c.init_radius,
+           "step_cost": c.step_cost, "path_ref": c.path_ref}
+    oracle = cached_oracle(env, tilts, setups, os.path.join(cache_dir, "oracle_eval.pt"), key, kind)
+    names = [g.name for g in env.setups]
+
+    def splits(ep):
+        blind = ep["init_bounces"] <= BLIND_MAX_BOUNCES
+        m = {"all": torch.ones_like(blind), "blind": blind, "informative": ~blind}
+        for i, nm in enumerate(names if len(names) > 1 else []):
+            m[nm] = ep["setup"] == i
+        return m
+
+    name = "set4" if kind == "all" else kind
+    return EvalSet(name, env, tilts, setups, oracle, "eval", "eval_samp", splits)
+
+
+def _table_set(c: PPOConfig, name: str, table, scen: torch.Tensor, key: Dict[str, Any],
+               file: str, prefix: str, bins, cache_dir: str, device: torch.device) -> EvalSet:
+    env = AlignEnv(env_config(c, c.eval_envs, False, c.eval_seed + 12345),
+                   scenarios=table.table())
+    tilts = eval_init_tilts(c, c.eval_n, env.limit, device)
+    scen = scen.to(device)
+    key = {**key, "center": list(c.init_center), "radius": c.init_radius,
+           "step_cost": c.step_cost}
+    oracle = cached_oracle(env, tilts, scen, os.path.join(cache_dir, file), key, name)
+    return EvalSet(name, env, tilts, scen, oracle, prefix, f"{prefix}_samp",
+                   scenario_splits(table, bins), table, bins)
+
+
+def full_eval_set(c: PPOConfig, atlas, cache_dir: str, device: torch.device) -> EvalSet:
+    """The full-range set: (initial tilt, scenario) pairs over the atlas (with a hold-out:
+    over the training scenarios only)."""
+    from scenarios import eval_scenarios, holdout_mask
+
+    key = {"n": c.eval_n, "seed": c.eval_seed, "impossible": c.eval_impossible,
+           "atlas": _digest(atlas.params, atlas.path_ref)}
+    g, im = atlas.good_ids, atlas.impossible_ids
+    if c.holdout_frac > 0:
+        ho = holdout_mask(atlas, c.holdout_frac, c.holdout_seed)
+        g, im = g[~ho[g]], im[~ho[im]]
+        key["holdout"] = [c.holdout_frac, c.holdout_seed]
+    scen = eval_scenarios(atlas, c.eval_n, c.eval_seed, c.eval_impossible, g, im)
+    return _table_set(c, "full", atlas, scen, key, "oracle_full.pt", "eval_full", None,
+                      cache_dir, device)
+
+
+def holdout_eval_set(c: PPOConfig, atlas, cache_dir: str, device: torch.device) -> EvalSet:
+    """The grid hold-out set: (initial tilt, scenario) pairs over the held-out scenarios
+    only (scenarios.holdout_mask; 90 / 10 good / impossible as the full set)."""
+    from scenarios import eval_scenarios, holdout_mask
+
+    assert c.holdout_frac > 0, "the hold-out set needs --holdout-frac > 0"
+    ho = holdout_mask(atlas, c.holdout_frac, c.holdout_seed)
+    g, im = atlas.good_ids, atlas.impossible_ids
+    g, im = g[ho[g]], im[ho[im]]
+    scen = eval_scenarios(atlas, c.eval_n, c.eval_seed, c.eval_impossible, g, im)
+    key = {"n": c.eval_n, "seed": c.eval_seed, "impossible": c.eval_impossible,
+           "atlas": _digest(atlas.params, atlas.path_ref),
+           "holdout": [c.holdout_frac, c.holdout_seed]}
+    return _table_set(c, "holdout", atlas, scen, key, "oracle_holdout.pt", "eval_holdout",
+                      None, cache_dir, device)
+
+
+def load_eval_table(c: PPOConfig, kind: str, atlas, device: torch.device, log=print):
+    """Off-grid table of a kind (scenarios.TABLE_KINDS) for the run's grid: loaded from
+    <eval_tables>/<kind>_v1.pt, built there if missing."""
+    from scenarios import OffgridConfig, atlas_config, load_or_build_offgrid, table_path
+
+    return load_or_build_offgrid(table_path(kind, c.eval_tables), atlas_config(atlas),
+                                 OffgridConfig(kind=kind), device, log)
+
+
+def table_eval_set(c: PPOConfig, kind: str, table, cache_dir: str,
+                   device: torch.device) -> EvalSet:
+    """An off-grid set (offgrid / extrap_short / extrap_long): eval_n episodes over the
+    table, eval_impossible of them impossible, one per scenario
+    (scenarios.offgrid_eval_scenarios); separation bins of the kind."""
+    from scenarios import TABLE_SEP_BINS, offgrid_eval_scenarios
+
+    scen = offgrid_eval_scenarios(table, c.eval_n, c.eval_seed, c.eval_impossible)
+    key = {"n": c.eval_n, "seed": c.eval_seed, "impossible": c.eval_impossible,
+           kind: _digest(table.params, table.path_ref)}
+    return _table_set(c, kind, table, scen, key, f"oracle_{kind}.pt", f"eval_{kind}",
+                      TABLE_SEP_BINS[kind], cache_dir, device)
+
+
+def cont_eval_set(c: PPOConfig, cache_dir: str, device: torch.device, log=print) -> EvalSet:
+    """The continuous set (eval_cont/): eval_n episodes, one per scenario, over the
+    seeded continuous table of the run's ranges (scenarios.ContConfig: the same 5D
+    distribution and beam filter as the pool, eval_impossible of them impossible; cached
+    in eval_tables, built if missing); separation bins cont_sep_bins of the range."""
+    from scenarios import (ContConfig, cont_sep_bins, cont_table_path, load_or_build_cont,
+                           offgrid_eval_scenarios)
+
+    ccfg = ContConfig(ranges=cont_ranges_of(c), n=c.eval_n, impossible_share=c.eval_impossible,
+                      seed=c.eval_seed)
+    table = load_or_build_cont(cont_table_path(ccfg, c.eval_tables), ccfg, device=device, log=log)
+    scen = offgrid_eval_scenarios(table, c.eval_n, c.eval_seed, c.eval_impossible)
+    key = {"n": c.eval_n, "seed": c.eval_seed, "impossible": c.eval_impossible,
+           "cont": _digest(table.params, table.path_ref)}
+    return _table_set(c, "cont", table, scen, key, "oracle_cont.pt", "eval_cont",
+                      cont_sep_bins(*ccfg.ranges.sep), cache_dir, device)
+
+
+def build_eval_sets(c: PPOConfig, names: List[str], atlas, cache_dir: str,
+                    device: torch.device, log=print) -> List[EvalSet]:
+    """Eval sets by name (EVAL_SET_NAMES); oracles cached in cache_dir."""
+    sets = []
+    for name in names:
+        assert name in EVAL_SET_NAMES, f"eval set {name!r} not in {EVAL_SET_NAMES}"
+        if name in ("set4", "measured"):
+            sets.append(setup_eval_set(c, "all" if name == "set4" else name, cache_dir, device))
+            continue
+        if name == "cont":
+            sets.append(cont_eval_set(c, cache_dir, device, log))
+            continue
+        assert atlas is not None, f"eval set {name} needs the atlas"
+        if name == "full":
+            sets.append(full_eval_set(c, atlas, cache_dir, device))
+        elif name == "holdout":
+            sets.append(holdout_eval_set(c, atlas, cache_dir, device))
+        else:
+            table = load_eval_table(c, name, atlas, device, log)
+            sets.append(table_eval_set(c, name, table, cache_dir, device))
+    return sets
+
+
+@torch.no_grad()
+def run_eval(agent: Agent, es: EvalSet, eval_seed: int, sampled: bool,
+             per_episode: bool = False) -> Tuple[Dict[str, float], Dict[str, torch.Tensor],
+                                                 EvalPolicy]:
+    """One evaluation of a set: flat metrics <prefix>/<split>/<metric> (FLAT_METRICS) and
+    <prefix>/head_*, the per-episode tensors (evaluation.evaluate) and the policy adapter
+    (per_episode: with per-episode head diagnostics)."""
+    gen = None
+    if sampled:
+        gen = torch.Generator(device=es.env.device)
+        gen.manual_seed(eval_seed * 1_000_003 + 4099)  # Same noise at every eval
+    pol = EvalPolicy(agent, gen, es.tilts.shape[0] if per_episode else 0)
+    ep, met = evaluate(es.env, pol, es.tilts, es.oracle["target_path_mm"], es.oracle["ret"],
+                       init_setups=es.setups)
+    pre = es.prefix_samp if sampled else es.prefix
+    ref = es.oracle["ret"].double().to(ep["ep_return"].device)
+    cap = es.env.cfg.max_bounces
+    flat: Dict[str, float] = {}
+    for split, m in es.splits(ep).items():
+        if not bool(m.any()):  # Keys always present (fixed CSV header)
+            flat.update({f"{pre}/{split}/{k}": float("nan") for k in FLAT_METRICS})
+            continue
+        s = split_metrics(ep, m, cap)
+        o = float(ref[m].mean())
+        r = s["return_mean"]
+        pct = 100.0 * r / o if r is not None and abs(o) > 1e-3 else None
+        vals = (r, o, pct, s.get("regret_mean"), s.get("path_frac_pref_mean"),
+                s.get("success"), s["terminated"], s["stop_first"], s["length_mean"],
+                s["end_cap"], s["n"])
+        for name, val in zip(FLAT_METRICS, vals):
+            flat[f"{pre}/{split}/{name}"] = float("nan") if val is None else float(val)
+    flat.update({f"{pre}/{k}": v for k, v in pol.diagnostics().items()})
+    flat[f"{pre}/wall_s"] = met["wall_s"]
+    return flat, ep, pol
 
 
 # ── Trainer ─────────────────────────────────────────────────────────────────
@@ -433,24 +777,42 @@ class Trainer:
         if c.total_env_steps <= 0:
             c.total_env_steps = default_total_steps(c)
         assert c.setups in SETUP_CHOICES, f"setups {c.setups!r} not in {SETUP_CHOICES}"
+        assert c.scenarios in SCENARIO_CHOICES, f"scenarios {c.scenarios!r} not in {SCENARIO_CHOICES}"
         self.device = dev = torch.device(device or "cuda")
         torch.manual_seed(c.seed)
 
-        # ── Atlas and sampler (--setups full) ──
-        self.atlas = self.sampler = None
+        # ── Scenarios and sampler (--setups full): pool or atlas ──
+        self.atlas = self.sampler = self.pool = None
         scen_kw: Dict[str, Any] = {}
+        log = lambda s: print(s, flush=True)  # noqa: E731
+        ec = EnvConfig()
         if c.setups == "full":
-            from scenarios import DEFAULT_ATLAS, SamplerConfig, ScenarioSampler, load_or_build
+            from scenarios import SamplerConfig, ScenarioSampler
 
-            c.atlas = os.path.abspath(c.atlas or DEFAULT_ATLAS)
-            t0 = time.time()
-            self.atlas = load_or_build(c.atlas, dev, log=lambda s: print(s, flush=True))
-            ec = EnvConfig()
-            self.atlas.check(ec.max_bounces, ec.geometry.m2_tilt_limit, ec.step_unit)
-            print(f"{self.atlas.summary()}\natlas ready in {time.time() - t0:.1f} s", flush=True)
-            self.sampler = ScenarioSampler(self.atlas, SamplerConfig(
+            scfg = SamplerConfig(
                 impossible_share=c.plr_impossible, alpha=c.plr_alpha, p_fresh=c.plr_p_fresh,
-                min_seen=c.plr_min_seen, beta=c.plr_beta, rho=c.plr_rho, replay=c.plr))
+                min_seen=c.plr_min_seen, beta=c.plr_beta, rho=c.plr_rho, replay=c.plr,
+                holdout_frac=c.holdout_frac, holdout_seed=c.holdout_seed)
+            # The grid atlas: training scenarios (atlas mode) or the fixed benchmark sets
+            if not pool_mode(c) or (build_eval and any(n in ATLAS_SETS for n in eval_set_names(c))):
+                self._load_atlas()
+        if pool_mode(c):
+            from scenarios import PoolConfig, ScenarioPool
+
+            assert c.holdout_frac == 0, "--holdout-frac needs --scenarios atlas"
+            self.pool = self.sampler = ScenarioPool(
+                PoolConfig(size=c.pool_size, ranges=cont_ranges_of(c), refresh_frac=c.pool_refresh,
+                           seed=c.seed), scfg, device=dev, log=log)
+            self.pool.atlas.check(ec.max_bounces, ec.geometry.m2_tilt_limit, ec.step_unit)
+            scen_kw = {"pool": self.pool}
+        elif c.setups == "full":
+            self.sampler = ScenarioSampler(self.atlas, scfg)
+            if c.holdout_frac > 0:
+                ho = self.sampler.holdout
+                print(f"hold-out: {int(ho.sum())} grid scenarios never drawn in training "
+                      f"({int((ho & self.atlas.good).sum())} good, "
+                      f"{int((ho & ~self.atlas.good).sum())} impossible; frac "
+                      f"{c.holdout_frac}, seed {c.holdout_seed})", flush=True)
             scen_kw = {"scenarios": self.atlas.table(), "sampler": self.sampler}
 
         # ── Env and agent ──
@@ -469,10 +831,16 @@ class Trainer:
             if info.get("encoder_info") is not None:
                 self.encoder_info = info["encoder_info"]
             self.init_info = {k: v for k, v in info.items() if k != "vnorm"}
-            other = sorted(k for k in info["skipped"] if not k.startswith("setup."))
+            # Expected: the old setup head; the scenario head when its range or width changed
+            scen_ok = lambda k: k.startswith("scenario.") and (  # noqa: E731
+                info.get("scen_reinit") or info["skipped"][k].startswith("shape"))
+            other = sorted(k for k in info["skipped"] if not k.startswith("setup.") and not scen_ok(k))
             print(f"init from {info['path']} ({info['name']}, iteration {info['iteration']}): "
                   f"{len(info['loaded'])} tensors loaded; skipped {sorted(info['skipped'])}; "
                   f"fresh {info['missing']}; value norm from the checkpoint", flush=True)
+            if any(scen_ok(k) for k in info["skipped"]):
+                why = info.get("scen_reinit") or "head width changed"
+                print(f"init from: scenario head re-initialized ({why})", flush=True)
             if other:
                 print(f"WARNING: init-from skipped tensors beyond the setup head: {other}",
                       flush=True)
@@ -497,11 +865,12 @@ class Trainer:
         self.next_first = torch.ones(B, dtype=torch.bool, device=dev)
         self.n_slots = math.ceil(c.rollout_len / c.max_steps)
         self.buf = Rollout(B, c.rollout_len, K, self.agent.cfg.encoder.z_dim, c.img_res,
-                           self.n_slots, dev)
+                           self.n_slots, dev, self.agent.n_scen)
         self.iteration = 0
         self.env_steps = 0
         self.best_eval = -math.inf
-        self.best_metric = "eval_full/all/pct_oracle" if c.setups == "full" else "eval/all/pct_oracle"
+        self.best_metric = ("eval_cont/all/pct_oracle" if pool_mode(c) else "eval_full/all/pct_oracle"
+                            if c.setups == "full" else "eval/all/pct_oracle")
         self.wandb_id: Optional[str] = None
         self.name = run_name(c, self.encoder_info)
         self.run_dir = run_dir or os.path.join(RUNS_DIR, self.name)
@@ -511,6 +880,18 @@ class Trainer:
         self._build_eval = build_eval
 
     # ── Helpers ──
+
+    def _load_atlas(self):
+        """The grid atlas (--atlas, built there if missing), checked against the env."""
+        from scenarios import DEFAULT_ATLAS, load_or_build
+
+        c = self.cfg
+        c.atlas = os.path.abspath(c.atlas or DEFAULT_ATLAS)
+        t0 = time.time()
+        self.atlas = load_or_build(c.atlas, self.device, log=lambda s: print(s, flush=True))
+        ec = EnvConfig()
+        self.atlas.check(ec.max_bounces, ec.geometry.m2_tilt_limit, ec.step_unit)
+        print(f"{self.atlas.summary()}\natlas ready in {time.time() - t0:.1f} s", flush=True)
 
     def encoder_trains(self, iteration: Optional[int] = None) -> bool:
         c = self.cfg
@@ -580,7 +961,7 @@ class Trainer:
             done = term | trunc
             if self.sampler is not None:
                 self.sampler.observe(info["setup"], info["ep_final_path_mm"], done,
-                                     info["scenario_src"])
+                                     info["scenario_src"], info["scenario_gen"])
             d = done.double()
             st["n"] += d.sum()
             st["ret"] += (info["ep_return"].double() * d).sum()
@@ -703,125 +1084,32 @@ class Trainer:
     # ── Evaluation ──
 
     def _init_tilts(self, n: int, limit: float) -> torch.Tensor:
-        """Seeded initial tilts mapped into the init box (the default box is the full
-        +-limit box, identical to eval_initial_tilts)."""
-        c = self.cfg
-        u = eval_initial_tilts(n, c.eval_seed, limit)
-        center = torch.tensor(c.init_center, dtype=torch.float32)
-        return (center + (c.init_radius / limit) * u).clamp(-limit, limit).to(self.device)
+        return eval_init_tilts(self.cfg, n, limit, self.device)
 
     def _oracle(self, env: AlignEnv, tilts: torch.Tensor, setups: torch.Tensor, file: str,
                 key: Dict[str, Any], label: str) -> Dict[str, Any]:
-        """Oracle plan of the set (baselines.plan_oracle), cached in the run dir by key."""
-        from baselines import plan_oracle
-
-        path = os.path.join(self.run_dir, file)
-        if os.path.exists(path):
-            d = torch.load(path, map_location=self.device)
-            if d.get("key") == key:
-                return d
-        t0 = time.time()
-        plan = plan_oracle(env, tilts, chunk=8, setups=setups)
-        oracle = {"key": key, "ret": plan.ret.float(), "target_path_mm": plan.target_path_mm,
-                  "plan_s": time.time() - t0}
-        torch.save(oracle, path)
-        print(f"oracle plan ({label}, {tilts.shape[0]} episodes): {oracle['plan_s']:.1f} s, "
-              f"mean return {float(plan.ret.mean()):.4f}", flush=True)
-        return oracle
+        """Oracle plan of the set (cached_oracle), cached in the run dir by key."""
+        return cached_oracle(env, tilts, setups, os.path.join(self.run_dir, file), key, label)
 
     def _setup_set(self, kind: str) -> EvalSet:
-        """The four-setup (kind "all") or measured-cell set, as in run 4398136."""
-        c = self.cfg
-        env = AlignEnv(env_config(c, c.eval_envs, False, c.eval_seed + 12345, setups=kind))
-        tilts = self._init_tilts(c.eval_n, env.limit)
-        setups = (eval_setups(c.eval_n, env.n_setups, c.eval_seed) if env.n_setups > 1
-                  else torch.zeros(c.eval_n, dtype=torch.long)).to(self.device)
-        key = {"n": c.eval_n, "seed": c.eval_seed, "setups": kind,
-               "center": list(c.init_center), "radius": c.init_radius,
-               "step_cost": c.step_cost, "path_ref": c.path_ref}
-        oracle = self._oracle(env, tilts, setups, "oracle_eval.pt", key, kind)
-        names = [g.name for g in env.setups]
-
-        def splits(ep):
-            blind = ep["init_bounces"] <= BLIND_MAX_BOUNCES
-            m = {"all": torch.ones_like(blind), "blind": blind, "informative": ~blind}
-            for i, nm in enumerate(names if len(names) > 1 else []):
-                m[nm] = ep["setup"] == i
-            return m
-
-        name = "set4" if kind == "all" else kind
-        return EvalSet(name, env, tilts, setups, oracle, "eval", "eval_samp", splits)
+        return setup_eval_set(self.cfg, kind, self.run_dir, self.device)
 
     def _full_set(self) -> EvalSet:
-        """The full-range set: (initial tilt, scenario) pairs over the atlas."""
-        from scenarios import eval_scenarios, sep_bin_masks
-
-        c, at = self.cfg, self.atlas
-        env = AlignEnv(env_config(c, c.eval_envs, False, c.eval_seed + 12345),
-                       scenarios=at.table())
-        tilts = self._init_tilts(c.eval_n, env.limit)
-        scen = eval_scenarios(at, c.eval_n, c.eval_seed, c.eval_impossible).to(self.device)
-        key = {"n": c.eval_n, "seed": c.eval_seed, "impossible": c.eval_impossible,
-               "atlas": _digest(at.params, at.path_ref), "center": list(c.init_center),
-               "radius": c.init_radius, "step_cost": c.step_cost}
-        oracle = self._oracle(env, tilts, scen, "oracle_full.pt", key, "full")
-        good_t, params = at.good, at.params
-
-        def splits(ep):
-            blind = ep["init_bounces"] <= BLIND_MAX_BOUNCES
-            good = good_t[ep["setup"]]
-            m = {"all": torch.ones_like(blind), "blind": blind, "informative": ~blind,
-                 "good": good, "impossible": ~good}
-            for nm, sm in sep_bin_masks(params[ep["setup"], 0]).items():
-                m[nm] = sm & good
-            return m
-
-        return EvalSet("full", env, tilts, scen, oracle, "eval_full", "eval_full_samp", splits)
+        return full_eval_set(self.cfg, self.atlas, self.run_dir, self.device)
 
     def setup_eval(self):
-        """Eval envs, sets and oracle references (cached in the run dir)."""
-        c = self.cfg
-        sets = []
-        if c.setups == "full":
-            sets.append(self._full_set())
-            if c.eval_set4:
-                sets.append(self._setup_set("all"))
-        else:
-            sets.append(self._setup_set(c.setups))
-        self.eval_sets = sets
+        """Eval envs, sets and oracle references (cached in the run dir), eval_set_names."""
+        names = eval_set_names(self.cfg)
+        if self.atlas is None and any(n in ATLAS_SETS for n in names):
+            self._load_atlas()
+        self.eval_sets = build_eval_sets(self.cfg, names, self.atlas,
+                                         self.run_dir, self.device,
+                                         log=lambda s: print(s, flush=True))
 
     @torch.no_grad()
     def _run_eval(self, es: EvalSet, sampled: bool) -> Dict[str, float]:
         """One evaluation of a set; flat metrics <prefix>/<split>/<metric>."""
-        c = self.cfg
-        gen = None
-        if sampled:
-            gen = torch.Generator(device=self.device)
-            gen.manual_seed(c.eval_seed * 1_000_003 + 4099)  # Same noise at every eval
-        pol = EvalPolicy(self.agent, gen)
-        ep, met = evaluate(es.env, pol, es.tilts, es.oracle["target_path_mm"], es.oracle["ret"],
-                           init_setups=es.setups)
-        pre = es.prefix_samp if sampled else es.prefix
-        ref = es.oracle["ret"].double()
-        cap = es.env.cfg.max_bounces
-        flat: Dict[str, float] = {}
-        names = ("return", "oracle_return", "pct_oracle", "regret", "path_frac", "success",
-                 "stop_rate", "stop_first", "length", "n")
-        for split, m in es.splits(ep).items():
-            if not bool(m.any()):  # Keys always present (fixed CSV header)
-                flat.update({f"{pre}/{split}/{k}": float("nan") for k in names})
-                continue
-            s = split_metrics(ep, m, cap)
-            o = float(ref[m].mean())
-            r = s["return_mean"]
-            pct = 100.0 * r / o if r is not None and abs(o) > 1e-3 else None
-            vals = (r, o, pct, s.get("regret_mean"), s.get("path_frac_pref_mean"),
-                    s.get("success"), s["terminated"], s["stop_first"], s["length_mean"], s["n"])
-            for name, val in zip(names, vals):
-                flat[f"{pre}/{split}/{name}"] = float("nan") if val is None else float(val)
-        flat.update({f"{pre}/{k}": v for k, v in pol.diagnostics().items()})
-        flat[f"{pre}/wall_s"] = met["wall_s"]
-        return flat
+        return run_eval(self.agent, es, self.cfg.eval_seed, sampled)[0]
 
     def evaluate(self) -> Dict[str, float]:
         """All eval sets, deterministic and (eval_sampled) sampled; flat metrics dict."""
@@ -1054,6 +1342,16 @@ class Logger:
                   f"top ({row.get('plr/top_sep', math.nan):g} mm, {row.get('plr/top_laser_pitch', math.nan):g}, "
                   f"{row.get('plr/top_laser_yaw', math.nan):g}) share {row.get('plr/top_draw_share', math.nan):.4f}",
                   flush=True)
+        if "pool/candidates" in row:
+            hist = " ".join(f"{k[len('pool/hist_sep'):]} {100 * v:.0f}" for k, v in row.items()
+                            if k.startswith("pool/hist_"))
+            print(f"      pool: refresh {row['pool/refresh_s']:.1f} s, {int(row['pool/replaced'])} slots, "
+                  f"{int(row['pool/candidates'])} candidates ({int(row['pool/prefix'])} used): angle "
+                  f"{100 * row['pool/angle_rejected_share']:.1f} %, clipped "
+                  f"{100 * row['pool/clipped_share']:.1f} %, missed {100 * row['pool/missed_share']:.1f} %, "
+                  f"valid {100 * row['pool/valid_share']:.1f} %, {int(row['pool/scans'])} box scans, good "
+                  f"{100 * row['pool/good_share']:.1f} % of valid | good slots % by sep: {hist}",
+                  flush=True)
 
     def eval(self, row: Dict[str, Any]):
         self._write("eval", row)
@@ -1074,18 +1372,37 @@ def init_run_id(path: str) -> str:
     return os.path.basename(os.path.dirname(os.path.abspath(path))) or "x"
 
 
-def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
-    """Display / directory name from the config, built at start:
-    ppo_cnn[-pre<S>]_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_<tag>]_<jobid>;
-    <scen>: full-plr / full-unif (atlas, prioritized / uniform good draws) or set<S>;
-    -pre<S>: the encoder was initialized from a checkpoint pretrained on S setups;
-    _ft<run>: initialized from that PPO run (--init-from)."""
+def encoder_origin(encoder_info: Optional[dict]) -> str:
+    """Encoder part of the run name: cnn, cnn-pre<S> (pretrained on S setups),
+    cnn-pregrid<N> (N grid scenarios), cnn-precont / cnn-ftcont (continuous scenarios,
+    from scratch / fine-tuned from another pretrain_encoder.py checkpoint)."""
     enc = "cnn"
     if encoder_info is not None:
-        m = re.search(r"_grid(\d+)", encoder_info.get("name") or "")
-        enc += f"-pregrid{m.group(1)}" if m else f"-pre{encoder_info.get('n_setups', 1)}"
-    if c.setups == "full":
+        nm = encoder_info.get("name") or ""
+        m = re.search(r"_grid(\d+)", nm)
+        if "_cont" in nm:
+            enc += "-ftcont" if "_ft-" in nm else "-precont"
+        elif m:
+            enc += f"-pregrid{m.group(1)}"
+        else:
+            enc += f"-pre{encoder_info.get('n_setups', 1)}"
+    return enc
+
+
+def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
+    """Display / directory name from the config, built at start:
+    ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_<tag>]_<jobid>;
+    <enc>: encoder_origin; <scen>: <ranges>-plr / -unif with the pool (ContRanges.tag,
+    e.g. cont20-400-plr), full-plr / full-unif with the atlas (prioritized / uniform
+    good draws), or set<S>, with -ho<pct>[s<seed>] when grid scenarios are held out
+    (--holdout-frac); _ft<run>: initialized from that PPO run (--init-from)."""
+    enc = encoder_origin(encoder_info)
+    if pool_mode(c):
+        scen = cont_ranges_of(c).tag() + ("-plr" if c.plr else "-unif")
+    elif c.setups == "full":
         scen = "full-plr" if c.plr else "full-unif"
+        if c.holdout_frac > 0:
+            scen += f"-ho{100 * c.holdout_frac:g}" + (f"s{c.holdout_seed}" if c.holdout_seed else "")
     else:
         scen = f"set{len(SETUPS) if c.setups == 'all' else 1}"
     name = f"ppo_{enc}_k{c.history_len}_{scen}_b{c.num_envs}_s{c.seed}"
@@ -1105,8 +1422,21 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
 
 RESUME_OVERRIDES = ("total_env_steps", "eval_every", "ckpt_minutes", "wandb", "wandb_project",
                     "unfreeze_at", "encoder_lr_scale", "compile", "target_kl", "eval_sampled",
-                    "enc_checkpoint")
-PATH_FIELDS = ("encoder_init", "init_from", "atlas")
+                    "enc_checkpoint", "eval_offgrid", "eval_extrap", "eval_tables")
+PATH_FIELDS = ("encoder_init", "init_from", "atlas", "eval_tables")
+TUPLE_FIELDS = tuple(f.name for f in fields(PPOConfig) if isinstance(getattr(PPOConfig(), f.name), tuple))
+LEGACY_DEFAULTS = {"scenarios": "atlas"}  # Checkpoints from before the field: the grid atlas
+
+
+def config_from_dict(d: Dict[str, Any]) -> PPOConfig:
+    """PPOConfig of a saved config dict (checkpoint cfg): unknown keys dropped, lists to
+    tuples, fields missing in older checkpoints from LEGACY_DEFAULTS (else the default)."""
+    known = {f.name for f in fields(PPOConfig)}
+    d = {**LEGACY_DEFAULTS, **{k: v for k, v in d.items() if k in known}}
+    for k in TUPLE_FIELDS:
+        if k in d:
+            d[k] = tuple(d[k])
+    return PPOConfig(**d)
 
 
 def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
@@ -1124,10 +1454,15 @@ def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
         v = getattr(d, f.name)
         if isinstance(v, bool):
             ap.add_argument(flag, dest=f.name, action=argparse.BooleanOptionalAction, default=dflt(v))
-        elif f.name == "init_center":
-            ap.add_argument(flag, type=float, nargs=2, default=dflt(list(v)))
+        elif isinstance(v, tuple):
+            ap.add_argument(flag, type=float, nargs=len(v), default=dflt(list(v)),
+                            metavar=("MIN", "MAX") if f.name.endswith("_range") else None)
         elif f.name == "setups":
             ap.add_argument(flag, choices=SETUP_CHOICES, default=dflt(v))
+        elif f.name == "scenarios":
+            ap.add_argument(flag, choices=SCENARIO_CHOICES, default=dflt(v))
+        elif f.name == "laser_mode":
+            ap.add_argument(flag, choices=("landing", "angle"), default=dflt(v))
         else:
             ap.add_argument(flag, type=type(v), default=dflt(v))
     return ap
@@ -1142,18 +1477,16 @@ def main(argv: Optional[List[str]] = None):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     cli = {f.name: getattr(args, f.name) for f in fields(PPOConfig)}
-    cli["init_center"] = tuple(cli["init_center"])
+    for k in TUPLE_FIELDS:
+        cli[k] = tuple(cli[k])
     if args.resume:
         assert args.run_dir, "--resume needs --run-dir"
         path = os.path.join(args.run_dir, "latest.pt")
-        saved = torch.load(path, map_location="cpu", weights_only=False)["cfg"]
-        known = {f.name for f in fields(PPOConfig)}
-        saved = {k: v for k, v in saved.items() if k in known}
-        saved["init_center"] = tuple(saved["init_center"])
+        saved = asdict(config_from_dict(torch.load(path, map_location="cpu", weights_only=False)["cfg"]))
         given = vars(build_parser(suppress=True).parse_args(argv))
         for k in RESUME_OVERRIDES:  # Run control from the flags given; the rest as saved
             if k in given:
-                saved[k] = cli[k]
+                saved[k] = os.path.abspath(cli[k]) if k in PATH_FIELDS and cli[k] else cli[k]
         ignored = sorted(k for k in given if k not in RESUME_OVERRIDES + ("run_dir", "resume"))
         if ignored:
             print(f"resume: ignoring {ignored} (taken from the checkpoint)", flush=True)

@@ -225,8 +225,9 @@ def test_labels():
     B, T, C = b.B, b.T, b.C
     tilt = b.tilt.flatten(0, 1)
     params = tr.agent.scen_denorm(b.scen.flatten(0, 1))
-    setup = (params[:, None] - env.setup_params[None]).abs().amax(-1).argmin(1)
-    assert float((env.setup_params[setup] - params).abs().max()) < 1e-4
+    sp = env.setup_params[:, :3]  # The agent's three scenario parameters
+    setup = (params[:, None] - sp[None]).abs().amax(-1).argmin(1)
+    assert float((sp[setup] - params).abs().max()) < 1e-4
     out = env.sim.simulate(env.scenario_states(tilt, params), store_world=False)
     img = env._render(out)
     frames = b.frames[:, C:].flatten(0, 1)

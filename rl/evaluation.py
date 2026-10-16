@@ -19,7 +19,7 @@ Shared by the baselines (baselines.py) and the PPO trainer.
                  episode (B,) int64     index into init_tilts (-1: inactive or padding)
                  privileged (diagnostics, oracle and setup-aware homing only):
                  tilt (B, 2), path_mm (B,), bounces (B,) of the current obs frame,
-                 setup (B,), scenario_params (B, 3) and path_ref (B,) of the episode
+                 setup (B,), scenario_params (B, 5) and path_ref (B,) of the episode
 
 Metrics (summarize): the aggregate over all episodes and split by the start region:
 blind start = 1-2 bounces at the initial tilt (one M2 spot at a fixed place), informative
@@ -78,6 +78,7 @@ def _policy_info(
     env: AlignEnv, active: torch.Tensor, episode: torch.Tensor
 ) -> Dict[str, torch.Tensor]:
     """Info dict for the policy, describing the current obs frame."""
+    si = env.state_info()  # Scenario parameters and P_ref of the episodes (also pool mode)
     return {
         "reset": env.step_count == 0,
         "step": env.step_count,
@@ -87,8 +88,8 @@ def _policy_info(
         "path_mm": env.path,
         "bounces": env.bounces,
         "setup": env.setup,
-        "scenario_params": env.setup_params[env.setup],
-        "path_ref": env.ref_of(env.setup),
+        "scenario_params": si["scenario_params"],
+        "path_ref": si["path_ref"],
     }
 
 

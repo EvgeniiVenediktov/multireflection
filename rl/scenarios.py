@@ -1,12 +1,22 @@
 """
-scenarios.py - Scenario atlas and the regret-prioritized scenario sampler (PLAN stage 2)
+scenarios.py - Scenario atlas, continuous scenario pool and the regret-prioritized
+scenario sampler (PLAN stage 2, D7)
 
 Run from rl/:
     uv run python scenarios.py build [--atlas PATH] [--sep 50 200 2] [--pitch 0 8 0.25]
                                      [--yaw 0 8 0.25] [--no-named]
     uv run python scenarios.py summary [--atlas PATH]
+    uv run python scenarios.py offgrid [--atlas PATH] [--tables-dir DIR] [--kinds K,..]
+                                       [--n 4096] [--impossible 0.1] [--seed 0] [--force]
+    uv run python scenarios.py cont [--tables-dir DIR] [--sep-range 20 400]
+                                    [--laser-range -8 8] [--laser-offset-radius 1.5]
+                                    [--laser-mode landing] [--n 4096] [--impossible 0.1]
+                                    [--seed 0] [--force]
 Default atlas path runs/atlas/atlas_v1.pt (gitignored); ppo.py --setups full builds it
-there (or at --atlas) when the file is missing and loads it otherwise.
+there (or at --atlas) when the file is missing and loads it otherwise. The off-grid eval
+tables go to runs/eval_sets/<kind>_v1.pt (offgrid, extrap_short, extrap_long), the
+continuous eval table to runs/eval_sets/<ranges tag>_n<n>_seed<seed>_v1.pt, likewise
+built by ppo.py / eval_policy.py if missing.
 
 Scenario = (separation, laser pitch, laser yaw); laser offset, mirror offsets, mirrors and
 M1 as in the measured cell (geometry.CellGeometry). Grid: separation 50-200 mm step 2 x
@@ -32,8 +42,67 @@ Triton kernel without per-hit outputs, in chunks of scenarios:
 Cost: 82,768 x 160,801 = 13.3 G rays; the coarse search (543 M rays incl. per-hit outputs)
 took 24 s on the RTX A2000, so about 10 min there and 1-2 min on an L40S (estimate).
 
+Off-grid eval tables (scenarios never seen in training), one kind each (TABLE_KINDS):
+    offgrid       interpolation: the midpoints of each grid axis (separation 51-199 mm
+                  odd, laser pitch / yaw k x 0.25 + 0.125 = 0.125-7.875 deg; 75 x 32 x 32
+                  = 76,800 points)
+    extrap_short  extrapolation: separation 20-49 mm (integer), laser midpoints as above
+    extrap_long   extrapolation: separation 201-350 mm (integer), laser midpoints
+The lattice is visited in a seeded random order and scanned in rounds (same statistics,
+cap and good / impossible rule as the atlas) until both groups have enough scenarios for
+an eval set of OffgridConfig.n episodes, one per scenario (n x impossible_share impossible,
+the rest good); the table is the shortest prefix of that order that fills both groups (it
+does not depend on the round size). One torch file per kind with the atlas fields (loads
+as an Atlas) plus lattice_index and offgrid (sizes, seed); its key = the grid's
+AtlasConfig key plus the OffgridConfig. offgrid_eval_scenarios: the first scenarios of
+each group in table order (a uniform random subset), cycled if more episodes are asked
+for. Separation bins: TABLE_SEP_BINS (the extrapolation sets have their own).
+
+Grid hold-out (holdout_mask, SamplerConfig.holdout_frac / holdout_seed): a seeded random
+share of the grid scenarios, stratified (that share of the good and of the impossible grid
+points, each a uniform subset; the named setups are never held out), removed from the
+sampler's draw segments, so no training draw can return one; eval_scenarios(...,
+good_ids, impossible_ids) draws the hold-out eval set from them only.
+
+Continuous scenarios (ContRanges, D7): scenario = (separation, laser pitch, laser yaw,
+laser dx, laser dy). Separation uniform over its range (default 20-400 mm), the laser
+offset uniform over the M1 hole disk (|offset| < 1.5 mm around the hole centre; radius 0:
+the measured offsets 0.75, 1.04 mm); laser angles constructive by default (the M2 landing
+point at zero M2 tilt uniform over the aperture minus 0.5 mm, pitch / yaw derived from the
+laser origin and that point in the sim's geometry, rejected outside the bounds, -8..8 deg),
+or uniform in angle (mode "angle"). Candidates come from seeded streams
+(ContRanges.candidates: blocks of CAND_BLOCK candidates per (stream, seed, block), so a
+candidate does not depend on how the stream is read; separate streams for the pool, the
+eval table and the encoder data). One generator for all of them: candidate_batch (angle
+bounds, then the beam check Scanner.check, a 1-bounce sim at the M2 box centre: the beam
+must pass the M1 hole and hit M2; clipped = stopped by the back of M1 at the hole edge,
+missed = no hit) and sample_valid_scenarios (the first n valid ones; encoder data, viewer).
+Invalid candidates are discarded, they are not "impossible" (= valid but P_max < P_floor).
+Only valid candidates get the atlas box scan (Scanner.scan; zero_cells = box cells without
+any hit: where the box scan disagrees with the centre check).
+
+ScenarioPool (PoolConfig; a ScenarioSampler over its slots): size slots (16,384),
+round(size x impossible_share) of them impossible, the rest good. Filled from the stream
+(STREAM_POOL) in rounds sized from the running good / impossible shares: beam check, box
+scan of the valid ones; the next good scenarios fill the good slots and the next
+impossible ones the impossible slots in stream order (the good share varies strongly with
+separation, so this is rejection sampling: the good slots follow the valid distribution
+restricted to the good set). refresh(iteration) at a new iteration replaces the oldest
+refresh_frac (1/8) of the good and of the impossible slots (ring order); their PLR scores
+reset and their generation (slot_gen) increments: the env copies parameters, P_ref and
+generation at the draw, and an episode updates its slot's score only if the generation
+still matches. Draws and the PLR replay as ScenarioSampler, within the pool. stats() adds
+pool/... (fill time, candidates, clipped / missed shares, good share of the valid ones per
+separation bin, slot histogram). Host syncs only in refresh() and stats().
+
+Continuous eval table (ContConfig, build_cont_table; ppo.py eval_cont/): the valid
+candidates of the shortest prefix of STREAM_EVAL (seeded) that holds n x 0.9 good and n x
+0.1 impossible scenarios; loads as an Atlas (params (n, 5)); offgrid_eval_scenarios picks
+the episodes; separation bins cont_sep_bins (20-50, 50-100, ..., 350-400).
+
 ScenarioSampler (all on the device; draw() and observe() have no host syncs):
-    draws      one categorical over [impossible | fresh good | replay good] segments:
+    draws      one categorical over [impossible | fresh good | replay good] segments
+               (without the held-out scenarios):
                impossible_share (10 %) uniform over the impossible set; the rest a
                good scenario, with probability p_fresh (0.3; 1.0 until min_seen = 2048
                good scenarios have a score) uniform over the good set, otherwise from
@@ -55,23 +124,33 @@ import argparse
 import math
 import os
 import time
-from dataclasses import asdict, dataclass, replace
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import asdict, dataclass, field, fields, replace
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
-from env import Scenarios
-from find_setups import SearchConfig, box_grid, candidate_states, coarse_candidates
+from env import M2_ID, SCEN_STATE, Scenarios
+from find_setups import SearchConfig, axis, box_grid, coarse_candidates
 from geometry import SETUPS, CellGeometry
-from herriott_sim import DEVICE, STOP_HOLE
+from herriott_sim import DEVICE, S_M2_PITCH, S_M2_YAW, STOP_BLOCKED, STOP_HOLE
 
 RL_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ATLAS = os.path.join(RL_DIR, "runs", "atlas", "atlas_v1.pt")
+EVAL_TABLES_DIR = os.path.join(RL_DIR, "runs", "eval_sets")
+DEFAULT_OFFGRID = os.path.join(EVAL_TABLES_DIR, "offgrid_v1.pt")
 ATLAS_VERSION = 1
 PARAM_NAMES = ("separation", "laser_pitch", "laser_yaw")
 SRC_EXPLICIT, SRC_IMPOSSIBLE, SRC_FRESH, SRC_REPLAY = -1, 0, 1, 2
 SEP_BINS = ((50.0, 80.0), (80.0, 110.0), (110.0, 140.0), (140.0, 170.0), (170.0, 200.0))
+# Off-grid eval tables (module docstring): interpolation and the two extrapolation sets,
+# their separation axes (None: midpoints of the grid axis) and separation bins
+TABLE_KINDS = ("offgrid", "extrap_short", "extrap_long")
+TABLE_SEP = {"offgrid": None, "extrap_short": (20.0, 49.0, 1.0),
+             "extrap_long": (201.0, 350.0, 1.0)}
+TABLE_SEP_BINS = {"offgrid": SEP_BINS,
+                  "extrap_short": ((20.0, 30.0), (30.0, 40.0), (40.0, 50.0)),
+                  "extrap_long": ((200.0, 250.0), (250.0, 300.0), (300.0, 350.0))}
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -144,14 +223,29 @@ def sample_grid(n: int, seed: int, cfg: Optional[AtlasConfig] = None) -> np.ndar
 # ── Scan ────────────────────────────────────────────────────────────────────
 
 
+def box_states(geom: CellGeometry, params: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """(n * G, 13) states: scenarios params (n, 3) [sep, laser pitch, laser yaw] or (n, 5)
+    [..., laser dx, laser dy] x M2 tilts grid (G, 2) (find_setups.candidate_states for
+    three parameters)."""
+    n, G = params.shape[0], grid.shape[0]
+    s = geom.base_state(n * G, grid.device).view(n, G, -1)
+    p = params.to(torch.float32)
+    for j, k in enumerate(SCEN_STATE[:p.shape[1]]):
+        s[..., k] = p[:, j, None]
+    s[..., S_M2_PITCH] = grid[:, 0]
+    s[..., S_M2_YAW] = grid[:, 1]
+    return s.view(n * G, -1)
+
+
 @torch.no_grad()
 def scan_scenarios(sim, geom: CellGeometry, params: torch.Tensor, grid: torch.Tensor,
-                   cfg: AtlasConfig) -> Dict[str, torch.Tensor]:
-    """Atlas statistics of scenarios params (n, 3) float32 over the M2 grid (G, 2)."""
+                   cfg: AtlasConfig, zero_cells: bool = False) -> Dict[str, torch.Tensor]:
+    """Atlas statistics of scenarios params (n, 3 | 5) float32 over the M2 grid (G, 2);
+    zero_cells: also the number of cells without any hit (beam check vs box scan)."""
     n, G = params.shape[0], grid.shape[0]
     dev = grid.device
     cap, mo = cfg.cap, cfg.min_order
-    out = sim.simulate(candidate_states(geom, params, grid), store_world=False, store_hits=False)
+    out = sim.simulate(box_states(geom, params, grid), store_world=False, store_hits=False)
     b = out["hit_counts"].view(n, G)
     hole = (out["stop_reason"] == STOP_HOLE).view(n, G)
     p = out["total_path_length"].view(n, G)
@@ -164,10 +258,11 @@ def scan_scenarios(sim, geom: CellGeometry, params: torch.Tensor, grid: torch.Te
     plateau_order = torch.where(pc > 0, po + mo, 0)
     pmask = hole & (b == plateau_order[:, None]) & (pc[:, None] > 0)
     best_b = b.amax(1)
-    first = sim.simulate(candidate_states(geom, params, torch.zeros(1, 2, device=dev)),
+    first = sim.simulate(box_states(geom, params, torch.zeros(1, 2, device=dev)),
                          store_world=False)
-    on_m2 = first["hit_mirror"][:, 0] == 2
-    return {
+    on_m2 = first["hit_mirror"][:, 0] == M2_ID
+    extra = {"zero_cells": (b == 0).sum(1).to(torch.int32)} if zero_cells else {}
+    return {**extra,
         "pmax": pmax,
         "pmax_tilt": grid[imax],
         "pmax_bounces": b[rows, imax].to(torch.int16),
@@ -183,39 +278,94 @@ def scan_scenarios(sim, geom: CellGeometry, params: torch.Tensor, grid: torch.Te
     }
 
 
+class Scanner:
+    """Box scans and beam checks of scenario batches on one device (persistent sim and
+    M2 grid of the AtlasConfig scan settings)."""
+
+    def __init__(self, cfg: Optional[AtlasConfig] = None, device: Optional[torch.device] = None):
+        self.cfg = cfg = cfg or AtlasConfig()
+        self.device = dev = torch.device(device) if device is not None else DEVICE
+        self.geom = CellGeometry()
+        self.sim = self.geom.make_sim(dev, max_bounces=cfg.cap)
+        self.grid, _ = box_grid(cfg.limit, cfg.step, dev)
+        self.per = max(1, cfg.chunk_states // self.grid.shape[0])
+        self.sim1 = self.geom.make_sim(dev, max_bounces=1)  # Beam check: the first hit only
+
+    @torch.no_grad()
+    def scan(self, params: torch.Tensor, zero_cells: bool = False) -> Dict[str, torch.Tensor]:
+        """Atlas fields (on the device) of scenarios params (n, 3 | 5): scan_scenarios in
+        chunks of cfg.chunk_states states, then params (float32), p_floor, good and
+        path_ref."""
+        cfg = self.cfg
+        pt = params.to(device=self.device, dtype=torch.float32)
+        parts: Dict[str, list] = {}
+        for i in range(0, pt.shape[0], self.per):
+            for k, v in scan_scenarios(self.sim, self.geom, pt[i:i + self.per], self.grid, cfg,
+                                       zero_cells).items():
+                parts.setdefault(k, []).append(v)
+        d = {k: torch.cat(v) for k, v in parts.items()}
+        pf = cfg.floor_bounces * pt[:, 0]
+        d.update(params=pt, p_floor=pf, good=d["pmax"] >= pf, path_ref=torch.maximum(d["pmax"], pf))
+        return d
+
+    @torch.no_grad()
+    def check(self, params: torch.Tensor, chunk: int = 1 << 16) -> Dict[str, torch.Tensor]:
+        """Beam check of scenarios params (n, 3 | 5) at the M2 box centre (zero tilt), on
+        the device, with a 1-bounce sim (the first hit of the full sim): valid = the
+        first hit is on M2; clipped = stopped by the back of M1 (the hole edge) before any
+        hit (STOP_BLOCKED, 0 bounces); missed = the rest (no hit on M2). The first M2 hit
+        hardly moves over the box (scan zero_cells checks it)."""
+        pt = params.to(device=self.device, dtype=torch.float32)
+        z = torch.zeros(1, 2, device=self.device)
+        on, clip = [], []
+        for i in range(0, pt.shape[0], chunk):
+            out = self.sim1.simulate(box_states(self.geom, pt[i:i + chunk], z), store_world=False)
+            b0 = out["hit_counts"] == 0
+            on.append(~b0 & (out["hit_mirror"][:, 0] == M2_ID))
+            clip.append(b0 & (out["stop_reason"] == STOP_BLOCKED))
+        valid = torch.cat(on) if on else torch.zeros(0, dtype=torch.bool, device=self.device)
+        clipped = torch.cat(clip) if clip else torch.zeros_like(valid)
+        return {"valid": valid, "clipped": clipped, "missed": ~valid & ~clipped}
+
+
+@torch.no_grad()
+def scan_table(params: np.ndarray, cfg: AtlasConfig,
+               device: torch.device) -> Dict[str, torch.Tensor]:
+    """Atlas fields (CPU tensors) of the scenarios params (n, 3 | 5) float64
+    (Scanner.scan)."""
+    pt = torch.tensor(params, dtype=torch.float32, device=device)
+    return {k: v.cpu() for k, v in Scanner(cfg, device).scan(pt).items()}
+
+
+def _sync(dev: torch.device):
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+
+
+def _device_name(dev: torch.device) -> str:
+    return torch.cuda.get_device_name(dev) if dev.type == "cuda" else str(dev)
+
+
 @torch.no_grad()
 def build_atlas(cfg: Optional[AtlasConfig] = None, device: Optional[torch.device] = None,
                 log=print) -> Dict[str, Any]:
     """Scan every scenario (module docstring); returns the atlas dict (CPU tensors)."""
     cfg = cfg or AtlasConfig()
     dev = torch.device(device) if device is not None else DEVICE
-    geom = CellGeometry()
-    sim = geom.make_sim(dev, max_bounces=cfg.cap)
     params, named, n_grid = scenario_params(cfg)
-    grid, W = box_grid(cfg.limit, cfg.step, dev)
-    G = grid.shape[0]
+    W = axis(-cfg.limit, cfg.limit, cfg.step).size
+    G = W * W
     per = max(1, cfg.chunk_states // G)
-    pt = torch.tensor(params, dtype=torch.float32, device=dev)
-    N = pt.shape[0]
+    N = params.shape[0]
     log(f"atlas: {N} scenarios ({n_grid} grid + {N - n_grid} named) x {W}^2 M2 cells "
         f"({N * G / 1e9:.2f} G rays), {per} scenarios per sim call")
-    if dev.type == "cuda":
-        torch.cuda.synchronize(dev)
+    _sync(dev)
     t0 = time.perf_counter()
-    parts: Dict[str, list] = {}
-    for i in range(0, N, per):
-        for k, v in scan_scenarios(sim, geom, pt[i:i + per], grid, cfg).items():
-            parts.setdefault(k, []).append(v)
-    if dev.type == "cuda":
-        torch.cuda.synchronize(dev)
+    d: Dict[str, Any] = scan_table(params, cfg, dev)
+    _sync(dev)
     build_s = time.perf_counter() - t0
-    d: Dict[str, Any] = {k: torch.cat(v).cpu() for k, v in parts.items()}
-    pf = cfg.floor_bounces * pt[:, 0].cpu()
-    d.update(params=pt.cpu(), p_floor=pf, good=d["pmax"] >= pf,
-             path_ref=torch.maximum(d["pmax"], pf))
     d.update(version=ATLAS_VERSION, key=cfg.key(), named=named, n_grid=n_grid,
-             build_s=build_s, device_name=torch.cuda.get_device_name(dev) if dev.type == "cuda"
-             else str(dev), date=time.strftime("%Y-%m-%d"))
+             build_s=build_s, device_name=_device_name(dev), date=time.strftime("%Y-%m-%d"))
     log(f"atlas: built in {build_s:.1f} s on {d['device_name']}; {int(d['good'].sum())} good, "
         f"{int((~d['good']).sum())} impossible (P_max < {cfg.floor_bounces} x separation)")
     return d
@@ -233,7 +383,8 @@ def save_atlas(d: Dict[str, Any], path: str):
 
 class Atlas:
     """Loaded atlas on a device: tensors as attributes (module docstring), plus
-    good_ids / impossible_ids (int64), named (name -> index), key, path."""
+    good_ids / impossible_ids (int64), named (name -> index), key, path; an off-grid
+    table also loads as an Atlas (offgrid: its build info, None for the atlas)."""
 
     TENSORS = ("params", "pmax", "pmax_tilt", "pmax_bounces", "plateau_order", "plateau_cells",
                "plateau_c", "plateau_path", "best_bounces", "best_cells", "near_cells",
@@ -249,6 +400,7 @@ class Atlas:
         self.named: Dict[str, int] = dict(d["named"])
         self.n_grid: int = int(d["n_grid"])
         self.build_s: float = float(d.get("build_s", float("nan")))
+        self.offgrid: Optional[Dict[str, Any]] = d.get("offgrid")  # Off-grid tables only
         self.path = path
         self.good_ids = torch.nonzero(self.good).squeeze(1)
         self.impossible_ids = torch.nonzero(~self.good).squeeze(1)
@@ -306,23 +458,26 @@ def load_or_build(path: str, device: Optional[torch.device] = None,
     return load_atlas(path, device)
 
 
-def sep_bin_masks(sep: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """Separation bins of SEP_BINS ([lo, hi), the last one closed): name -> mask."""
+def sep_bin_masks(sep: torch.Tensor, bins=SEP_BINS) -> Dict[str, torch.Tensor]:
+    """Separation bins ([lo, hi), the last one closed): name -> mask."""
     out = {}
-    for lo, hi in SEP_BINS:
-        top = sep <= hi if hi == SEP_BINS[-1][1] else sep < hi
+    for lo, hi in bins:
+        top = sep <= hi if hi == bins[-1][1] else sep < hi
         out[f"sep{lo:g}-{hi:g}"] = (sep >= lo) & top
     return out
 
 
-def eval_scenarios(atlas: Atlas, n: int, seed: int = 0,
-                   impossible_share: float = 0.1) -> torch.Tensor:
+def eval_scenarios(atlas: Atlas, n: int, seed: int = 0, impossible_share: float = 0.1,
+                   good_ids: Optional[torch.Tensor] = None,
+                   impossible_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
     """(n,) int64 scenario per episode of the "full" eval set (CPU, seeded): round(n x
     impossible_share) uniform over the impossible set, the rest uniform over the good
-    set (with replacement), in a seeded random order."""
+    set (with replacement), in a seeded random order. good_ids / impossible_ids: draw
+    from these instead of the atlas's sets (the hold-out set)."""
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed + 7)
-    good, imp = atlas.good_ids.cpu(), atlas.impossible_ids.cpu()
+    good = (atlas.good_ids if good_ids is None else good_ids).cpu()
+    imp = (atlas.impossible_ids if impossible_ids is None else impossible_ids).cpu()
     n_imp = int(round(n * impossible_share)) if imp.numel() else 0
     if good.numel() == 0:
         n_imp = n
@@ -333,6 +488,545 @@ def eval_scenarios(atlas: Atlas, n: int, seed: int = 0,
         parts.append(imp[torch.randint(imp.numel(), (n_imp,), generator=gen)])
     s = torch.cat(parts)
     return s[torch.randperm(n, generator=gen)]
+
+
+def atlas_config(atlas: Atlas) -> AtlasConfig:
+    """AtlasConfig of a loaded atlas (from its key; default chunking)."""
+    k = atlas.key
+    names = [f.name for f in fields(AtlasConfig) if f.name != "chunk_states" and f.name in k]
+    return AtlasConfig(**{n: tuple(k[n]) if isinstance(k[n], (list, tuple)) else k[n]
+                          for n in names})
+
+
+def table_stats(at: Atlas, rows: Optional[torch.Tensor] = None, bins=SEP_BINS) -> Dict[str, Any]:
+    """Summary of the scenarios rows (default: the grid points of an atlas, every row of
+    an off-grid table): count, good share, P_max of the good ones (m: mean, quantiles),
+    share of good ones whose P_max is at the bounce cap, mean share of the box cells at
+    the cap (all and good scenarios), median success-region area (cells >= 0.9 P_max,
+    deg^2), mean blind share of the box; per separation bin (bins) count, good share,
+    median good P_max and cap shares."""
+    if rows is None:
+        rows = torch.arange(at.n_grid, device=at.device)
+    rows = rows.to(at.device)
+    k = at.key
+    cap = int(k["cap"])
+    cell = float(k["step"]) ** 2
+    G = axis(-k["limit"], k["limit"], k["step"]).size ** 2
+    good = at.good[rows]
+    cap_cells = torch.where(at.best_bounces >= cap, at.best_cells, 0).double() / G
+    nan = math.nan
+    mean = lambda x: float(x.double().mean()) if x.numel() else nan
+
+    def part(r: torch.Tensor, g: torch.Tensor) -> Dict[str, Any]:
+        rg = r[g]
+        pm = at.pmax[rg].double() / 1000
+        qs = (0.1, 0.25, 0.5, 0.75, 0.9)
+        q = torch.quantile(pm, torch.tensor(qs, dtype=torch.float64, device=pm.device)).tolist() \
+            if rg.numel() else [nan] * len(qs)
+        out = {"n": int(r.numel()), "good": int(rg.numel()), "good_share": mean(g),
+               "pmax_m_mean": mean(pm)}
+        out.update({f"pmax_m_q{int(100 * a)}": v for a, v in zip(qs, q)})
+        out.update(
+            pmax_cap_share=mean(at.pmax_bounces[rg] >= cap),
+            cap_cells_share=mean(cap_cells[r]),
+            cap_cells_share_good=mean(cap_cells[rg]),
+            near_area_deg2_median=float(at.near_cells[rg].double().median()) * cell
+            if rg.numel() else nan,
+            blind_share_mean=mean(at.blind_cells[rg].double() / G))
+        return out
+
+    out = part(rows, good)
+    out["sep_bins"] = {}
+    for name, m in sep_bin_masks(at.params[rows, 0], bins).items():
+        b = part(rows[m], good[m])
+        out["sep_bins"][name] = {x: b[x] for x in ("n", "good", "good_share", "pmax_m_q50",
+                                                   "pmax_cap_share", "cap_cells_share")}
+    return out
+
+
+# ── Off-grid tables: interpolation and extrapolation ───────────────────────
+
+
+OFFGRID_VERSION = 1
+
+
+@dataclass
+class OffgridConfig:
+    """Off-grid eval table (module docstring). kind: offgrid (midpoints in all three
+    parameters), extrap_short / extrap_long (separation TABLE_SEP outside the grid range,
+    laser pitch / yaw midpoints)."""
+
+    kind: str = "offgrid"
+    n: int = 4096  # Eval episodes the table is sized for, one per scenario
+    impossible_share: float = 0.1  # Of those episodes (as the "full" set)
+    seed: int = 0  # Order in which the lattice is visited
+    round_n: int = 2048  # Candidates per scan round (the table does not depend on it)
+
+    def counts(self) -> Tuple[int, int]:
+        """(good, impossible) scenarios the table must hold."""
+        n_imp = int(round(self.n * self.impossible_share))
+        return self.n - n_imp, n_imp
+
+    def key(self, grid: AtlasConfig) -> Dict[str, Any]:
+        """Key of the table: the grid's atlas key plus the off-grid settings."""
+        assert self.kind in TABLE_KINDS, f"kind {self.kind!r} not in {TABLE_KINDS}"
+        d = grid.key()
+        d["offgrid"] = {"kind": self.kind, "version": OFFGRID_VERSION, "n": self.n,
+                        "impossible_share": self.impossible_share, "seed": self.seed,
+                        "sep": TABLE_SEP[self.kind]}
+        return d
+
+
+def table_path(kind: str, directory: str = "") -> str:
+    """Cached table file of a kind: <directory or EVAL_TABLES_DIR>/<kind>_v1.pt."""
+    return os.path.join(directory or EVAL_TABLES_DIR, f"{kind}_v{OFFGRID_VERSION}.pt")
+
+
+def grid_axes(cfg: AtlasConfig) -> List[np.ndarray]:
+    """Training grid axes (separation, laser pitch, laser yaw), float64."""
+    return [axis(*a) for a in (cfg.sep, cfg.pitch, cfg.yaw)]
+
+
+def offgrid_axes(cfg: AtlasConfig, kind: str = "offgrid") -> List[np.ndarray]:
+    """Lattice axes of a table kind: midpoints between neighbouring grid values of each
+    axis (exact in float32 for the default grid: odd mm, k x 0.25 + 0.125 deg); the
+    extrapolation kinds replace the separation axis by TABLE_SEP[kind]."""
+    ax = [0.5 * (a[1:] + a[:-1]) for a in grid_axes(cfg)]
+    if TABLE_SEP[kind] is not None:
+        ax[0] = axis(*TABLE_SEP[kind])
+    return ax
+
+
+def offgrid_lattice(cfg: AtlasConfig, kind: str = "offgrid") -> np.ndarray:
+    """(n, 3) float64 lattice points, separation-major (offgrid: 75 x 32 x 32 = 76,800;
+    extrap_short 30 x 32 x 32; extrap_long 150 x 32 x 32 by default)."""
+    S, P, Y = np.meshgrid(*offgrid_axes(cfg, kind), indexing="ij")
+    return np.stack((S.ravel(), P.ravel(), Y.ravel()), 1)
+
+
+def on_grid_axes(params: np.ndarray, cfg: AtlasConfig, tol: float = 1e-6) -> np.ndarray:
+    """(n, 3) bool: coordinate j of each row of params (n, 3) lies on grid axis j."""
+    params = np.asarray(params, dtype=np.float64)
+    return np.stack([np.abs(params[:, j, None] - a[None]).min(1) <= tol
+                     for j, a in enumerate(grid_axes(cfg))], 1)
+
+
+@torch.no_grad()
+def build_offgrid(ocfg: Optional[OffgridConfig] = None, cfg: Optional[AtlasConfig] = None,
+                  device: Optional[torch.device] = None, log=print) -> Dict[str, Any]:
+    """Off-grid table of the grid cfg (module docstring); returns the dict (CPU tensors,
+    the atlas fields plus lattice_index and offgrid). If the whole lattice holds fewer
+    good or impossible scenarios than asked for, the table is the whole lattice
+    (offgrid["short"] True, logged) and the eval set cycles over the group."""
+    ocfg = ocfg or OffgridConfig()
+    cfg = cfg or AtlasConfig()
+    dev = torch.device(device) if device is not None else DEVICE
+    lat = offgrid_lattice(cfg, ocfg.kind)
+    order = np.random.default_rng(ocfg.seed).permutation(lat.shape[0])
+    n_good, n_imp = ocfg.counts()
+    tag = ocfg.kind
+    log(f"{tag}: lattice of {lat.shape[0]} points (separation {offgrid_axes(cfg, tag)[0][0]:g}-"
+        f"{offgrid_axes(cfg, tag)[0][-1]:g} mm), scanning in rounds of {ocfg.round_n} until "
+        f"{n_good} good + {n_imp} impossible scenarios")
+    _sync(dev)
+    t0 = time.perf_counter()
+    parts: Dict[str, list] = {}
+    cnt_g = cnt_i = done = 0
+    while (cnt_g < n_good or cnt_i < n_imp) and done < lat.shape[0]:
+        idx = order[done:done + ocfg.round_n]
+        for k, v in scan_table(lat[idx], cfg, dev).items():
+            parts.setdefault(k, []).append(v)
+        g = int(parts["good"][-1].sum())
+        cnt_g, cnt_i, done = cnt_g + g, cnt_i + idx.size - g, done + idx.size
+    _sync(dev)
+    build_s = time.perf_counter() - t0
+    short = cnt_g < n_good or cnt_i < n_imp
+    if short:
+        log(f"WARNING {tag}: lattice exhausted with {cnt_g} good / {cnt_i} impossible "
+            f"scenarios; the eval set repeats them")
+    d: Dict[str, Any] = {k: torch.cat(v) for k, v in parts.items()}
+    good = d["good"]
+    last = lambda ids, k: int(ids[min(k, ids.numel()) - 1]) if min(k, ids.numel()) else -1
+    L = max(last(torch.nonzero(good).squeeze(1), n_good),
+            last(torch.nonzero(~good).squeeze(1), n_imp)) + 1  # Shortest prefix
+    d = {k: v[:L] for k, v in d.items()}
+    d.update(version=ATLAS_VERSION, key=ocfg.key(cfg), named={}, n_grid=L, build_s=build_s,
+             device_name=_device_name(dev), date=time.strftime("%Y-%m-%d"),
+             lattice_index=torch.from_numpy(order[:L].copy()),
+             offgrid={"kind": tag, "lattice": int(lat.shape[0]), "candidates": L,
+                      "scanned": done, "n_good": n_good, "n_impossible": n_imp,
+                      "seed": ocfg.seed, "short": short})
+    ng = int(d["good"].sum())
+    log(f"{tag}: {L} candidates ({done} scanned) in {build_s:.1f} s on {d['device_name']}: "
+        f"{ng} good ({100 * ng / max(L, 1):.1f} %), {L - ng} impossible")
+    return d
+
+
+def load_or_build_offgrid(path: str, cfg: AtlasConfig, ocfg: Optional[OffgridConfig] = None,
+                          device: Optional[torch.device] = None, log=print) -> Atlas:
+    """Off-grid table at path for the grid cfg (build_offgrid; built and saved there if the
+    file is missing). A file built for another grid or OffgridConfig is an error."""
+    ocfg = ocfg or OffgridConfig()
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        log(f"{ocfg.kind}: {path} missing, building")
+        save_atlas(build_offgrid(ocfg, cfg, device, log), path)
+        log(f"{ocfg.kind}: saved {path}")
+    d = torch.load(path, map_location="cpu", weights_only=False)
+    want, have = ocfg.key(cfg), d.get("key") or {}
+    bad = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+    assert not bad, f"table {path} does not match the grid / OffgridConfig: {bad}"
+    return Atlas(d, device, path)
+
+
+def offgrid_eval_scenarios(table: Atlas, n: int, seed: int = 0,
+                           impossible_share: float = 0.1) -> torch.Tensor:
+    """(n,) int64 scenario per episode of an off-grid eval set (CPU, seeded): round(n x
+    impossible_share) impossible, the rest good, each the first scenarios of its group in
+    table order (a uniform random subset; one episode per scenario, cycled when the group
+    is smaller), in a seeded random order."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed + 7)
+    good, imp = table.good_ids.cpu(), table.impossible_ids.cpu()
+    n_imp = int(round(n * impossible_share)) if imp.numel() else 0
+    if good.numel() == 0:
+        n_imp = n
+    parts = []
+    if n - n_imp:
+        parts.append(good[torch.arange(n - n_imp) % good.numel()])
+    if n_imp:
+        parts.append(imp[torch.arange(n_imp) % imp.numel()])
+    s = torch.cat(parts)
+    return s[torch.randperm(n, generator=gen)]
+
+
+# ── Continuous scenarios ────────────────────────────────────────────────────
+
+
+CAND_BLOCK = 4096  # Candidates per seeded block of a candidate stream
+STREAM_POOL, STREAM_EVAL, STREAM_ENCODER = 1, 2, 3  # Independent streams per use
+CONT_SEP_EDGES = (50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0)
+CONT_VERSION = 1
+
+
+def cont_sep_bins(lo: float, hi: float) -> Tuple[Tuple[float, float], ...]:
+    """Separation bins of a continuous range: edges lo, the CONT_SEP_EDGES inside (lo,
+    hi), hi (20-400 mm: 20-50, 50-100, ..., 350-400)."""
+    e = [float(lo)] + [x for x in CONT_SEP_EDGES if lo < x < hi] + [float(hi)]
+    return tuple(zip(e[:-1], e[1:]))
+
+
+LASER_Z_MM = -5.0  # Laser origin behind the M1 surface, M1-local z (herriott_sim, sim_triton)
+OFFSET_SHRINK = 1.0 - 1e-6  # Disk radii x this: float32 parameters stay strictly inside
+
+
+@dataclass(frozen=True)
+class ContRanges:
+    """Continuous scenario distribution (module docstring). Scenario = (separation, laser
+    pitch, laser yaw, laser dx, laser dy) (env.SCEN_NAMES). Separation uniform over sep,
+    laser (dx, dy) uniform over the disk of offset_radius around the M1 hole centre (0:
+    the measured offsets of geometry.CellGeometry, fixed). Laser angles:
+        landing  (default) constructive: the M2 landing point of the beam at zero M2 tilt
+                 uniform over the M2 aperture minus landing_margin; pitch / yaw follow
+                 from laser origin and landing point (the sim's geometry: origin at
+                 (dx, hole y + dy, -5 mm) behind the untilted M1, landing point on the M2
+                 sphere); candidates whose angles fall outside pitch / yaw are rejected
+                 (angle_ok), so the angle range shrinks with separation by construction
+        angle    uniform over pitch x yaw (for comparison)"""
+
+    sep: Tuple[float, float] = (20.0, 400.0)  # mm
+    pitch: Tuple[float, float] = (-8.0, 8.0)  # deg, laser (landing: bounds)
+    yaw: Tuple[float, float] = (-8.0, 8.0)  # deg, laser (landing: bounds)
+    offset_radius: float = 1.5  # mm (the M1 hole radius)
+    mode: str = "landing"  # landing / angle
+    landing_margin: float = 0.5  # mm inside the M2 aperture edge
+
+    def candidates(self, seed: int, start: int, count: int, stream: int) -> np.ndarray:
+        """(count, 5) float64 candidates start .. start + count - 1 of the seeded stream
+        (block b of CAND_BLOCK candidates from numpy's Generator seeded by (stream, seed,
+        b), so a candidate does not depend on how the stream is read). Landing mode:
+        the angles may lie outside the bounds (angle_ok)."""
+        assert seed >= 0 and start >= 0 and self.mode in ("landing", "angle"), self.mode
+        out = np.empty((count, 5))
+        if count <= 0:
+            return out
+        b0, b1 = start // CAND_BLOCK, (start + count - 1) // CAND_BLOCK
+        u = np.concatenate([np.random.default_rng([stream, seed, b]).random((CAND_BLOCK, 5))
+                            for b in range(b0, b1 + 1)])
+        u = u[start - b0 * CAND_BLOCK:start - b0 * CAND_BLOCK + count]
+        g = CellGeometry()
+        out[:, 0] = self.sep[0] + (self.sep[1] - self.sep[0]) * u[:, 0]
+        if self.offset_radius > 0:  # Uniform over the disk, |offset| < radius
+            r = self.offset_radius * OFFSET_SHRINK * np.sqrt(u[:, 3])
+            t = 2.0 * np.pi * u[:, 4]
+            out[:, 3], out[:, 4] = r * np.cos(t), r * np.sin(t)
+        else:
+            out[:, 3], out[:, 4] = g.laser_dx, g.laser_dy
+        if self.mode == "angle":
+            out[:, 1] = self.pitch[0] + (self.pitch[1] - self.pitch[0]) * u[:, 1]
+            out[:, 2] = self.yaw[0] + (self.yaw[1] - self.yaw[0]) * u[:, 2]
+            return out
+        # Landing point (M2-local lx, ly) uniform over the aperture minus the margin
+        rl = (g.diameter / 2 - self.landing_margin) * OFFSET_SHRINK * np.sqrt(u[:, 1])
+        tl = 2.0 * np.pi * u[:, 2]
+        lx, ly = rl * np.cos(tl), rl * np.sin(tl)
+        pz = out[:, 0] - (g.roc - np.sqrt(g.roc ** 2 - rl ** 2))  # On the M2 sphere
+        d = np.stack((g.m2_tx + lx - out[:, 3], g.m2_ty + ly - (g.m1_hole_offset_y + out[:, 4]),
+                      pz - LASER_Z_MM), 1)
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        # herriott_sim: direction = Ry(yaw) Rx(pitch) (0, 0, 1) = (cos p sin y, -sin p, cos p cos y)
+        out[:, 1] = np.degrees(np.arcsin(np.clip(-d[:, 1], -1.0, 1.0)))
+        out[:, 2] = np.degrees(np.arctan2(d[:, 0], d[:, 2]))
+        return out
+
+    def angle_ok(self, params: np.ndarray) -> np.ndarray:
+        """(n,) bool: laser pitch and yaw of params (n, 5) within the bounds."""
+        return ((params[:, 1] >= self.pitch[0]) & (params[:, 1] <= self.pitch[1])
+                & (params[:, 2] >= self.yaw[0]) & (params[:, 2] <= self.yaw[1]))
+
+    def head_range(self) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+        """Scenario-head normalization (lo, hi): separation, laser pitch, yaw and, with
+        offset_radius > 0, laser dx, dy (+- offset_radius); 3 entries otherwise."""
+        lo = (self.sep[0], self.pitch[0], self.yaw[0])
+        hi = (self.sep[1], self.pitch[1], self.yaw[1])
+        r = self.offset_radius
+        if r > 0:
+            lo, hi = lo + (-r, -r), hi + (r, r)
+        return tuple(float(v) for v in lo), tuple(float(v) for v in hi)
+
+    def tag(self) -> str:
+        """Name marker: cont<sep lo>-<sep hi>, plus -lp<a> (laser bounds +-a) or
+        -l<lo>to<hi>x<lo>to<hi> if not the default +-8 deg, -off<r> if the offset radius
+        is not 1.5 mm, -ang in angle mode."""
+        t = f"cont{self.sep[0]:g}-{self.sep[1]:g}"
+        if self.pitch != (-8.0, 8.0) or self.yaw != (-8.0, 8.0):
+            if self.pitch == self.yaw and self.pitch[0] == -self.pitch[1]:
+                t += f"-lp{self.pitch[1]:g}"
+            else:
+                t += f"-l{self.pitch[0]:g}to{self.pitch[1]:g}x{self.yaw[0]:g}to{self.yaw[1]:g}"
+        if self.offset_radius != 1.5:
+            t += f"-off{self.offset_radius:g}"
+        if self.mode != "landing":
+            t += "-ang"
+        return t
+
+
+def cont_ranges(sep: Tuple[float, float], laser: Tuple[float, float], offset_radius: float,
+                mode: str = "landing") -> ContRanges:
+    """ContRanges from CLI values (the same range for laser pitch and yaw)."""
+    return ContRanges(sep=(float(sep[0]), float(sep[1])), pitch=(float(laser[0]), float(laser[1])),
+                      yaw=(float(laser[0]), float(laser[1])), offset_radius=float(offset_radius),
+                      mode=mode)
+
+
+def scenario_geometry(p, name: str = "") -> CellGeometry:
+    """CellGeometry of a scenario (separation, laser pitch, laser yaw[, laser dx, laser
+    dy]): the measured cell with these values (encoder data, FrameData setups)."""
+    kw = dict(separation=float(p[0]), laser_pitch=float(p[1]), laser_yaw=float(p[2]))
+    if len(p) > 3:
+        kw.update(laser_dx=float(p[3]), laser_dy=float(p[4]))
+    return replace(CellGeometry(), name=name, **kw)
+
+
+def sep_band(sep: np.ndarray, bins) -> np.ndarray:
+    """Index of the separation bin ([lo, hi), the last closed) of each value, -1 outside."""
+    out = np.full(sep.shape, -1, dtype=np.int64)
+    for j, (lo, hi) in enumerate(bins):
+        top = sep <= hi if j == len(bins) - 1 else sep < hi
+        out[(sep >= lo) & top] = j
+    return out
+
+
+STAGES = ("candidates", "angle_rejected", "clipped", "missed", "valid")  # Generator stages
+
+
+@torch.no_grad()
+def candidate_batch(ranges: ContRanges, seed: int, start: int, count: int, stream: int,
+                    scanner: "Scanner") -> Dict[str, np.ndarray]:
+    """Candidates start .. start + count - 1 of a seeded stream with their validity
+    stages (host arrays): params (count, 5) float64; angle_ok (laser angles within the
+    bounds; landing mode); clipped / missed (Scanner.check at the box centre, the
+    angle_ok ones only); valid = angle_ok and neither. No box scan."""
+    prm = ranges.candidates(seed, start, count, stream)
+    ok = ranges.angle_ok(prm)
+    clipped = np.zeros(count, dtype=bool)
+    missed = np.zeros(count, dtype=bool)
+    idx = np.nonzero(ok)[0]
+    if idx.size:
+        chk = scanner.check(torch.from_numpy(prm[idx]))
+        clipped[idx] = chk["clipped"].cpu().numpy()
+        missed[idx] = chk["missed"].cpu().numpy()
+    return {"params": prm, "angle_ok": ok, "clipped": clipped, "missed": missed,
+            "valid": ok & ~clipped & ~missed}
+
+
+def stage_counts(b: Dict[str, np.ndarray], end: int) -> Dict[str, int]:
+    """STAGES counts of the first end candidates of a candidate_batch."""
+    return {"candidates": int(end), "angle_rejected": int((~b["angle_ok"][:end]).sum()),
+            "clipped": int(b["clipped"][:end].sum()), "missed": int(b["missed"][:end].sum()),
+            "valid": int(b["valid"][:end].sum())}
+
+
+@torch.no_grad()
+def sample_valid_scenarios(n: int, ranges: ContRanges, seed: int = 0, stream: int = STREAM_ENCODER,
+                           device: Optional[torch.device] = None, scanner: Optional["Scanner"] = None,
+                           start: int = 0, round_n: int = 8192) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """The scenario generator (pool, eval table and encoder data use it through
+    candidate_batch): the first n valid scenarios (angles within the bounds, beam through
+    the M1 hole onto M2 at the box centre) of a seeded candidate stream from position
+    start, (n, 5) float64, and info: STAGES counts up to the last one, positions (n,)
+    stream positions, next (the position after the last one). No box scans."""
+    sc = scanner or Scanner(device=device)
+    keep, pos = [], []
+    cnt = dict.fromkeys(STAGES, 0)
+    got, at = 0, start
+    while got < n:
+        b = candidate_batch(ranges, seed, at, round_n, stream, sc)
+        idx = np.nonzero(b["valid"])[0][:n - got]
+        end = int(idx[-1]) + 1 if got + idx.size >= n else round_n
+        for k, v in stage_counts(b, end).items():
+            cnt[k] += v
+        keep.append(b["params"][idx])
+        pos.append(idx + at)
+        got += idx.size
+        at += round_n
+        assert at - start < 1000 * max(n, 1) + 10 * round_n, "almost no valid scenarios in the ranges"
+    nxt = int(pos[-1][-1]) + 1 if n else start
+    return np.concatenate(keep), {**cnt, "positions": np.concatenate(pos), "next": nxt}
+
+
+# ── Continuous eval table (eval_cont) ───────────────────────────────────────
+
+
+@dataclass
+class ContConfig:
+    """Continuous eval table: the valid candidates (Scanner.check) of the shortest prefix
+    of a seeded candidate stream (STREAM_EVAL) that holds n x impossible_share impossible
+    and the rest good scenarios (as OffgridConfig, one episode per scenario)."""
+
+    ranges: ContRanges = field(default_factory=ContRanges)
+    n: int = 4096
+    impossible_share: float = 0.1
+    seed: int = 0
+    round_n: int = 8192  # Max candidates per round, 2 x n for small tables (no effect on the table)
+
+    def counts(self) -> Tuple[int, int]:
+        n_imp = int(round(self.n * self.impossible_share))
+        return self.n - n_imp, n_imp
+
+    def key(self, scan: AtlasConfig) -> Dict[str, Any]:
+        """Scan settings (AtlasConfig.key without the grid) plus the table settings."""
+        d = {k: v for k, v in scan.key().items() if k not in ("sep", "pitch", "yaw", "named")}
+        d["cont"] = {"version": CONT_VERSION, "ranges": asdict(self.ranges), "n": self.n,
+                     "impossible_share": self.impossible_share, "seed": self.seed}
+        return d
+
+
+def cont_table_path(ccfg: ContConfig, directory: str = "") -> str:
+    """<directory or EVAL_TABLES_DIR>/<ranges tag>_n<n>_seed<seed>_v1.pt."""
+    return os.path.join(directory or EVAL_TABLES_DIR,
+                        f"{ccfg.ranges.tag()}_n{ccfg.n}_seed{ccfg.seed}_v{CONT_VERSION}.pt")
+
+
+@torch.no_grad()
+def build_cont_table(ccfg: Optional[ContConfig] = None, scan: Optional[AtlasConfig] = None,
+                     device: Optional[torch.device] = None, log=print) -> Dict[str, Any]:
+    """Continuous eval table (ContConfig); the atlas fields (CPU tensors, params (n, 5))
+    of the valid candidates (candidate_batch, box scan of the valid ones only),
+    candidate_index (stream position) and the build info under "offgrid" (kind "cont":
+    candidates of the prefix, generated, STAGES counts, valid candidates with box cells
+    without any hit)."""
+    ccfg = ccfg or ContConfig()
+    scan = scan or AtlasConfig()
+    dev = torch.device(device) if device is not None else DEVICE
+    sc = Scanner(scan, dev)
+    n_good, n_imp = ccfg.counts()
+    tag = ccfg.ranges.tag()
+    rn = min(ccfg.round_n, max(256, 2 * ccfg.n))  # Small tables: small rounds
+    log(f"cont table {tag}: generating the seeded stream (seed {ccfg.seed}) in rounds of "
+        f"{rn} until {n_good} good + {n_imp} impossible valid scenarios")
+    _sync(dev)
+    t0 = time.perf_counter()
+    parts: Dict[str, list] = {}
+    batches = []
+    cnt_g = cnt_i = done = 0
+    while cnt_g < n_good or cnt_i < n_imp:
+        b = candidate_batch(ccfg.ranges, ccfg.seed, done, rn, STREAM_EVAL, sc)
+        vid = np.nonzero(b["valid"])[0]
+        d = sc.scan(torch.from_numpy(b["params"][vid]), zero_cells=True)
+        d["candidate_index"] = torch.from_numpy(vid + done)
+        for k, v in d.items():
+            parts.setdefault(k, []).append(v.cpu())
+        batches.append(b)
+        g = int(d["good"].sum())
+        cnt_g, cnt_i, done = cnt_g + g, cnt_i + vid.size - g, done + rn
+        assert done < 2000 * max(ccfg.n, 1), "the ranges hold almost no good or impossible scenarios"
+    _sync(dev)
+    build_s = time.perf_counter() - t0
+    d = {k: torch.cat(v) for k, v in parts.items()}
+    good, pos = d["good"], d["candidate_index"]
+    last = lambda ids, k: int(pos[ids[k - 1]]) if k else -1  # noqa: E731
+    L = max(last(torch.nonzero(good).squeeze(1), n_good),
+            last(torch.nonzero(~good).squeeze(1), n_imp)) + 1  # Shortest prefix
+    keep = pos < L
+    d = {k: v[keep] for k, v in d.items()}
+    zc = d.pop("zero_cells")
+    whole = {k: np.concatenate([b[k] for b in batches]) for k in ("angle_ok", "clipped", "missed", "valid")}
+    st = stage_counts(whole, L)
+    nv = int(keep.sum())
+    assert nv == st["valid"]
+    info = {"kind": "cont", "lattice": None, "candidates": L, "scanned": done, **st,
+            "box_zero_cells": int((zc > 0).sum()), "n_good": n_good, "n_impossible": n_imp,
+            "seed": ccfg.seed, "short": False, "ranges": asdict(ccfg.ranges)}
+    d.update(version=ATLAS_VERSION, key=ccfg.key(scan), named={}, n_grid=nv, build_s=build_s,
+             device_name=_device_name(dev), date=time.strftime("%Y-%m-%d"), offgrid=info)
+    ng = int(d["good"].sum())
+    log(f"cont table {tag}: {L} candidates ({done} generated) in {build_s:.1f} s on "
+        f"{d['device_name']}: angles out of bounds {100 * st['angle_rejected'] / L:.1f} %, "
+        f"clipped {100 * st['clipped'] / L:.1f} %, missed M2 {100 * st['missed'] / L:.1f} %, "
+        f"{nv} valid: {ng} good ({100 * ng / max(nv, 1):.1f} %), {nv - ng} impossible; valid "
+        f"with box cells without a hit: {info['box_zero_cells']}")
+    return d
+
+
+def load_or_build_cont(path: str, ccfg: Optional[ContConfig] = None,
+                       scan: Optional[AtlasConfig] = None, device: Optional[torch.device] = None,
+                       log=print) -> Atlas:
+    """Continuous eval table at path (build_cont_table; built and saved there if the file
+    is missing). A file built with other settings is an error."""
+    ccfg = ccfg or ContConfig()
+    scan = scan or AtlasConfig()
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        log(f"cont table: {path} missing, building")
+        save_atlas(build_cont_table(ccfg, scan, device, log), path)
+        log(f"cont table: saved {path}")
+    d = torch.load(path, map_location="cpu", weights_only=False)
+    want, have = ccfg.key(scan), d.get("key") or {}
+    bad = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+    assert not bad, f"table {path} does not match the ContConfig / scan settings: {bad}"
+    return Atlas(d, device, path)
+
+
+# ── Grid hold-out ───────────────────────────────────────────────────────────
+
+
+def holdout_mask(atlas: Atlas, frac: float, seed: int = 0) -> torch.Tensor:
+    """(N,) bool on the atlas device: the held-out scenarios, round(frac x count) of the
+    good and of the impossible grid points (each a uniform subset, CPU generator seeded
+    by seed); the named setups are never held out. frac 0: none."""
+    m = torch.zeros(atlas.n, dtype=torch.bool)
+    if frac > 0:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed + 11)
+        free = torch.arange(atlas.n) < atlas.n_grid
+        free[list(atlas.named.values())] = False
+        good = atlas.good.cpu()
+        for grp in (good, ~good):
+            ids = torch.nonzero(grp & free).squeeze(1)
+            k = int(round(frac * ids.numel()))
+            m[ids[torch.randperm(ids.numel(), generator=gen)[:k]]] = True
+    return m.to(atlas.device)
 
 
 # ── Sampler ─────────────────────────────────────────────────────────────────
@@ -349,6 +1043,8 @@ class SamplerConfig:
     beta: float = 0.3  # Rank temperature: P_S ~ rank^(-1 / beta)
     rho: float = 0.1  # Staleness share of the replay distribution
     replay: bool = True  # False: good draws always uniform (no prioritization)
+    holdout_frac: float = 0.0  # Share of the grid scenarios never drawn (holdout_mask)
+    holdout_seed: int = 0
 
 
 class ScenarioSampler:
@@ -359,7 +1055,12 @@ class ScenarioSampler:
         self.atlas = atlas
         dev = self.device = atlas.device
         N = atlas.n
+        # Training scenarios: the atlas without the held-out ones (holdout_mask)
+        self.holdout = holdout_mask(atlas, self.cfg.holdout_frac, self.cfg.holdout_seed)
         g, im = atlas.good_ids, atlas.impossible_ids
+        if bool(self.holdout.any()):
+            g, im = g[~self.holdout[g]], im[~self.holdout[im]]
+        self.good_ids, self.impossible_ids = g, im
         self.n_good, self.n_imp = g.numel(), im.numel()
         assert self.n_good + self.n_imp > 0
         self.good = atlas.good
@@ -379,9 +1080,10 @@ class ScenarioSampler:
     # ── Distribution ──
 
     def replay_probs(self) -> torch.Tensor:
-        """(n_good,) float64 replay distribution over the good scenarios (0 if unseen)."""
+        """(n_good,) float64 replay distribution over the good training scenarios (0 if
+        unseen)."""
         c = self.cfg
-        gs = self.atlas.good_ids
+        gs = self.good_ids
         seen = self.seen[gs]
         n_seen = seen.sum()
         key = torch.where(seen, self.score[gs], -math.inf)
@@ -403,7 +1105,7 @@ class ScenarioSampler:
         c = self.cfg
         self.iteration = int(iteration)
         dev = self.device
-        n_seen = self.seen[self.atlas.good_ids].sum()
+        n_seen = self.seen[self.good_ids].sum()
         if c.replay and self.n_good:
             p_fresh = torch.where(n_seen >= c.min_seen, c.p_fresh, 1.0).double()
             p_r = self.replay_probs()
@@ -434,10 +1136,11 @@ class ScenarioSampler:
 
     @torch.no_grad()
     def observe(self, scenario: torch.Tensor, final_path: torch.Tensor, done: torch.Tensor,
-                src: Optional[torch.Tensor] = None):
+                src: Optional[torch.Tensor] = None, gen: Optional[torch.Tensor] = None):
         """Episode ends: scenario (B,) index, final_path (B,) mm (P_final), done (B,) bool,
-        src (B,) the draw source (statistics only). Updates the scores of the good
-        scenarios by scatter ops."""
+        src (B,) the draw source (statistics only), gen (B,) the pool slot generation
+        (ScenarioPool; unused here). Updates the scores of the good scenarios by scatter
+        ops."""
         a = self.cfg.alpha
         N = self.score.numel()
         good = self.good[scenario] & done
@@ -467,7 +1170,7 @@ class ScenarioSampler:
 
     def stats(self) -> Dict[str, float]:
         """Flat statistics (plr/...) of the current state and the iteration so far."""
-        gs = self.atlas.good_ids
+        gs = self.good_ids
         seen = self.seen[gs]
         n_seen = int(seen.sum())
         acc = self._acc.cpu()
@@ -519,12 +1222,279 @@ class ScenarioSampler:
         self.refresh(d["iteration"])
 
 
+# ── Continuous scenario pool ────────────────────────────────────────────────
+
+
+@dataclass
+class PoolConfig:
+    """ScenarioPool settings (module docstring)."""
+
+    size: int = 16384  # Slots; round(size x SamplerConfig.impossible_share) hold impossible ones
+    ranges: ContRanges = field(default_factory=ContRanges)
+    refresh_frac: float = 0.125  # Share of the good and of the impossible slots replaced per refresh
+    seed: int = 0  # Candidate stream (STREAM_POOL)
+    round_min: int = 1024  # Candidates per scan round: the expected need x 1.1, clamped
+    round_max: int = 1 << 16
+    max_candidates: int = 1 << 25  # Per fill; beyond: error (ranges without good scenarios)
+
+
+POOL_ROWS = ("candidates", "angle_rejected", "clipped", "missed", "valid", "good", "box_zero")
+
+
+class ScenarioPool(ScenarioSampler):
+    """Continuous scenario pool with PLR inside it, see the module docstring. Slots
+    [0, n_good) hold good scenarios, [n_good, size) impossible ones; atlas is the slot
+    table (an Atlas, params (size, 5)); slot_gen counts the replacements of each slot
+    (an episode scores its slot only if the slot was not replaced meanwhile), born the
+    iteration of the last fill."""
+
+    def __init__(self, cfg: Optional[PoolConfig] = None, sampler: Optional[SamplerConfig] = None,
+                 scan: Optional[AtlasConfig] = None, device: Optional[torch.device] = None,
+                 log=print):
+        self.pcfg = pc = cfg or PoolConfig()
+        sc = sampler or SamplerConfig()
+        assert sc.holdout_frac == 0, "no hold-out in the pool"
+        dev = torch.device(device) if device is not None else DEVICE
+        self.scanner = Scanner(scan or AtlasConfig(), dev)
+        self.log = log
+        N = pc.size
+        n_imp = int(round(N * sc.impossible_share)) if sc.impossible_share > 0 else 0
+        if sc.impossible_share > 0:
+            n_imp = max(n_imp, 1)
+        self.n_good_slots, self.n_imp_slots = N - n_imp, n_imp
+        assert self.n_good_slots > 0, "pool too small"
+        self.bins = cont_sep_bins(*pc.ranges.sep)
+        self.cursor = 0  # Next candidate of the stream
+        self.ptr = [0, 0]  # Oldest good / impossible slot (ring order)
+        self.filled_iter = 0
+        nb = len(self.bins)
+        # Lifetime counts over the used stream prefix, per separation bin (POOL_ROWS):
+        # candidates, angles out of bounds, clipped, missed, valid, good, valid with box
+        # cells without a hit
+        self.cum = np.zeros((len(POOL_ROWS), nb), dtype=np.int64)
+        _sync(dev)
+        t0 = time.perf_counter()
+        g, i, st = self._fill(self.n_good_slots, self.n_imp_slots)
+        d = {k: torch.cat((g[k], i[k])) for k in Atlas.TENSORS}
+        _sync(dev)
+        st["refresh_s"] = time.perf_counter() - t0
+        st["replaced"] = N
+        d.update(version=ATLAS_VERSION, key=self.key(), named={}, n_grid=N,
+                 build_s=st["refresh_s"], offgrid=None)
+        atlas = Atlas(d, dev, "pool")
+        assert bool(atlas.good[:self.n_good_slots].all()) and not bool(atlas.good[self.n_good_slots:].any())
+        self.slot_gen = torch.zeros(N, dtype=torch.long, device=dev)
+        self.born = torch.zeros(N, dtype=torch.long, device=dev)
+        self.last_fill = st
+        super().__init__(atlas, sc)
+        log(f"pool: {N} slots ({self.n_good_slots} good, {self.n_imp_slots} impossible), "
+            f"{pc.ranges.tag()} (laser pitch {pc.ranges.pitch}, yaw {pc.ranges.yaw} deg, offsets "
+            f"over r = {pc.ranges.offset_radius} mm), filled in {st['refresh_s']:.1f} s: "
+            + self._fill_text(st))
+
+    def key(self) -> Dict[str, Any]:
+        """Scan settings of the slot table (Atlas.check) and the pool settings."""
+        d = {k: v for k, v in self.scanner.cfg.key().items() if k not in ("sep", "pitch", "yaw", "named")}
+        d["pool"] = asdict(self.pcfg)
+        return d
+
+    @staticmethod
+    def _fill_text(st: Dict[str, float]) -> str:
+        return (f"{st['candidates']} candidates generated ({st['prefix']} used): angles out of "
+                f"bounds {100 * st['angle_rejected_share']:.1f} %, clipped "
+                f"{100 * st['clipped_share']:.1f} %, missed M2 {100 * st['missed_share']:.1f} %, "
+                f"valid {100 * st['valid_share']:.1f} %; {st['scans']} box scans; good "
+                f"{100 * st['good_share']:.1f} % of the valid; box cells without a hit in "
+                f"{100 * st['box_zero_share']:.2f} % of the valid")
+
+    # ── Filling ──
+
+    @torch.no_grad()
+    def _fill(self, k_g: int, k_i: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor],
+                                                  Dict[str, float]]:
+        """The next k_g good and k_i impossible valid scenarios of the candidate stream
+        (atlas fields, on the device) and the fill statistics (host syncs). Rounds of
+        candidates from the cursor (candidate_batch: angle bounds, beam check), box scan
+        of the valid ones only; the used prefix ends at the last scenario taken, the
+        cursor moves to its end (candidates scanned past it are read again by the next
+        fill)."""
+        pc, sc = self.pcfg, self.scanner
+        nb = len(self.bins)
+        need = [k_g, k_i]
+        taken: List[List[Dict[str, torch.Tensor]]] = [[], []]
+        cnt = np.zeros((len(POOL_ROWS), nb), dtype=np.int64)
+        scanned = scans = 0
+        while need[0] > 0 or need[1] > 0:
+            tot = (self.cum + cnt).sum(1)  # Running shares: lifetime and this fill
+            share_g = (tot[5] + 1.0) / (tot[0] + 2.0)
+            share_i = (tot[4] - tot[5] + 1.0) / (tot[0] + 2.0)
+            want = max(need[0] / share_g, need[1] / share_i)
+            n = int(min(max(math.ceil(1.1 * want), pc.round_min), pc.round_max))
+            b = candidate_batch(pc.ranges, pc.seed, self.cursor, n, STREAM_POOL, sc)
+            vid = np.nonzero(b["valid"])[0]
+            d = sc.scan(torch.from_numpy(b["params"][vid]), zero_cells=True)
+            scans += vid.size
+            good = d["good"]
+            end = n  # Used prefix of this round
+            lasts = []
+            for j, grp in enumerate((good, ~good)):
+                rows = torch.nonzero(grp).squeeze(1)[:need[j]]
+                if rows.numel():
+                    taken[j].append({k: v[rows] for k, v in d.items()})
+                    need[j] -= rows.numel()
+                    lasts.append(int(vid[int(rows[-1])]))
+            if need[0] == 0 and need[1] == 0:
+                end = max(lasts) + 1 if lasts else 0
+            # Stage counts over the used prefix of the round, per separation bin
+            band = sep_band(b["params"][:end, 0], self.bins)
+            vin = vid < end
+            bv = band[vid[vin]]
+            gv = good.cpu().numpy()[vin]
+            zv = (d["zero_cells"] > 0).cpu().numpy()[vin]
+            for row, sel in enumerate((np.ones(end, bool), ~b["angle_ok"][:end], b["clipped"][:end],
+                                       b["missed"][:end], b["valid"][:end])):
+                np.add.at(cnt[row], band[sel], 1)
+            np.add.at(cnt[5], bv[gv], 1)
+            np.add.at(cnt[6], bv[zv], 1)
+            self.cursor += end
+            scanned += n
+            if scanned > pc.max_candidates:
+                raise RuntimeError(f"pool: {scanned} candidates without filling {k_g} good / {k_i} "
+                                   f"impossible slots; check the ranges or the impossible share")
+        self.cum += cnt
+        tot = cnt.sum(1)
+        cat = lambda j: {k: torch.cat([t[k] for t in taken[j]]) for k in taken[j][0]} \
+            if taken[j] else {k: v[:0] for k, v in d.items()}
+        c0, cv = max(int(tot[0]), 1), max(int(tot[4]), 1)
+        st = {"candidates": scanned, "prefix": int(tot[0]), "valid": int(tot[4]), "scans": scans,
+              "angle_rejected_share": float(tot[1] / c0), "clipped_share": float(tot[2] / c0),
+              "missed_share": float(tot[3] / c0), "valid_share": float(tot[4] / c0),
+              "good_share": float(tot[5] / cv), "box_zero_share": float(tot[6] / cv)}
+        return cat(0), cat(1), st
+
+    @torch.no_grad()
+    def _replace(self, iteration: int):
+        """Refill the oldest refresh_frac of the good and of the impossible slots; their
+        scores reset, their generation increments (host syncs)."""
+        pc = self.pcfg
+        dev = self.device
+        ng, ni = self.n_good_slots, self.n_imp_slots
+        k_g = max(1, int(round(pc.refresh_frac * ng)))
+        k_i = max(1, int(round(pc.refresh_frac * ni))) if ni else 0
+        _sync(dev)
+        t0 = time.perf_counter()
+        g, i, st = self._fill(k_g, k_i)
+        sg = (self.ptr[0] + torch.arange(k_g, device=dev)) % ng
+        si = ng + (self.ptr[1] + torch.arange(k_i, device=dev)) % max(ni, 1)
+        slots = torch.cat((sg, si))
+        at = self.atlas
+        for k in Atlas.TENSORS:
+            getattr(at, k)[slots] = torch.cat((g[k], i[k])).to(getattr(at, k).dtype)
+        self.pmax[slots] = at.pmax[slots].clamp(min=1e-6)
+        self.score[slots] = 0.0
+        self.seen[slots] = False
+        self.last[slots] = iteration
+        self.visits[slots] = 0
+        self.slot_gen[slots] += 1
+        self.born[slots] = iteration
+        self.ptr = [(self.ptr[0] + k_g) % ng, (self.ptr[1] + k_i) % max(ni, 1)]
+        self.filled_iter = iteration
+        _sync(dev)
+        st["refresh_s"] = time.perf_counter() - t0
+        st["replaced"] = k_g + k_i
+        self.last_fill = st
+
+    @torch.no_grad()
+    def refresh(self, iteration: int):
+        """Once per iteration: at a new iteration, replace the oldest refresh_frac of the
+        slots with freshly scanned scenarios (host syncs), then recompute the draw
+        distribution (ScenarioSampler.refresh)."""
+        if iteration > self.filled_iter and self.pcfg.refresh_frac > 0:
+            self._replace(iteration)
+        super().refresh(iteration)
+
+    @torch.no_grad()
+    def observe(self, scenario: torch.Tensor, final_path: torch.Tensor, done: torch.Tensor,
+                src: Optional[torch.Tensor] = None, gen: Optional[torch.Tensor] = None):
+        """ScenarioSampler.observe for episodes whose slot still holds their scenario
+        (gen (B,) = the slot generation at the draw; None: all)."""
+        if gen is not None:
+            done = done & (gen == self.slot_gen[scenario])
+        super().observe(scenario, final_path, done, src)
+
+    # ── Logging (host syncs) ──
+
+    def stats(self) -> Dict[str, float]:
+        """ScenarioSampler.stats plus the top scenario's laser offsets and pool/...: the
+        last fill (time, slots replaced, candidates generated / used, box scans, per stage: angles
+        out of bounds, clipped, missed M2, valid (box-scanned) shares of the candidates,
+        good share and box-check disagreement of the valid ones), lifetime good share of
+        the valid candidates and valid share per separation bin, the separation
+        histogram of the good slots, mean slot age."""
+        out = super().stats()
+        out["plr/top_laser_dx"] = out["plr/top_laser_dy"] = math.nan
+        p = self.p_replay
+        if p.numel() and float(p.sum()) > 0:
+            prm = self.atlas.params[int(self.good_ids[int(p.argmax())])].tolist()
+            out["plr/top_laser_dx"], out["plr/top_laser_dy"] = prm[3], prm[4]
+        lf = self.last_fill
+        out.update({f"pool/{k}": float(lf[k]) for k in (
+            "refresh_s", "replaced", "candidates", "prefix", "valid", "scans", "angle_rejected_share",
+            "clipped_share", "missed_share", "valid_share", "good_share", "box_zero_share")})
+        c = self.cum
+        sep = self.atlas.params[:self.n_good_slots, 0]
+        for j, (lo, hi) in enumerate(self.bins):
+            nm = f"sep{lo:g}-{hi:g}"
+            out[f"pool/good_share_{nm}"] = float(c[5, j] / c[4, j]) if c[4, j] else math.nan
+            out[f"pool/valid_share_{nm}"] = float(c[4, j] / c[0, j]) if c[0, j] else math.nan
+        for nm, m in sep_bin_masks(sep, self.bins).items():
+            out[f"pool/hist_{nm}"] = float(m.float().mean())
+        out["pool/age_mean"] = float((self.iteration - self.born).double().mean())
+        return out
+
+    # ── Checkpoint ──
+
+    def state_dict(self) -> Dict[str, Any]:
+        d = super().state_dict()
+        d.update(pool={k: getattr(self.atlas, k) for k in Atlas.TENSORS}, slot_gen=self.slot_gen,
+                 born=self.born, cursor=self.cursor, ptr=list(self.ptr),
+                 filled_iter=self.filled_iter, cum=self.cum.copy(), last_fill=dict(self.last_fill),
+                 pool_cfg=asdict(self.pcfg))
+        return d
+
+    def load_state_dict(self, d: Dict[str, Any]):
+        dev = self.device
+        assert d["pool_cfg"] == asdict(self.pcfg), "pool settings differ from the checkpoint"
+        for k in Atlas.TENSORS:
+            getattr(self.atlas, k).copy_(d["pool"][k].to(dev))
+        self.pmax = self.atlas.pmax.clamp(min=1e-6)
+        self.slot_gen, self.born = d["slot_gen"].to(dev), d["born"].to(dev)
+        self.cursor, self.ptr, self.filled_iter = int(d["cursor"]), list(d["ptr"]), int(d["filled_iter"])
+        self.cum = np.array(d["cum"], dtype=np.int64)
+        self.last_fill = dict(d["last_fill"])
+        super().load_state_dict(d)
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 
+def table_summary(st: Dict[str, Any], label: str) -> str:
+    """One block of table_stats(...) as text."""
+    lines = [f"{label}: {st['n']} scenarios, good {st['good']} ({100 * st['good_share']:.1f} %); "
+             f"good P_max (m) mean {st['pmax_m_mean']:.2f}, q10 / q50 / q90 {st['pmax_m_q10']:.2f} / "
+             f"{st['pmax_m_q50']:.2f} / {st['pmax_m_q90']:.2f}; P_max at the cap "
+             f"{100 * st['pmax_cap_share']:.1f} % of good; box cells at the cap "
+             f"{100 * st['cap_cells_share']:.2f} % (good {100 * st['cap_cells_share_good']:.2f} %)"]
+    for name, b in st["sep_bins"].items():
+        lines.append(f"  {name} mm: {b['n']} scenarios, good {100 * b['good_share']:.1f} %, "
+                     f"good P_max q50 {b['pmax_m_q50']:.2f} m, at cap {100 * b['pmax_cap_share']:.1f} %")
+    return "\n".join(lines)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Scenario atlas (build / summary)")
-    ap.add_argument("cmd", choices=("build", "summary"))
+    ap = argparse.ArgumentParser(description="Scenario atlas (build / summary) and the off-grid "
+                                             "eval tables (offgrid)")
+    ap.add_argument("cmd", choices=("build", "summary", "offgrid", "cont"))
     ap.add_argument("--atlas", default=DEFAULT_ATLAS, help="Atlas file")
     d = AtlasConfig()
     ap.add_argument("--sep", type=float, nargs=3, default=list(d.sep), metavar=("LO", "HI", "STEP"))
@@ -533,7 +1503,52 @@ def main():
     ap.add_argument("--no-named", action="store_true", help="Do not add geometry.SETUPS")
     ap.add_argument("--chunk-states", type=int, default=d.chunk_states)
     ap.add_argument("--force", action="store_true", help="Rebuild an existing file")
+    o = OffgridConfig()
+    ap.add_argument("--kinds", default=",".join(TABLE_KINDS),
+                    help="offgrid: tables to build / summarize (" + ", ".join(TABLE_KINDS) + ")")
+    ap.add_argument("--tables-dir", default=EVAL_TABLES_DIR, help="offgrid: <dir>/<kind>_v1.pt")
+    ap.add_argument("--n", type=int, default=o.n, help="offgrid: eval episodes (one per scenario)")
+    ap.add_argument("--impossible", type=float, default=o.impossible_share)
+    ap.add_argument("--seed", type=int, default=o.seed)
+    r = ContRanges()
+    ap.add_argument("--sep-range", type=float, nargs=2, default=list(r.sep), metavar=("MIN", "MAX"),
+                    help="cont: separation range (mm)")
+    ap.add_argument("--laser-range", type=float, nargs=2, default=list(r.pitch),
+                    metavar=("MIN", "MAX"), help="cont: laser pitch and yaw range (deg)")
+    ap.add_argument("--laser-offset-radius", type=float, default=r.offset_radius,
+                    help="cont: laser offset disk radius (mm); 0 = the measured offsets")
+    ap.add_argument("--laser-mode", choices=("landing", "angle"), default=r.mode,
+                    help="cont: laser angles from a uniform M2 landing point, or uniform")
     args = ap.parse_args()
+    if args.cmd == "cont":
+        ccfg = ContConfig(ranges=cont_ranges(args.sep_range, args.laser_range,
+                                             args.laser_offset_radius, args.laser_mode),
+                          n=args.n, impossible_share=args.impossible, seed=args.seed)
+        path = cont_table_path(ccfg, args.tables_dir)
+        if args.force and os.path.exists(path):
+            os.remove(path)
+        t = load_or_build_cont(path, ccfg)
+        bins = cont_sep_bins(*ccfg.ranges.sep)
+        print(table_summary(table_stats(t, bins=bins), f"cont ({path})"))
+        b = t.offgrid
+        print(f"  candidates {b['candidates']} (generated {b['scanned']}): angles out of bounds "
+              f"{100 * b['angle_rejected'] / b['candidates']:.1f} %, clipped "
+              f"{100 * b['clipped'] / b['candidates']:.1f} %, missed M2 "
+              f"{100 * b['missed'] / b['candidates']:.1f} %, valid {b['valid']}; valid with box "
+              f"cells without a hit {b['box_zero_cells']}")
+        return
+    if args.cmd == "offgrid":
+        grid = load_atlas(args.atlas)
+        cfg = atlas_config(grid)
+        print(table_summary(table_stats(grid), "grid"))
+        for kind in args.kinds.split(","):
+            path = table_path(kind, args.tables_dir)
+            if args.force and os.path.exists(path):
+                os.remove(path)
+            t = load_or_build_offgrid(path, cfg, OffgridConfig(
+                kind=kind, n=args.n, impossible_share=args.impossible, seed=args.seed))
+            print(table_summary(table_stats(t, bins=TABLE_SEP_BINS[kind]), f"{kind} ({path})"))
+        return
     if args.cmd == "build":
         if os.path.exists(args.atlas) and not args.force:
             raise SystemExit(f"{args.atlas} exists (--force to rebuild)")

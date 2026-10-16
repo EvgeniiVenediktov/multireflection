@@ -183,6 +183,38 @@ four-setup encoder does not transfer (in-distribution recall 0.078 vs 0.825, cou
 0.187 vs 0.999, tilt probe RMSE 0.54 vs 0.09 deg), so the run trains it from the start
 (`--unfreeze-at 0 --encoder-lr-scale 0.1`).
 
+**Unseen-scenario evaluation (2026-10-16):** the "full" set draws from the training grid,
+so it is in-distribution only. Added: off-grid eval tables (`scenarios.py offgrid`;
+`runs/eval_sets/<kind>_v1.pt`): `offgrid` = midpoints between grid points in all three
+parameters (interpolation), `extrap_short` / `extrap_long` = separation 20-49 / 201-350 mm
+(extrapolation); 4096 episodes each, one per scenario, 90 / 10 good / impossible. `ppo.py`
+evaluates them by default in full mode (`eval_offgrid/`, `eval_extrap_short/`,
+`eval_extrap_long/`; `--no-eval-offgrid`, `--no-eval-extrap`) and can hold out a seeded,
+stratified share of the grid (`--holdout-frac`, `--holdout-seed`; `eval_holdout/`, never
+drawn by the sampler). `eval_policy.py` (`cluster/eval_l40s.slurm`) evaluates any
+checkpoint. Run 4407578 best.pt (`reports/eval_4407578_best.md`), argmax: full 93.9 % of the
+oracle, offgrid 63.8 %, extrap_short 39.8 %, extrap_long -46 % (wanders, stops in 37 %).
+Off-grid the tilt and scenario heads are as accurate as on the grid at the first frame;
+the path head (P / P_ref) is not, episodes get 3x longer and the stop rate drops. A one-off
+check (1024 grid scenarios shifted off the grid) puts the loss on separation: laser tilt
++0.125 deg costs ~2 points of % oracle, separation +0.5 or +1 mm ~30; between neighbouring
+grid separations (2 mm) only 9 % of the scenarios keep their plateau order and the P_max
+tilt moves by a median 0.6 deg (laser +0.25 deg: 89 %, 0.2 deg). The 2 mm separation grid
+undersamples the landscape, which suggests drawing separation continuously (or on a much
+finer grid) in the next run.
+
+**Implemented (2026-10-16), continuous scenarios (D7):** `scenarios.py` ContRanges (5D
+scenario, constructive laser angles), `sample_valid_scenarios` / `candidate_batch` (the one
+generator: seeded streams, angle bounds, 1-bounce beam check before any box scan),
+`Scanner`, `ScenarioPool` (16,384 slots, 1/8 rescanned per iteration, PLR per slot with
+generation-checked scores), the continuous eval table (`scenarios.py cont`);
+`AlignEnv(cfg, pool=...)` with per-env copies of parameters / P_ref / slot generation;
+5-parameter scenario head (re-initialized on `--init-from` when the normalization
+changes); `ppo.py --scenarios pool --sep-range --laser-range --laser-offset-radius
+--laser-mode --pool-size --pool-refresh` (default for `--setups full`), `eval_cont/`
+(best.pt), the grid sets kept as fixed benchmarks; `pretrain_encoder.py --init` (fine-tune)
+with continuous scenarios, `eval_encoder.py` per separation bin; tests `tests/test_pool.py`.
+
 ## Decisions (2026-10-15)
 
 - **D1 - trapped beams: bounce cap, default 128.** A 0.001 deg scan around the 89 island
@@ -217,3 +249,42 @@ four-setup encoder does not transfer (in-distribution recall 0.078 vs 0.825, cou
   best path. Setup-blind homing drops to 32 % of the oracle.
 - **D6 - encoder: CNN with spatial-softmax keypoints** (benchmark above); ViT revisited only
   with longer training and oversampled rare patterns.
+- **D7 - continuous scenarios, separation 20-400 mm** (2026-10-16). Run 4407578 trained
+  on the grid (separation 50-200 mm step 2, laser pitch / yaw 0-8 deg step 0.25): 93.9 % of
+  the oracle on grid scenarios, 63.8 % on off-grid midpoints. Shifting separation by
+  0.5 mm costs 30 points (laser shifts 1-2); between neighbouring 2 mm separations only
+  9 % of the scenarios keep their plateau order and the best tilt moves a median 0.6 deg:
+  the policy memorized grid-specific targets (`reports/eval_4407578_best.md`). Decision:
+  - no grid: scenarios drawn continuously, separation 20-400 mm (400 = 2 R, the
+    concentric stability limit of the ROC 200 mm mirrors);
+  - scenario = (separation, laser pitch, laser yaw, laser dx, laser dy): laser offset
+    uniform over the M1 hole disk (|offset| < 1.5 mm, around the hole centre; radius 0 =
+    the measured 0.75, 1.04 mm), laser angles -8..8 deg on both axes (a check at
+    50-200 mm, 600 scenarios per quadrant: good shares pitch+ / yaw+ 31.8 %, + / - 35.5 %,
+    - / + 4.0 %, - / - 13.0 %);
+  - laser angles constructive: the M2 landing point at zero M2 tilt uniform over the
+    aperture minus 0.5 mm, pitch / yaw derived from the laser origin (5 mm behind M1) and
+    that point, rejected beyond +-8 deg; the useful angle range shrinks with separation by
+    construction (valid |pitch| / |yaw| q90: 6.5 / 6.7 deg at 20-50 mm, 3.9 / 2.4 at
+    200-250, 2.3 / 1.5 at 350-400). Uniform angles stay selectable (`--laser-mode angle`);
+  - validity before any box scan (1-bounce sim at the box centre, exact): the beam must
+    pass the M1 hole (not clipped by the back of M1 at the hole edge) and hit M2;
+    invalid candidates are discarded and redrawn, they are not "impossible" (= valid,
+    P_max < 20 x separation); 90 / 10 good / impossible among the valid ones;
+  - candidate sample (12,288, constructive): angles out of bounds 11 %, clipped 8.3 %,
+    missed 0, valid 80.7 %, good 46.6 % of the valid; good share of the valid per
+    separation band 20-50 / 50-100 / ... / 350-400 mm: 59.5 / 55.0 / 59.1 / 58.7 / 59.2 /
+    51.5 / 33.4 / 13.6 %; good slots per band 2.6 / 10.3 / 17.9 / 18.2 / 18.7 / 16.4 / 11.4
+    / 4.4 % (short separations are rare: 75 % of the 20-50 mm candidates need more than
+    8 deg). Uniform angles: valid 23.8 % (clipped 23.7 %, missed 52.4 %), good slots 24.8 %
+    at 20-50 mm and 0.5 % at 350-400 mm;
+  - near the limits the sim is finite (no NaN / inf, bounces within the cap): at 20 mm
+    the cap binds (128 bounces, P_max up to 2.58 m, 2.5 % of the box at the cap); at
+    380-400 mm 95.6 % of the candidates are valid but only 5.4 % good, P_max q50 2.3 m
+    (median best pattern 6 bounces), 95 % of the box blind (<= 2 bounces), the good ones
+    long (P_max q50 14.4 m, 37 bounces);
+  - training: the scenario pool (16,384 slots, 1/8 rescanned per iteration, PLR within
+    it: beta 1.0, rho 0.1, p_fresh 0.3), scenario head on the five parameters; eval
+    `eval_cont/` (4096 seeded continuous scenarios, best.pt) plus the grid sets of run
+    4407578 as fixed benchmarks; the encoder fine-tuned from the grid encoder on 16,384
+    continuous scenarios (8k steps, lr 3e-4); transformer and heads from 4407578.

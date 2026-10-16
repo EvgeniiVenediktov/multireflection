@@ -9,9 +9,31 @@ Run from rl/:
     uv run python pretrain_encoder.py --arch vit --patch 8 --seed 0
     uv run python pretrain_encoder.py --arch vit --patch 4 --seed 0
     uv run python pretrain_encoder.py --arch cnn --steps 8000 --setups all   # 4 setups
+    uv run python pretrain_encoder.py --scenarios 16384                      # grid scenarios
+    uv run python pretrain_encoder.py --init <run>/model.pt --scenarios 16384 \
+        --sep-range 20 400 --laser-range -8 8                    # fine-tune, continuous (D7)
 Outputs in runs/encoder/<name>/ (or <--runs-dir>/<name>/): config.json, train.csv,
 val.csv, model.pt.
 Evaluation: eval_encoder.py.
+
+Data: --setups measured / all (the four geometry.SETUPS); --scenarios N: N scenarios plus
+the four named setups, from the atlas grid (scenarios.sample_grid; run name _grid<N>) or,
+with --sep-range, continuous (D7: scenarios.sample_valid_scenarios over scenarios.ContRanges:
+separation --sep-range, laser pitch / yaw --laser-range, laser offset uniform over the M1
+hole disk of --laser-offset-radius; only beams that reach M2; run name _<ranges tag>x<N>,
+e.g. _cont20-400x16384; laser angles from a uniform M2 landing point by default,
+--laser-mode angle for uniform angles; no laser-offset jitter, the offsets already cover
+the hole disk); --scenario-seed seeds the scenarios (eval_encoder.py holds out another
+seed).
+
+Fine-tuning (--init PATH): model config and weights from a pretrain_encoder.py checkpoint
+(encoder and the map / count / ellipse heads, every tensor whose name and shape match;
+skipped and missing tensors are printed and kept in config.json and model.pt), the
+outputs equal the source's before the first step; fresh optimizer. Defaults then: peak lr
+3e-4 (CNN; ViT 1.5e-4, 0.3 x the from-scratch values), warmup 100 steps, 8000 steps
+(cosine to 1 %): a third of the from-scratch peak keeps the start close to the source
+while 8k steps of new-range frames (half the source run's 16k) adapt it. Run name
+_ft-<origin>, origin = the source run's data marker (e.g. _ft-grid16384_cont20-400x16384).
 
 Loss = w_map L_map + w_count L_count + w_ell L_ell:
     L_map    peak-weighted MSE on the square-root spot map,
@@ -31,9 +53,10 @@ import csv
 import json
 import math
 import os
+import re
 import time
 from dataclasses import asdict
-from typing import Dict
+from typing import Any, Dict
 
 import torch
 import torch.nn.functional as F
@@ -96,6 +119,46 @@ def lr_factor(step: int, warmup: int, total: int, min_ratio: float = 0.01) -> fl
     return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
 
 
+# ── Fine-tuning init ────────────────────────────────────────────────────────
+
+
+def load_init(path: str) -> Dict[str, Any]:
+    """A pretrain_encoder.py checkpoint (CPU tensors)."""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def init_config(ck: Dict[str, Any]) -> EncoderConfig:
+    """EncoderConfig of a pretrain_encoder.py checkpoint."""
+    return EncoderConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in ck["cfg"].items()})
+
+
+def init_model(model: FrameModel, ck: Dict[str, Any], path: str = "") -> Dict[str, Any]:
+    """Load every tensor of the checkpoint ck whose name and shape match into model
+    (encoder and heads); returns the info: path, name, step, loaded, skipped (with the
+    reason), missing (model tensors not in the checkpoint)."""
+    own = model.state_dict()
+    sd, loaded, skipped = {}, [], {}
+    for k, v in ck["model"].items():
+        if k not in own:
+            skipped[k] = "not in the model"
+        elif tuple(own[k].shape) != tuple(v.shape):
+            skipped[k] = f"shape {tuple(v.shape)} != {tuple(own[k].shape)}"
+        else:
+            sd[k] = v
+            loaded.append(k)
+    missing = sorted(k for k in own if k not in sd)
+    model.load_state_dict({**own, **sd})
+    return {"path": os.path.abspath(path) if path else "", "name": ck.get("name"),
+            "step": ck.get("step"), "loaded": len(loaded), "skipped": skipped, "missing": missing}
+
+
+def init_origin(name: str) -> str:
+    """Data marker of a source run name (after _s<seed>_, '_' -> '-'), e.g. grid16384,
+    set4; meas for a measured-cell run."""
+    m = re.search(r"_s\d+_(.+)$", name or "")
+    return m.group(1).replace("_", "-") if m else "meas"
+
+
 # ── Validation ──────────────────────────────────────────────────────────────
 
 
@@ -125,11 +188,14 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--arch", choices=("cnn", "vit"), default="cnn")
     ap.add_argument("--patch", type=int, default=8, help="ViT patch size (4 or 8)")
-    ap.add_argument("--steps", type=int, default=6000)
+    ap.add_argument("--steps", type=int, default=None, help="Default 6000 (--init: 8000)")
     ap.add_argument("--batch", type=int, default=256)
-    ap.add_argument("--lr", type=float, default=None, help="Peak LR (default cnn 1e-3, vit 5e-4)")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="Peak LR (default cnn 1e-3, vit 5e-4; --init: cnn 3e-4, vit 1.5e-4)")
     ap.add_argument("--wd", type=float, default=0.05)
-    ap.add_argument("--warmup", type=int, default=300)
+    ap.add_argument("--warmup", type=int, default=None, help="Default 300 (--init: 100)")
+    ap.add_argument("--init", default="", help="Fine-tune from this pretrain_encoder.py "
+                    "checkpoint (model config and weights)")
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--w-map", type=float, default=1.0)
     ap.add_argument("--w-count", type=float, default=0.1)
@@ -140,8 +206,20 @@ def parse_args() -> argparse.Namespace:
                          "(uniform; run name suffix _set4)")
     ap.add_argument("--scenarios", type=int, default=0,
                     help="Frames of this many scenarios sampled uniformly from the atlas grid "
-                         "plus the four named setups (overrides --setups); 0 = --setups")
+                         "(or continuously with --sep-range) plus the four named setups "
+                         "(overrides --setups); 0 = --setups")
     ap.add_argument("--scenario-seed", type=int, default=0)
+    ap.add_argument("--sep-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+                    help="--scenarios: continuous scenarios with this separation range (mm) "
+                         "instead of grid points")
+    ap.add_argument("--laser-range", type=float, nargs=2, default=[-8.0, 8.0],
+                    metavar=("MIN", "MAX"), help="Continuous: laser pitch and yaw range (deg)")
+    ap.add_argument("--laser-offset-radius", type=float, default=1.5,
+                    help="Continuous: laser offset disk radius around the hole centre (mm); "
+                         "0 = the measured offsets")
+    ap.add_argument("--laser-mode", choices=("landing", "angle"), default="landing",
+                    help="Continuous: laser angles from a uniform M2 landing point (bounded by "
+                         "--laser-range) or uniform in angle")
     ap.add_argument("--no-amp", action="store_true", help="fp32 instead of bf16 autocast")
     ap.add_argument("--no-compile", action="store_true", help="eager model (no torch.compile)")
     ap.add_argument("--log-every", type=int, default=25)
@@ -153,13 +231,30 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def run_name(args: argparse.Namespace, cfg: EncoderConfig) -> str:
-    """Display / directory name from the key config, built at start."""
+def cont_ranges_of(args: argparse.Namespace):
+    """scenarios.ContRanges of the continuous mode (--sep-range given), else None."""
+    if args.scenarios <= 0 or args.sep_range is None:
+        return None
+    from scenarios import cont_ranges
+
+    return cont_ranges(args.sep_range, args.laser_range, args.laser_offset_radius,
+                       args.laser_mode)
+
+
+def run_name(args: argparse.Namespace, cfg: EncoderConfig, init_name: str = "") -> str:
+    """Display / directory name from the key config, built at start:
+    <model>_w<width>_lr<lr>_b<batch>_<steps>_s<seed>[_ft-<origin>][_<data>][_<tag>], data
+    grid<N>, <ranges tag>x<N> (continuous) or set4; _ft-<origin> with --init."""
     k = args.steps / 1000
     steps = f"{k:g}k" if args.steps >= 1000 else str(args.steps)
     name = f"{model_name(cfg)}_w{cfg.width if cfg.arch == 'vit' else cfg.cnn_widths[-1]}" \
            f"_lr{args.lr:g}_b{args.batch}_{steps}_s{args.seed}"
-    if args.scenarios > 0:
+    if args.init:
+        name += f"_ft-{init_origin(init_name)}"
+    rng = cont_ranges_of(args)
+    if rng is not None:
+        name += f"_{rng.tag()}x{args.scenarios}"
+    elif args.scenarios > 0:
         name += f"_grid{args.scenarios}"
     elif args.setups == "all":
         name += f"_set{len(SETUPS)}"
@@ -177,25 +272,58 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(args.seed)
+    ck_init = load_init(args.init) if args.init else None
+    if ck_init is not None:
+        cfg = init_config(ck_init)
+        if cfg.arch != args.arch or (cfg.arch == "vit" and cfg.patch != args.patch):
+            print(f"--init: model config from the checkpoint ({model_name(cfg)}), not --arch "
+                  f"{args.arch}", flush=True)
+        args.arch = cfg.arch
+    else:
+        cfg = EncoderConfig(arch=args.arch, patch=args.patch)
+    ft = ck_init is not None
     if args.lr is None:
-        args.lr = 1e-3 if args.arch == "cnn" else 5e-4
-    cfg = EncoderConfig(arch=args.arch, patch=args.patch)
-    name = run_name(args, cfg)
+        args.lr = (3e-4 if ft else 1e-3) if args.arch == "cnn" else (1.5e-4 if ft else 5e-4)
+    if args.steps is None:
+        args.steps = 8000 if ft else 6000
+    if args.warmup is None:
+        args.warmup = 100 if ft else 300
+    name = run_name(args, cfg, ck_init.get("name", "") if ft else "")
     run_dir = os.path.join(args.runs_dir, name)
     os.makedirs(run_dir, exist_ok=True)
 
+    data_info: Dict[str, Any] = {}
     if args.scenarios > 0:
         from dataclasses import replace
 
-        from find_setups import setup_geometry
-        from scenarios import sample_grid
+        rng = cont_ranges_of(args)
+        if rng is not None:
+            from scenarios import sample_valid_scenarios, scenario_geometry
 
-        pts = sample_grid(args.scenarios, args.scenario_seed)
-        setups = tuple(SETUPS) + tuple(setup_geometry(*p) for p in pts)
+            pts, rej = sample_valid_scenarios(args.scenarios, rng, args.scenario_seed, device=dev)
+            setups = tuple(SETUPS) + tuple(scenario_geometry(p) for p in pts)
+            stages = {k: v for k, v in rej.items() if k not in ("positions", "next")}
+            data_info = {"ranges": asdict(rng), "scenarios": args.scenarios,
+                         "scenario_seed": args.scenario_seed, "stages": stages}
+            kind = (f"continuous scenarios ({rng.tag()}, {rng.mode} mode, laser bounds "
+                    f"{rng.pitch} deg, offsets r {rng.offset_radius} mm; {rej['candidates']} "
+                    f"candidates: angles out of bounds "
+                    f"{100 * rej['angle_rejected'] / rej['candidates']:.1f} %, clipped "
+                    f"{100 * rej['clipped'] / rej['candidates']:.1f} %, missed M2 "
+                    f"{100 * rej['missed'] / rej['candidates']:.1f} %)")
+        else:
+            from find_setups import setup_geometry
+            from scenarios import sample_grid
+
+            pts = sample_grid(args.scenarios, args.scenario_seed)
+            setups = tuple(SETUPS) + tuple(setup_geometry(*p) for p in pts)
+            kind = "grid scenarios"
+        # Continuous offsets cover the hole disk: no offset jitter (it would leave the disk)
+        jit = {"jitter_laser_offset": 0.0} if rng is not None and rng.offset_radius > 0 else {}
         data = FrameData(replace(data_config("measured", args.batch), setups=setups,
-                                 scan_step=0.05), dev)
-        print(f"{args.scenarios} grid scenarios (seed {args.scenario_seed}) + {len(SETUPS)} "
-              f"named setups; {int((data.cell_count == 0).sum())} without >= 4 bounce cells")
+                                 scan_step=0.05, **jit), dev)
+        print(f"{args.scenarios} {kind} (seed {args.scenario_seed}) + {len(SETUPS)} named "
+              f"setups; {int((data.cell_count == 0).sum())} without >= 4 bounce cells", flush=True)
     else:
         data = FrameData(data_config(args.setups, args.batch), dev)
     gen = torch.Generator(device=dev)
@@ -203,6 +331,13 @@ def main():
     val = data.eval_set(args.val_n, VAL_SEED)
 
     model = FrameModel(cfg).to(dev)
+    init_info = None
+    if ft:
+        init_info = init_model(model, ck_init, args.init)
+        print(f"init from {init_info['path']} ({init_info['name']}, step {init_info['step']}): "
+              f"{init_info['loaded']} tensors loaded; skipped {sorted(init_info['skipped'])}; "
+              f"missing {init_info['missing']}", flush=True)
+        del ck_init
     fwd = model if args.no_compile else torch.compile(model)
     opt = torch.optim.AdamW(param_groups(model, args.wd), lr=args.lr, betas=(0.9, 0.95), fused=True)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_factor(s, args.warmup, args.steps))
@@ -212,7 +347,8 @@ def main():
             "data": {"batch_size": args.batch, "cell_frac": data.cfg.cell_frac,
                      "n_cells": int(data.cells.shape[0]),
                      "setups": [g.name for g in data.setups],
-                     "n_cells_per_setup": data.cell_count.tolist()}}
+                     "n_cells_per_setup": data.cell_count.tolist(), **data_info},
+            "init": init_info}
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(info, f, indent=1)
     print(f"{name}: encoder {n_enc / 1e6:.2f} M params, heads {n_heads / 1e6:.2f} M -> {run_dir}")
@@ -278,7 +414,8 @@ def main():
                   f"count {v['count']:.3f} (acc {v['count_acc']:.3f}) ell {v['ellipse']:.4f}  "
                   f"skipped {skipped}", flush=True)
             torch.save({"cfg": asdict(cfg), "model": model.state_dict(), "step": step,
-                        "name": name, "data_setups": [g.name for g in data.setups]},
+                        "name": name, "data_setups": [g.name for g in data.setups],
+                        "data": data_info, "init": init_info},
                        os.path.join(run_dir, "model.pt"))
 
     elapsed = time.time() - t0

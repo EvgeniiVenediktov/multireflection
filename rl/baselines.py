@@ -196,7 +196,7 @@ class OraclePlan:
 def sim_tilts(env: AlignEnv, tilts: torch.Tensor, setups: Optional[torch.Tensor] = None,
               params: Optional[torch.Tensor] = None) -> dict:
     """Sim of (n, 2) controlled tilts of setups (n,) (default 0), the env's states, or
-    of explicit scenario params (n, 3) (env.scenario_states); no per-hit outputs."""
+    of explicit scenario params (n, 3 | 5) (env.scenario_states); no per-hit outputs."""
     st = env.states(tilts, setups) if params is None else env.scenario_states(tilts, params)
     return env.sim.simulate(st, store_world=False, store_hits=False)
 
@@ -274,7 +274,7 @@ def plan_oracle(
 ) -> OraclePlan:
     """Exact best clamp-free plan per (initial tilt, setup), see the module docstring.
     setups (n,): default 0; the value uses each episode's P_ref. Any scenario instead:
-    scenarios (n, 3) explicit (separation, laser pitch, laser yaw) per episode (every
+    scenarios (n, 3 | 5) explicit (separation, laser pitch, laser yaw[, dx, dy]) per episode (every
     other DOF as the env's setup 0) with path_ref (n,) their P_ref; setups is then only
     recorded in the plan."""
     dev = env.device
@@ -290,7 +290,8 @@ def plan_oracle(
     setups = (torch.zeros(n, dtype=torch.long, device=dev) if setups is None
               else setups.to(device=dev, dtype=torch.long))
     if scenarios is not None:
-        assert path_ref is not None and path_ref.shape[0] == n and scenarios.shape == (n, 3)
+        assert path_ref is not None and path_ref.shape[0] == n and scenarios.shape[0] == n
+        assert scenarios.shape[1] in (3, 5), "scenario parameters (n, 3) or (n, 5)"
         scen = scenarios.to(device=dev, dtype=torch.float32)
         pref = path_ref.to(device=dev).double()
         single = False

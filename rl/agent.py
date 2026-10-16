@@ -22,9 +22,12 @@ agent.py - Policy network: frame encoder, causal transformer over the last K ste
                value   in the trainer's normalized units (ppo.ValueNorm)
                path    P_t / P_ref of the current frame (path head, P6)
                tilt    current controlled tilt / tilt_scale: mean and log-variance (2 + 2)
-               scenario  (separation, laser pitch, laser yaw), each mapped to [-1, 1] over
-                       the atlas range (scen_lo, scen_hi): mean and log-variance (3 + 3),
-                       Gaussian NLL (stage 2; replaces the 4-way setup head)
+               scenario  (separation, laser pitch, laser yaw[, laser dx, laser dy]), each
+                       mapped to [-1, 1] over the training range (scen_lo, scen_hi; 3
+                       entries: the atlas grid, 5: the continuous pool with laser offsets):
+                       mean and log-variance (n + n), Gaussian NLL (stage 2; replaces the
+                       4-way setup head); targets are the first n columns of the env's
+                       scenario parameters (env.SCEN_NAMES)
 
 Two call paths compute the same function of the same inputs:
     act()               rollout: per env a Ring of the last K (z, a, valid, frame); only
@@ -36,7 +39,9 @@ Window mask from the sequence: position q is visible to the window ending at p i
 a frame (real) and no episode starts in (q, p] (first flags; cumulative segment ids).
 
 init_from(path): weights of a previous PPO checkpoint (ppo.py latest.pt / best.pt) where
-names and shapes match; the rest keeps its fresh initialization and is reported.
+names and shapes match; the rest keeps its fresh initialization and is reported. A
+checkpoint whose scenario-head normalization (agent_cfg scen_lo / scen_hi) differs from
+this agent's leaves the scenario head re-initialized (skipped, reported).
 """
 
 import functools
@@ -70,8 +75,8 @@ class AgentConfig:
     n_bins: int = 11  # Ladder steps per axis (env.n_bins)
     policy_init_scale: float = 0.01  # Last policy layer weights x this, bias 0
     tilt_scale: float = 2.0  # deg; tilt labels are divided by this (the mount limit)
-    scen_lo: Tuple[float, float, float] = (50.0, 0.0, 0.0)  # Atlas range: mm, deg, deg
-    scen_hi: Tuple[float, float, float] = (200.0, 8.0, 8.0)
+    scen_lo: Tuple[float, ...] = (50.0, 0.0, 0.0)  # Atlas range: mm, deg, deg[, mm, mm]
+    scen_hi: Tuple[float, ...] = (200.0, 8.0, 8.0)
     logvar_min: float = -12.0
     logvar_max: float = 4.0
     amp: bool = True  # bf16 autocast for encoder, token and core (heads in fp32)
@@ -242,7 +247,9 @@ class Agent(nn.Module):
         self.v = _mlp(c.d_model, hid, 1)
         self.path = _mlp(c.d_model, hid, 1)
         self.tilt = _mlp(c.d_model, hid, 4)
-        self.scenario = _mlp(c.d_model, hid, 6)
+        assert len(c.scen_lo) == len(c.scen_hi) and len(c.scen_lo) in (3, 5), "scenario range"
+        self.n_scen = len(c.scen_lo)
+        self.scenario = _mlp(c.d_model, hid, 2 * self.n_scen)
         lo = torch.tensor(c.scen_lo, dtype=torch.float32)
         hi = torch.tensor(c.scen_hi, dtype=torch.float32)
         self.register_buffer("scen_mid", (hi + lo) / 2, persistent=False)
@@ -292,17 +299,28 @@ class Agent(nn.Module):
     def init_from(self, path: str) -> dict:
         """Weights of a ppo.py checkpoint where names and shapes match (encoder, token
         projection, core, policy, value, path, tilt heads); the rest (e.g. the old setup
-        head, the new scenario head) keeps its initialization. Returns the info: path,
-        loaded / skipped (checkpoint tensors not used, with the reason) / missing (agent
-        tensors not in the checkpoint), and the checkpoint's name, iteration, env steps,
-        encoder info and value-norm state."""
+        head, the new scenario head) keeps its initialization. The scenario head is
+        re-initialized (skipped) if the checkpoint's normalization range (agent_cfg
+        scen_lo / scen_hi) differs from this agent's. Returns the info: path, loaded /
+        skipped (checkpoint tensors not used, with the reason) / missing (agent tensors
+        not in the checkpoint), scen_reinit (the reason, or None), and the checkpoint's
+        name, iteration, env steps, encoder info and value-norm state."""
         ck = torch.load(path, map_location="cpu", weights_only=False)
         src = ck["agent"]
         own = self.state_dict()
         loaded, skipped = [], {}
         sd = {}
+        reinit = None
+        acfg = ck.get("agent_cfg") or {}
+        if "scen_lo" in acfg:
+            have = (tuple(float(v) for v in acfg["scen_lo"]), tuple(float(v) for v in acfg["scen_hi"]))
+            want = (tuple(float(v) for v in self.cfg.scen_lo), tuple(float(v) for v in self.cfg.scen_hi))
+            if have != want:
+                reinit = f"scenario normalization {have[0]}-{have[1]} != {want[0]}-{want[1]}: re-initialized"
         for k, v in src.items():
-            if k not in own:
+            if reinit is not None and k.startswith("scenario."):
+                skipped[k] = reinit
+            elif k not in own:
                 skipped[k] = "not in the agent"
             elif tuple(own[k].shape) != tuple(v.shape):
                 skipped[k] = f"shape {tuple(v.shape)} != {tuple(own[k].shape)}"
@@ -314,7 +332,7 @@ class Agent(nn.Module):
         return {"path": os.path.abspath(path), "name": ck.get("name"),
                 "iteration": ck.get("iteration"), "env_steps": ck.get("env_steps"),
                 "encoder_info": ck.get("encoder_info"), "vnorm": ck.get("vnorm"),
-                "loaded": loaded, "skipped": skipped, "missing": missing}
+                "loaded": loaded, "skipped": skipped, "missing": missing, "scen_reinit": reinit}
 
     def compile(self, **kw):
         """torch.compile the encoder and the core (used by every call path). The
@@ -377,13 +395,14 @@ class Agent(nn.Module):
             "path": self.path(h).squeeze(-1),
             "tilt_mu": t[..., :2],
             "tilt_logvar": t[..., 2:].clamp(c.logvar_min, c.logvar_max),
-            "scen_mu": sc[..., :3],
-            "scen_logvar": sc[..., 3:].clamp(c.logvar_min, c.logvar_max),
+            "scen_mu": sc[..., :self.n_scen],
+            "scen_logvar": sc[..., self.n_scen:].clamp(c.logvar_min, c.logvar_max),
         }
 
     def scen_norm(self, params: torch.Tensor) -> torch.Tensor:
-        """(..., 3) scenario parameters -> scenario-head units ([-1, 1] over the range)."""
-        return (params - self.scen_mid) / self.scen_half
+        """(..., >= n_scen) scenario parameters (env.SCEN_NAMES order; the first n_scen
+        are used) -> (..., n_scen) scenario-head units ([-1, 1] over the range)."""
+        return (params[..., :self.n_scen] - self.scen_mid) / self.scen_half
 
     def scen_denorm(self, x: torch.Tensor) -> torch.Tensor:
         return x * self.scen_half + self.scen_mid
