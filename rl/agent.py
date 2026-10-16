@@ -3,7 +3,10 @@ agent.py - Policy network: frame encoder, causal transformer over the last K ste
 (PLAN phase 6: P1-P6, D6)
 
     frame      CNNEncoder (encoders.py, spatial-softmax keypoints): uint8 (1, 64, 64) -> z (256),
-               optionally initialized from a pretrain_encoder.py checkpoint (encoder only)
+               optionally initialized from a pretrain_encoder.py checkpoint (encoder only);
+               channels_last weights and inputs, bf16 autocast, torch.compile (compile());
+               with grad (unfrozen encoder) in activation-checkpointed chunks of enc_chunk
+               images (enc_checkpoint) or in one pass that keeps the activations
     token      Linear(concat(LayerNorm(z_t), a_{t-1})) -> d_model; a_{t-1} is the applied
                action that led to frame t (env obs["action"], delta / largest ladder step,
                in [-1, 1]; zero at an episode start)
@@ -19,7 +22,9 @@ agent.py - Policy network: frame encoder, causal transformer over the last K ste
                value   in the trainer's normalized units (ppo.ValueNorm)
                path    P_t / P_ref of the current frame (path head, P6)
                tilt    current controlled tilt / tilt_scale: mean and log-variance (2 + 2)
-               setup   logits over the setups
+               scenario  (separation, laser pitch, laser yaw), each mapped to [-1, 1] over
+                       the atlas range (scen_lo, scen_hi): mean and log-variance (3 + 3),
+                       Gaussian NLL (stage 2; replaces the 4-way setup head)
 
 Two call paths compute the same function of the same inputs:
     act()               rollout: per env a Ring of the last K (z, a, valid, frame); only
@@ -29,8 +34,12 @@ Two call paths compute the same function of the same inputs:
     final_windows()     truncation bootstrap: the window of a final (pre-reset) frame
 Window mask from the sequence: position q is visible to the window ending at p if q holds
 a frame (real) and no episode starts in (q, p] (first flags; cumulative segment ids).
+
+init_from(path): weights of a previous PPO checkpoint (ppo.py latest.pt / best.pt) where
+names and shapes match; the rest keeps its fresh initialization and is reported.
 """
 
+import functools
 import math
 import os
 import re
@@ -59,13 +68,16 @@ class AgentConfig:
     mlp_ratio: float = 4.0
     head_hidden: int = 256
     n_bins: int = 11  # Ladder steps per axis (env.n_bins)
-    n_setups: int = 4
     policy_init_scale: float = 0.01  # Last policy layer weights x this, bias 0
     tilt_scale: float = 2.0  # deg; tilt labels are divided by this (the mount limit)
+    scen_lo: Tuple[float, float, float] = (50.0, 0.0, 0.0)  # Atlas range: mm, deg, deg
+    scen_hi: Tuple[float, float, float] = (200.0, 8.0, 8.0)
     logvar_min: float = -12.0
     logvar_max: float = 4.0
     amp: bool = True  # bf16 autocast for encoder, token and core (heads in fp32)
+    channels_last: bool = True  # Encoder weights and inputs in NHWC (tensor-core convs)
     enc_chunk: int = 1024  # Images per checkpointed chunk when the encoder trains
+    enc_checkpoint: bool = True  # False: keep the encoder activations (no recompute)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
 
     def to_dict(self) -> dict:
@@ -77,7 +89,8 @@ class AgentConfig:
         enc = d.pop("encoder", {})
         enc = EncoderConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in enc.items()})
         names = {f.name for f in fields(AgentConfig)}
-        return AgentConfig(encoder=enc, **{k: v for k, v in d.items() if k in names})
+        return AgentConfig(encoder=enc, **{k: tuple(v) if isinstance(v, list) else v
+                                           for k, v in d.items() if k in names})
 
 
 class Ring(NamedTuple):
@@ -229,8 +242,14 @@ class Agent(nn.Module):
         self.v = _mlp(c.d_model, hid, 1)
         self.path = _mlp(c.d_model, hid, 1)
         self.tilt = _mlp(c.d_model, hid, 4)
-        self.setup = _mlp(c.d_model, hid, c.n_setups)
+        self.scenario = _mlp(c.d_model, hid, 6)
+        lo = torch.tensor(c.scen_lo, dtype=torch.float32)
+        hi = torch.tensor(c.scen_hi, dtype=torch.float32)
+        self.register_buffer("scen_mid", (hi + lo) / 2, persistent=False)
+        self.register_buffer("scen_half", (hi - lo) / 2, persistent=False)
         self._init_weights()
+        if c.channels_last:
+            self.encoder.to(memory_format=torch.channels_last)
         self._compiled: Dict[str, nn.Module] = {}  # Not registered: state_dict unchanged
 
     def _init_weights(self):
@@ -270,9 +289,41 @@ class Agent(nn.Module):
         return {"path": os.path.abspath(path), "name": name, "step": ck.get("step"),
                 "n_setups": n_set}
 
+    def init_from(self, path: str) -> dict:
+        """Weights of a ppo.py checkpoint where names and shapes match (encoder, token
+        projection, core, policy, value, path, tilt heads); the rest (e.g. the old setup
+        head, the new scenario head) keeps its initialization. Returns the info: path,
+        loaded / skipped (checkpoint tensors not used, with the reason) / missing (agent
+        tensors not in the checkpoint), and the checkpoint's name, iteration, env steps,
+        encoder info and value-norm state."""
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        src = ck["agent"]
+        own = self.state_dict()
+        loaded, skipped = [], {}
+        sd = {}
+        for k, v in src.items():
+            if k not in own:
+                skipped[k] = "not in the agent"
+            elif tuple(own[k].shape) != tuple(v.shape):
+                skipped[k] = f"shape {tuple(v.shape)} != {tuple(own[k].shape)}"
+            else:
+                sd[k] = v
+                loaded.append(k)
+        missing = sorted(k for k in own if k not in sd)
+        self.load_state_dict({**own, **sd})
+        return {"path": os.path.abspath(path), "name": ck.get("name"),
+                "iteration": ck.get("iteration"), "env_steps": ck.get("env_steps"),
+                "encoder_info": ck.get("encoder_info"), "vnorm": ck.get("vnorm"),
+                "loaded": loaded, "skipped": skipped, "missing": missing}
+
     def compile(self, **kw):
-        """torch.compile the encoder and the core (used by every call path)."""
+        """torch.compile the encoder and the core (used by every call path). The
+        checkpointed encoder (unfrozen, enc_checkpoint) is compiled as one function around
+        checkpoint(): checkpoint() around the compiled encoder fails in the backward
+        recompute with channels_last activations (stride assertion, torch 2.14)."""
         self._compiled["encoder"] = torch.compile(self.encoder, **kw)
+        self._compiled["encoder_ckpt"] = torch.compile(
+            functools.partial(checkpoint, self.encoder, use_reentrant=False), **kw)
         self._compiled["core"] = torch.compile(self.core, **kw)
         return self
 
@@ -291,16 +342,19 @@ class Agent(nn.Module):
     # ── Pieces ──
 
     def encode(self, images: torch.Tensor, grad: bool = False) -> torch.Tensor:
-        """uint8 (N, 1, H, W) -> z (N, Dz) float32. grad: activation checkpointing in
-        chunks of enc_chunk images (only z is kept between forward and backward)."""
-        enc = self._compiled.get("encoder", self.encoder)
+        """uint8 (N, 1, H, W) -> z (N, Dz) float32. grad (unfrozen encoder): with
+        enc_checkpoint, activation checkpointing in chunks of enc_chunk images (only z is
+        kept between forward and backward; the backward recomputes the forward), else one
+        pass that keeps the activations (no recompute, memory ~ N)."""
+        if self.cfg.channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
         with self._amp():
-            if not grad:
-                return enc(images).float()
+            if not grad or not self.cfg.enc_checkpoint:
+                return self._compiled.get("encoder", self.encoder)(images).float()
+            enc = self._compiled.get("encoder_ckpt") or functools.partial(
+                checkpoint, self.encoder, use_reentrant=False)
             n, ch = images.shape[0], self.cfg.enc_chunk
-            parts = [checkpoint(enc, images[i:i + ch], use_reentrant=False)
-                     for i in range(0, n, ch)]
-            return torch.cat(parts).float()
+            return torch.cat([enc(images[i:i + ch]) for i in range(0, n, ch)]).float()
 
     def tokens(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """(..., Dz), (..., 2) -> (..., d_model)."""
@@ -316,14 +370,23 @@ class Agent(nn.Module):
         """Head outputs (fp32) of h (..., d)."""
         c = self.cfg
         t = self.tilt(h)
+        sc = self.scenario(h)
         return {
             "logits": self.pi(h).unflatten(-1, (2, c.n_bins)),
             "value": self.v(h).squeeze(-1),
             "path": self.path(h).squeeze(-1),
             "tilt_mu": t[..., :2],
             "tilt_logvar": t[..., 2:].clamp(c.logvar_min, c.logvar_max),
-            "setup_logits": self.setup(h),
+            "scen_mu": sc[..., :3],
+            "scen_logvar": sc[..., 3:].clamp(c.logvar_min, c.logvar_max),
         }
+
+    def scen_norm(self, params: torch.Tensor) -> torch.Tensor:
+        """(..., 3) scenario parameters -> scenario-head units ([-1, 1] over the range)."""
+        return (params - self.scen_mid) / self.scen_half
+
+    def scen_denorm(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scen_half + self.scen_mid
 
     # ── Rollout path ──
 

@@ -138,6 +138,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--setups", choices=("measured", "all"), default="measured",
                     help="Frames of the measured cell only, or of all geometry.SETUPS "
                          "(uniform; run name suffix _set4)")
+    ap.add_argument("--scenarios", type=int, default=0,
+                    help="Frames of this many scenarios sampled uniformly from the atlas grid "
+                         "plus the four named setups (overrides --setups); 0 = --setups")
+    ap.add_argument("--scenario-seed", type=int, default=0)
     ap.add_argument("--no-amp", action="store_true", help="fp32 instead of bf16 autocast")
     ap.add_argument("--no-compile", action="store_true", help="eager model (no torch.compile)")
     ap.add_argument("--log-every", type=int, default=25)
@@ -155,7 +159,9 @@ def run_name(args: argparse.Namespace, cfg: EncoderConfig) -> str:
     steps = f"{k:g}k" if args.steps >= 1000 else str(args.steps)
     name = f"{model_name(cfg)}_w{cfg.width if cfg.arch == 'vit' else cfg.cnn_widths[-1]}" \
            f"_lr{args.lr:g}_b{args.batch}_{steps}_s{args.seed}"
-    if args.setups == "all":
+    if args.scenarios > 0:
+        name += f"_grid{args.scenarios}"
+    elif args.setups == "all":
         name += f"_set{len(SETUPS)}"
     return name + (f"_{args.tag}" if args.tag else "")
 
@@ -178,7 +184,20 @@ def main():
     run_dir = os.path.join(args.runs_dir, name)
     os.makedirs(run_dir, exist_ok=True)
 
-    data = FrameData(data_config(args.setups, args.batch), dev)
+    if args.scenarios > 0:
+        from dataclasses import replace
+
+        from find_setups import setup_geometry
+        from scenarios import sample_grid
+
+        pts = sample_grid(args.scenarios, args.scenario_seed)
+        setups = tuple(SETUPS) + tuple(setup_geometry(*p) for p in pts)
+        data = FrameData(replace(data_config("measured", args.batch), setups=setups,
+                                 scan_step=0.05), dev)
+        print(f"{args.scenarios} grid scenarios (seed {args.scenario_seed}) + {len(SETUPS)} "
+              f"named setups; {int((data.cell_count == 0).sum())} without >= 4 bounce cells")
+    else:
+        data = FrameData(data_config(args.setups, args.batch), dev)
     gen = torch.Generator(device=dev)
     gen.manual_seed(1_000_003 * (args.seed + 1))
     val = data.eval_set(args.val_n, VAL_SEED)

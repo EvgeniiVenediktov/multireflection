@@ -19,7 +19,7 @@ Shared by the baselines (baselines.py) and the PPO trainer.
                  episode (B,) int64     index into init_tilts (-1: inactive or padding)
                  privileged (diagnostics, oracle and setup-aware homing only):
                  tilt (B, 2), path_mm (B,), bounces (B,) of the current obs frame,
-                 setup (B,) and path_ref (B,) of the episode
+                 setup (B,), scenario_params (B, 3) and path_ref (B,) of the episode
 
 Metrics (summarize): the aggregate over all episodes and split by the start region:
 blind start = 1-2 bounces at the initial tilt (one M2 spot at a fixed place), informative
@@ -87,6 +87,7 @@ def _policy_info(
         "path_mm": env.path,
         "bounces": env.bounces,
         "setup": env.setup,
+        "scenario_params": env.setup_params[env.setup],
         "path_ref": env.ref_of(env.setup),
     }
 
@@ -220,8 +221,8 @@ def _frac(m: torch.Tensor) -> Optional[float]:
     return float(m.double().mean()) if m.numel() else None
 
 
-def _split_metrics(ep: Dict[str, torch.Tensor], m: torch.Tensor, cap: int) -> Dict[str, Any]:
-    """Metrics over the episodes selected by mask m."""
+def split_metrics(ep: Dict[str, torch.Tensor], m: torch.Tensor, cap: int) -> Dict[str, Any]:
+    """Metrics over the episodes selected by mask m (any split, e.g. ppo.py's)."""
     fb = ep["final_bounces"][m]
     fp = ep["final_path_mm"][m] / 1000.0
     length = ep["ep_length"][m]
@@ -237,6 +238,7 @@ def _split_metrics(ep: Dict[str, torch.Tensor], m: torch.Tensor, cap: int) -> Di
         "end_ge89": _frac(fb >= 89),
         "end_cap": _frac(fb >= cap),
         "terminated": _frac(ep["terminated"][m]),
+        "stop_first": _frac(ep["terminated"][m] & (length == 1)),  # Not move at step 0
         "truncated": _frac(ep["truncated"][m]),
         "length_mean": _mean(length),
         "length_median": _q(length, 0.5),
@@ -279,4 +281,4 @@ def summarize(
     if setup_names is not None:
         for i, name in enumerate(setup_names):
             splits[f"setup:{name}"] = ep["setup"] == i
-    return {name: _split_metrics(ep, m, cap) for name, m in splits.items()}
+    return {name: split_metrics(ep, m, cap) for name, m in splits.items()}

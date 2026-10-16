@@ -5,6 +5,7 @@
 #
 #   cd /ihome/kchen/evv13/multireflection
 #   sbatch rl/cluster/encoder_l40s.slurm
+#   sbatch --export=ALL,SCENARIOS=16384,STEPS=16000 rl/cluster/encoder_l40s.slurm   # full grid
 #
 # Outputs: /ix1/kchen/evv/multireflection/rl_runs/encoder/<jobid>/
 #     cnn_w160_lr0.001_b256_8k_s0_set4/{model.pt, config.json, train.csv, val.csv,
@@ -47,6 +48,7 @@ VENV_PY="${VENV_PY:-$PROJECT_DIR/.venv/bin/python}"
 STEPS="${STEPS:-8000}"
 SEED="${SEED:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+SCENARIOS="${SCENARIOS:-0}"      # > 0: frames from that many atlas-grid scenarios + the named setups
 FIXED_CKPT="$RUNS_ROOT/encoder/cnn_w160_lr0.001_b256_8k_s0_set4.pt"
 
 # No modules: the venv carries its own CPython and CUDA runtime. Slurm does not source
@@ -75,12 +77,14 @@ echo "=================================================================="
 
 SRUN=(srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}")
 "${SRUN[@]}" "$VENV_PY" pretrain_encoder.py --arch cnn --steps "$STEPS" --seed "$SEED" \
-    --setups all --runs-dir "$RUN_DIR" $EXTRA_ARGS
+    --setups all --scenarios "$SCENARIOS" --runs-dir "$RUN_DIR" $EXTRA_ARGS
 
-RUN_SUB=$(ls -d "$RUN_DIR"/cnn_*_set4 | head -n 1)
+RUN_SUB=$(ls -d "$RUN_DIR"/cnn_* | head -n 1)
 echo "trained     : $RUN_SUB"
 # Four-setup sets (metrics_set4.json, encoder_tables_set4.md), then the measured-cell
 # sets of the phase-5 benchmark (metrics.json, encoder_tables.md); tables in $RUN_DIR
+# Full range: 4096 grid scenarios drawn with another seed than the training scenarios
+"${SRUN[@]}" "$VENV_PY" eval_encoder.py --scenarios 4096 --scenario-seed 1 --no-speed --no-figures --out "$RUN_DIR" "$RUN_SUB"
 "${SRUN[@]}" "$VENV_PY" eval_encoder.py --setups all --no-figures --out "$RUN_DIR" "$RUN_SUB"
 "${SRUN[@]}" "$VENV_PY" eval_encoder.py --no-figures --out "$RUN_DIR" "$RUN_SUB"
 

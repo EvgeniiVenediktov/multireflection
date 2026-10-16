@@ -6,6 +6,12 @@ B independent episodes, all state on the device, no host syncs in step() / reset
     setups     one or more cells (geometry.CellGeometry, same mirrors), EnvConfig.setups;
                empty = the single EnvConfig.geometry (default: the measured cell). Each
                env samples a setup per episode (EnvConfig.setup_weights)
+    scenarios  alternative to setups (AlignEnv(cfg, scenarios=Scenarios(...)), stage 2):
+               a table of N (separation, laser pitch, laser yaw) on EnvConfig.geometry
+               with a P_ref per scenario (scenarios.Atlas.table(): max(P_max, P_floor));
+               the setup index is then the scenario index. Draws uniform over the table,
+               or from a sampler (AlignEnv(..., sampler=...): draw(u (B,)) -> (index,
+               source), e.g. scenarios.ScenarioSampler; no host syncs)
     state      13-DOF base state of the episode's setup; the controlled DOFs (default
                M2 pitch, M2 yaw) move, every other DOF stays at the setup value
     action     (B, 2) int64, per-axis index into the step ladder
@@ -17,7 +23,8 @@ B independent episodes, all state on the device, no host syncs in step() / reset
     reward     move:     (P_t - P_{t-1}) / P_ref - step_cost
                not move: 0, the episode terminates (decision D2)
                P_t = optical path after step t (bounce cap, D1); P_ref per setup
-               (EnvConfig.path_ref): "nominal" = path at the setup's nominal tilt
+               (scenario mode: from the table; otherwise EnvConfig.path_ref):
+               "nominal" = path at the setup's nominal tilt
                (2733.27 mm for the measured cell, the stage-1 P_nom), "max" = longest
                path in the +-limit box (0.01 deg scan at construction); the default
                "auto" is nominal for one setup and max for several. The return is
@@ -25,7 +32,8 @@ B independent episodes, all state on the device, no host syncs in step() / reset
     truncation the step count reaches max_steps without termination
     auto-reset done envs restart inside step(): obs is the first frame of the new
                episode, info holds the pre-reset quantities (final frame and its
-               stack, path, stop reason, true tilt, setup, episode stats).
+               stack, path, stop reason, true tilt, setup and scenario parameters,
+               episode stats).
                EnvConfig.auto_reset False: done envs idle (actions ignored, reward 0,
                state frozen at the final frame) until reset(mask)
     reset draw initial tilt (uniform in the init box) and setup of env i's episode j
@@ -53,7 +61,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from geometry import NOMINAL_PATH_MM, CellGeometry
-from herriott_sim import DEVICE, S_LASER_PITCH, S_M2_PITCH, S_M2_YAW
+from herriott_sim import DEVICE, S_LASER_PITCH, S_LASER_YAW, S_M2_PITCH, S_M2_YAW, S_SEP
 
 M2_ID = 2  # hit_mirror value of an M2 hit
 AUTO_SIGMA_PX = 2.5  # Auto oversampling: spot sigma >= this many splat-grid pixels
@@ -104,6 +112,15 @@ class EnvConfig:
     gain: float = 1.6  # 1 - exp(-gain * I): a unit spot (k = 0) peaks at 0.80
     oversample: int = 0  # Splat grid oversampling; 0 = auto (sigma >= 2.5 grid px)
     history_len: int = 8  # Frames K in the history stack; 0 = no stack
+
+
+@dataclass
+class Scenarios:
+    """Scenario table (scenarios.Atlas.table()): EnvConfig.geometry with separation and
+    laser tilt replaced per scenario, and the reward scale of each."""
+
+    params: torch.Tensor  # (N, 3) separation (mm), laser pitch, laser yaw (deg)
+    path_ref: torch.Tensor  # (N,) P_ref (mm)
 
 
 # ── Counter-based random numbers ────────────────────────────────────────────
@@ -396,14 +413,18 @@ class AlignEnv:
     post-step states and B freshly drawn reset states; the reset half is used only
     where an episode ended (no data-dependent indexing, no host syncs).
 
-    Setup attributes: setups (tuple of CellGeometry), n_setups, setup_probs (S,),
-    path_refs (S,) float32 tensor (P_ref per setup), path_ref_mode ("nominal" / "max"),
-    p_nom (float, P_ref of setup 0: 2733.27 mm by default). Per env: setup (B,) int64
-    index of the episode's setup, episode (B,) int64 episode counter, idle (B,) bool
-    (only without auto-reset).
+    Setup attributes: setups (tuple of CellGeometry; empty in scenario mode), n_setups
+    (setups or scenarios), setup_params (S, 3) separation / laser pitch / laser yaw,
+    setup_probs (S,), path_refs (S,) float32 tensor (P_ref per setup), path_ref_mode
+    ("nominal" / "max" / "scenario"), p_nom (float, P_ref of setup 0: 2733.27 mm by
+    default), scenario_mode, sampler. Per env: setup (B,) int64 index of the episode's
+    setup (scenario), scen_src (B,) int8 sampler source of the episode's draw (-1: no
+    sampler or explicit), episode (B,) int64 episode counter, idle (B,) bool (only without
+    auto-reset).
     """
 
-    def __init__(self, cfg: Optional[EnvConfig] = None):
+    def __init__(self, cfg: Optional[EnvConfig] = None, scenarios: Optional[Scenarios] = None,
+                 sampler=None):
         self.cfg = c = cfg or EnvConfig()
         self.device = dev = torch.device(c.device) if c.device is not None else DEVICE
         self.num_envs = B = c.num_envs
@@ -412,20 +433,38 @@ class AlignEnv:
         assert c.path_ref in PATH_REFS, f"path_ref {c.path_ref!r} not in {PATH_REFS}"
         self.ctrl = tuple(int(i) for i in c.controlled)
 
-        # ── Setups ──
-        self.setups: Tuple[CellGeometry, ...] = tuple(c.setups) or (c.geometry,)
-        S = self.n_setups = len(self.setups)
-        g = self.setups[0]
-        for s in self.setups[1:]:
-            assert s.mirror_configs() == g.mirror_configs(), "setups must share the mirrors"
-            assert s.m2_tilt_limit == g.m2_tilt_limit, "setups must share the tilt limit"
-            assert s.intensity_threshold == g.intensity_threshold
+        # ── Setups or scenarios ──
+        self.scenario_mode = scenarios is not None
+        self.sampler = sampler
+        if self.scenario_mode:
+            assert not c.setups, "scenarios replace EnvConfig.setups"
+            g = c.geometry
+            self.setups: Tuple[CellGeometry, ...] = ()
+            prm = scenarios.params.to(device=dev, dtype=torch.float32)
+            S = self.n_setups = prm.shape[0]
+            base = g.base_state(S, dev)
+            base[:, S_SEP], base[:, S_LASER_PITCH], base[:, S_LASER_YAW] = prm.unbind(1)
+            self.setup_base = base  # (S, 13)
+            self.setup_params = prm
+        else:
+            assert sampler is None, "a sampler needs a scenario table"
+            self.setups = tuple(c.setups) or (c.geometry,)
+            S = self.n_setups = len(self.setups)
+            g = self.setups[0]
+            for s in self.setups[1:]:
+                assert s.mirror_configs() == g.mirror_configs(), "setups must share the mirrors"
+                assert s.m2_tilt_limit == g.m2_tilt_limit, "setups must share the tilt limit"
+                assert s.intensity_threshold == g.intensity_threshold
+            self.setup_base = torch.cat([s.base_state(1, dev) for s in self.setups])  # (S, 13)
+            self.setup_params = torch.tensor(
+                [[s.separation, s.laser_pitch, s.laser_yaw] for s in self.setups],
+                dtype=torch.float32, device=dev)
         self.limit = float(g.m2_tilt_limit if c.tilt_limit is None else c.tilt_limit)
-        self.setup_base = torch.cat([s.base_state(1, dev) for s in self.setups])  # (S, 13)
         self._dead = self.setup_base[0].clone()
         self._dead[S_LASER_PITCH] = DEAD_LASER_PITCH
         w = torch.tensor(
-            c.setup_weights if c.setup_weights is not None else [1.0] * S, dtype=torch.float64
+            c.setup_weights if c.setup_weights is not None and not self.scenario_mode
+            else [1.0] * S, dtype=torch.float64
         )
         assert w.numel() == S and bool((w >= 0).all()) and float(w.sum()) > 0, "setup weights"
         self.setup_probs = (w / w.sum()).float().to(dev)
@@ -447,15 +486,21 @@ class AlignEnv:
         self.img_shape = (1, c.img_res, c.img_res)
 
         # ── Reward scale per setup ──
-        self.path_ref_mode = c.path_ref if c.path_ref != "auto" else (
-            "nominal" if S == 1 else "max")
         self._path_max: Optional[torch.Tensor] = None
-        if self.path_ref_mode == "max":
-            refs = self.path_max().tolist()
+        if self.scenario_mode:
+            self.path_ref_mode = "scenario"
+            self.path_refs = scenarios.path_ref.to(device=dev, dtype=torch.float32)
+            assert self.path_refs.shape == (S,), "one P_ref per scenario"
+            self.p_nom = float(self.path_refs[0])
         else:
-            refs = self._nominal_paths()
-        self.p_nom = float(refs[0])
-        self.path_refs = torch.tensor(refs, dtype=torch.float32, device=dev)  # (S,)
+            self.path_ref_mode = c.path_ref if c.path_ref != "auto" else (
+                "nominal" if S == 1 else "max")
+            if self.path_ref_mode == "max":
+                refs = self.path_max().tolist()
+            else:
+                refs = self._nominal_paths()
+            self.p_nom = float(refs[0])
+            self.path_refs = torch.tensor(refs, dtype=torch.float32, device=dev)  # (S,)
 
         # ── Reset draws: per-env key of the counter-based hash ──
         self.gen = torch.Generator(device=dev)  # Kept for callers; resets use the hash
@@ -465,11 +510,13 @@ class AlignEnv:
         k = hash32(k ^ hash32(torch.full((B,), (sd >> 32) & _M32, dtype=torch.long, device=dev)))
         self._env_key = hash32(k ^ torch.arange(B, device=dev))
         self._setup0 = torch.zeros(B, dtype=torch.long, device=dev)
+        self._src0 = torch.full((B,), -1, dtype=torch.int8, device=dev)
         self.set_init_box(c.init_center, c.init_radius)
 
         # ── Per-env state ──
         self.tilt = torch.zeros(B, 2, device=dev)  # Controlled DOFs (deg)
         self.setup = torch.zeros(B, dtype=torch.long, device=dev)  # Index into setups
+        self.scen_src = self._src0.clone()  # Sampler source of the episode's draw
         self.episode = torch.full((B,), -1, dtype=torch.long, device=dev)  # Counter
         self.idle = torch.zeros(B, dtype=torch.bool, device=dev)  # Done, no auto-reset
         self.path = torch.zeros(B, device=dev)  # mm, current state
@@ -543,16 +590,25 @@ class AlignEnv:
         if radius is not None:
             self.init_radius = torch.as_tensor(radius, dtype=torch.float32).to(self.device)
 
-    def _draw(self, episode: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Initial tilts (B, 2) in the init box (clamped) and setups (B,) of the given
-        per-env episode indices; a function of (seed, env, episode) only."""
+    def _draw_src(self, episode: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Initial tilts (B, 2) in the init box (clamped), setups (B,) and sampler
+        sources (B,) int8 of the given per-env episode indices; a function of (seed,
+        env, episode) only (with a sampler: and of its current distribution)."""
         u = uniforms(self._env_key, episode)
         t = (self.init_center + self.init_radius * (2.0 * u[:, :2] - 1.0)).clamp(
             -self.limit, self.limit)
+        if self.sampler is not None:
+            s, src = self.sampler.draw(u[:, 2].contiguous())
+            return t, s, src
         if self.n_setups == 1:
-            return t, self._setup0
+            return t, self._setup0, self._src0
         s = torch.searchsorted(self._setup_cdf, u[:, 2].contiguous(), right=True)
-        return t, s.clamp(max=self.n_setups - 1)
+        return t, s.clamp(max=self.n_setups - 1), self._src0
+
+    def _draw(self, episode: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Initial tilts (B, 2) and setups (B,) of the given per-env episode indices."""
+        t, s, _ = self._draw_src(episode)
+        return t, s
 
     def _sample_tilts(self) -> torch.Tensor:
         """(B, 2) initial tilts of each env's next episode (as reset() would draw)."""
@@ -573,6 +629,15 @@ class AlignEnv:
         return s
 
     _states = states
+
+    def scenario_states(self, tilts: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """(n, 13) states of explicit scenarios params (n, 3) (separation, laser pitch,
+        laser yaw; every other DOF as setup 0) at the controlled tilts (n, 2)."""
+        s = self.setup_base[0].expand(tilts.shape[0], -1).clone()
+        s[:, S_SEP], s[:, S_LASER_PITCH], s[:, S_LASER_YAW] = params.to(torch.float32).unbind(1)
+        s[:, self.ctrl[0]] = tilts[:, 0]
+        s[:, self.ctrl[1]] = tilts[:, 1]
+        return s
 
     def _simulate(
         self,
@@ -613,7 +678,7 @@ class AlignEnv:
 
     _STATE_KEYS = ("tilt", "setup", "episode", "idle", "path", "bounces", "stop", "image",
                    "prev_action", "step_count", "ep_return", "ep_moves", "path0",
-                   "init_center", "init_radius")
+                   "init_center", "init_radius", "scen_src")
 
     def get_state(self) -> Dict[str, torch.Tensor]:
         """Per-env episode state and the init box (tensors, for a checkpoint); with the
@@ -627,7 +692,8 @@ class AlignEnv:
     def set_state(self, st: Dict[str, torch.Tensor]):
         """Restore get_state() output (same num_envs and config)."""
         for k in self._STATE_KEYS:
-            setattr(self, k, st[k].to(self.device))
+            if k in st:  # scen_src: absent in older checkpoints
+                setattr(self, k, st[k].to(self.device))
         if self.history is not None and "hist_images" in st:
             self.history.images = st["hist_images"].to(self.device)
             self.history.actions = st["hist_actions"].to(self.device)
@@ -643,11 +709,12 @@ class AlignEnv:
         return obs
 
     def state_info(self) -> Dict[str, torch.Tensor]:
-        """Privileged quantities of the current frame: tilt, setup, path_ref, path_mm,
-        path_norm, bounces, stop_reason, step, idle."""
+        """Privileged quantities of the current frame: tilt, setup, scenario_params
+        (B, 3), path_ref, path_mm, path_norm, bounces, stop_reason, step, idle."""
         return {
             "tilt": self.tilt,
             "setup": self.setup,
+            "scenario_params": self.setup_params[self.setup],
             "path_ref": self.ref_of(self.setup),
             "path_mm": self.path,
             "path_norm": self._norm(self.path, self.setup),
@@ -675,13 +742,15 @@ class AlignEnv:
         if mask is None:
             mask = torch.ones(B, dtype=torch.bool, device=self.device)
         ep = torch.where(mask, self.episode + 1, self.episode)
-        d_tilt, d_setup = self._draw(ep)
+        d_tilt, d_setup, d_src = self._draw_src(ep)
         new = d_tilt if tilts is None else tilts.to(
             device=self.device, dtype=torch.float32).clamp(-self.limit, self.limit)
         new_s = d_setup if setups is None else setups.to(device=self.device, dtype=torch.long)
+        new_src = d_src if setups is None else self._src0
         m1 = mask[:, None]
         tilt = torch.where(m1, new, self.tilt)
         setup = torch.where(mask, new_s, self.setup)
+        self.scen_src = torch.where(mask, new_src, self.scen_src)
         out = self._simulate(tilt, setup, live=mask)
         img = self._render(out)
 
@@ -713,13 +782,15 @@ class AlignEnv:
         (B,), computed before the auto-reset):
             final_image (B, 1, H, W) uint8, final_obs (obs dict of that frame, with
             its history stack), applied_action (B, 2), tilt (B, 2) true controlled
-            tilts, setup, path_ref (privileged), path_mm, path_norm = path_mm / P_ref
+            tilts, setup (= scenario index in scenario mode), scenario_params (B, 3),
+            scenario_src (B,) int8 sampler source of the episode (-1: none), path_ref
+            (privileged), path_mm, path_norm = path_mm / P_ref
             (path-head label of final_image), bounces, stop_reason, done, idle (env
             was idle: action ignored, reward 0, not done; only without auto-reset);
             ep_return, ep_length, ep_moves, ep_initial_path_mm, ep_final_path_mm,
             ep_final_bounces: valid where done;
-            obs_tilt, obs_setup, obs_path_ref, obs_path_norm: the same for the
-            returned obs (post-reset).
+            obs_tilt, obs_setup, obs_scenario_params, obs_path_ref, obs_path_norm: the
+            same for the returned obs (post-reset).
         """
         c = self.cfg
         B = self.num_envs
@@ -746,7 +817,7 @@ class AlignEnv:
         setup = self.setup
         if auto:
             ep_next = self.episode + 1
-            reset_tilt, reset_setup = self._draw(ep_next)
+            reset_tilt, reset_setup, reset_src = self._draw_src(ep_next)
             out = self._simulate(
                 torch.cat((new, reset_tilt)), torch.cat((setup, reset_setup)),
                 live=torch.cat((move, done)),
@@ -787,6 +858,8 @@ class AlignEnv:
             "applied_action": applied,
             "tilt": new,
             "setup": setup,
+            "scenario_params": self.setup_params[setup],
+            "scenario_src": self.scen_src,
             "path_ref": self.ref_of(setup),
             "path_mm": path,
             "path_norm": self._norm(path, setup),
@@ -807,6 +880,7 @@ class AlignEnv:
             d1 = done[:, None]
             self.tilt = torch.where(d1, reset_tilt, new)
             self.setup = torch.where(done, reset_setup, setup)
+            self.scen_src = torch.where(done, reset_src, self.scen_src)
             self.episode = torch.where(done, ep_next, self.episode)
             self.path = torch.where(done, path_all[B:], path)
             self.bounces = torch.where(done, count_all[B:], bounces)
@@ -833,6 +907,7 @@ class AlignEnv:
 
         info["obs_tilt"] = self.tilt
         info["obs_setup"] = self.setup
+        info["obs_scenario_params"] = self.setup_params[self.setup]
         info["obs_path_ref"] = self.ref_of(self.setup)
         info["obs_path_norm"] = self._norm(self.path, self.setup)
         return self.observe(), reward, terminated, truncated, info

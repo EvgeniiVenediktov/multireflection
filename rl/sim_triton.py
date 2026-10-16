@@ -20,7 +20,8 @@ Design:
       block is 1, so a program ends as soon as all its rays are done
     - per-bounce outputs are masked stores (active lanes, column `bounce`) into
       zero-filled tensors allocated once by the wrapper; world xyz only with
-      STORE_WORLD; per-ray outputs are stored once after the loop
+      STORE_WORLD, mirror id and local xy only with STORE_HITS; per-ray outputs are
+      stored once after the loop
     - no host syncs, no intermediate global tensors
     - same formulas as the reference with its rounding reproduced: IEEE sqrt / div /
       sin / cos, no FMA contraction (enable_fp_fusion=False), torch's einsum and size-3
@@ -161,6 +162,7 @@ def _trace_kernel(
     threshold,
     STATE_STRIDE: tl.constexpr,
     STORE_WORLD: tl.constexpr,
+    STORE_HITS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -354,9 +356,10 @@ def _trace_kernel(
 
         # Store column `bounce` for active lanes
         hidx = hit_base + bounce
-        tl.store(mirror_ptr + hidx, mirror.to(tl.int8), mask=active)
-        tl.store(local_ptr + hidx * 2, lx, mask=active)
-        tl.store(local_ptr + hidx * 2 + 1, ly, mask=active)
+        if STORE_HITS:
+            tl.store(mirror_ptr + hidx, mirror.to(tl.int8), mask=active)
+            tl.store(local_ptr + hidx * 2, lx, mask=active)
+            tl.store(local_ptr + hidx * 2 + 1, ly, mask=active)
         if STORE_WORLD:
             tl.store(world_ptr + hidx * 3, hx, mask=active)
             tl.store(world_ptr + hidx * 3 + 1, hy, mask=active)
@@ -433,8 +436,12 @@ def simulate_triton(
     store_world: bool = True,
     block: Optional[int] = None,
     num_warps: Optional[int] = None,
+    store_hits: bool = True,
 ) -> dict:
-    """Trace (B, 13) states with the fused kernel; same dict as the torch backend."""
+    """Trace (B, 13) states with the fused kernel; same dict as the torch backend.
+    store_hits False: no per-hit outputs (hit_mirror / hit_local_xy None, the stores are
+    compiled out and the (B, N) buffers are not allocated); the per-ray outputs are
+    unchanged (large scans: the zero-fill of the hit buffers dominates otherwise)."""
     assert state.is_cuda, "triton backend needs a CUDA state"
     assert state.shape[1] == STATE_DIM, f"Expected state dim {STATE_DIM}"
     state = state.to(torch.float32).contiguous()
@@ -450,8 +457,9 @@ def simulate_triton(
     stop = torch.empty(B, dtype=torch.int8, device=dev)
     exited = torch.empty(B, dtype=torch.bool, device=dev)
     final = torch.empty(B, 3, dtype=torch.float32, device=dev)
-    hit_mirror = torch.zeros(B, N, dtype=torch.int8, device=dev)
-    hit_local = torch.zeros(B, N, 2, dtype=torch.float32, device=dev)
+    hn = (B, N) if store_hits else (1, 1)
+    hit_mirror = torch.zeros(*hn, dtype=torch.int8, device=dev)
+    hit_local = torch.zeros(*hn, 2, dtype=torch.float32, device=dev)
     hit_world = (
         torch.zeros(B, N, 3, dtype=torch.float32, device=dev) if store_world else None
     )
@@ -465,6 +473,7 @@ def simulate_triton(
             *_mirror_args(sim),
             STATE_STRIDE=STATE_DIM,
             STORE_WORLD=store_world,
+            STORE_HITS=store_hits,
             BLOCK=blk,
             num_warps=nw,
             enable_fp_fusion=False,
@@ -475,8 +484,8 @@ def simulate_triton(
         "final_positions": final,
         "total_path_length": path,
         "hit_sequence": hit_world,
-        "hit_mirror": hit_mirror,
-        "hit_local_xy": hit_local,
+        "hit_mirror": hit_mirror if store_hits else None,
+        "hit_local_xy": hit_local if store_hits else None,
         "intensity": intensity,
         "stop_reason": stop,
         "exited_hole": exited,

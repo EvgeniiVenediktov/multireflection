@@ -26,6 +26,14 @@ are drawn from all geometry.SETUPS (uniform; the 89 vs trapped set stays on the 
 cell), a linear setup probe is added, and the outputs are metrics_set4.json and
 reports/encoder_tables_set4.md. Models trained on several setups are labeled
 <model>-pre<S> in the tables.
+
+--scenarios N (stage 2 check): the sets are drawn from N scenarios sampled uniformly from
+the atlas grid points (scenarios.GRID: separation 50-200 mm step 2, laser pitch / yaw
+0-8 deg step 0.25; built on the fly, no atlas), plus the measured cell as setup 0 (the
+89 vs trapped set). Tilt cells from a 0.05 deg scan per scenario (DataConfig.scan_step;
+scenarios without >= 4 bounce cells draw from the box). The setup probe becomes a ridge
+probe of (separation, laser pitch, laser yaw); outputs metrics_full.json and
+reports/encoder_tables_full.md. --no-speed skips the forward timing.
 """
 
 import argparse
@@ -43,6 +51,7 @@ from scipy.optimize import linear_sum_assignment
 
 from encoders import EncoderConfig, FrameModel, count_params, model_name
 from frame_data import MODES, FrameData
+from geometry import CellGeometry
 from pretrain_encoder import ELL_SCALE_MM, RUNS_DIR, data_config
 from render_random import OOD_FACTORS
 from targets import REGIONS, vec_to_ellipse
@@ -213,9 +222,9 @@ def logistic_probe(Xtr, ytr, Xte, yte) -> Dict[str, float]:
 
 
 def probes(feat: torch.Tensor, ev: Dict[str, torch.Tensor], feat89: torch.Tensor,
-           pr: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, float]]:
+           pr: Dict[str, torch.Tensor], scen: bool = False) -> Dict[str, Dict[str, float]]:
     """Tilt, bounce and 89 vs trapped probes; features (n, D) of the eval set and of
-    the probe set."""
+    the probe set. scen: scenario-parameter probe instead of the setup classifier."""
     n = feat.shape[0]
     half = n // 2
     tr = torch.arange(n, device=feat.device) < half
@@ -226,6 +235,15 @@ def probes(feat: torch.Tensor, ev: Dict[str, torch.Tensor], feat89: torch.Tensor
     y = (pr["region"] == REGIONS.index("trapped")).float()
     h = feat89.shape[0] // 2
     out["89_vs_trapped"] = logistic_probe(feat89[:h], y[:h], feat89[h:], y[h:])
+    if scen:  # (separation, laser pitch, laser yaw) from one frame: ridge, per parameter
+        sc = ev["scen"]
+        out["scenario"] = {}
+        for j, name in enumerate(("sep_mm", "laser_pitch_deg", "laser_yaw_deg")):
+            y = sc[:, j:j + 1]
+            out["scenario"][name] = ridge_probe(feat[tr], y[tr], feat[~tr], y[~tr])
+            out["scenario"][name + "_ge3"] = ridge_probe(feat[tr & sel], y[tr & sel],
+                                                         feat[~tr & sel], y[~tr & sel])
+        return out
     S = int(ev["setup"].max()) + 1
     if S > 1:  # Setup from one frame: ridge on one-hot, argmax accuracy (all frames / >= 3 bounces)
         Y = F.one_hot(ev["setup"], S).float()
@@ -293,13 +311,16 @@ def run_label(run_dir: str) -> str:
     return m + (f"-pre{n}" if n > 1 else "")
 
 
-def evaluate_run(run_dir: str, data: FrameData, ev, pr, oracle, pix_probes) -> Dict:
+def evaluate_run(run_dir: str, data: FrameData, ev, pr, oracle, pix_probes,
+                 scen: bool = False, speed: bool = True) -> Dict:
     dev = data.device
     model = load_run(run_dir, dev)
     xs, ys = data.base.xs, data.base.ys
     region = ev["region"].cpu().numpy()
+    setups = ([f"{data.n_setups - 1} grid scenarios + measured"] if scen
+              else [g.name for g in data.setups])
     res = {"run": os.path.basename(run_dir), "model": model_name(model.cfg),
-           "label": run_label(run_dir), "eval_setups": [g.name for g in data.setups],
+           "label": run_label(run_dir), "eval_setups": setups, "eval_n": int(region.shape[0]),
            "params_encoder": count_params(model.encoder), "params_heads": count_params(model.heads),
            "sets": {}, "probes": {}}
     for mode in MODES:
@@ -321,7 +342,7 @@ def evaluate_run(run_dir: str, data: FrameData, ev, pr, oracle, pix_probes) -> D
                        "count_exact": float((o["count"].argmax(1) == ev["count"])[ev["ood_factor"] == i].float().mean())}
                 for i, name in enumerate(OOD_FACTORS)}
         o89 = predict(model, pr[f"image_{mode}"])
-        res["probes"][mode] = probes(o["z"], ev, o89["z"], pr)
+        res["probes"][mode] = probes(o["z"], ev, o89["z"], pr, scen)
         pos, pv = detect(o89["map"], xs, ys)
         m89 = match(pos, pv, pr["spots"], pr["spot_valid"])
         reg = pr["region"].cpu().numpy()
@@ -330,7 +351,8 @@ def evaluate_run(run_dir: str, data: FrameData, ev, pr, oracle, pix_probes) -> D
                    "count_exact": float((o89["count"].argmax(1) == pr["count"])[pr["region"] == REGIONS.index(name)].float().mean())}
             for name in ("89", "trapped")}
         res["sets"][mode] = r
-    res["speed"] = forward_time(model, ev["image_id"])
+    if speed:
+        res["speed"] = forward_time(model, ev["image_id"])
     res["oracle_detection"] = oracle
     res["pixel_probes"] = pix_probes
     cfg_path = os.path.join(run_dir, "config.json")
@@ -343,7 +365,7 @@ def evaluate_run(run_dir: str, data: FrameData, ev, pr, oracle, pix_probes) -> D
     return res
 
 
-def build_sets(data: FrameData, n: int = EVAL_N):
+def build_sets(data: FrameData, n: int = EVAL_N, scen: bool = False):
     ev = data.eval_set(n, EVAL_SEED)
     pr = data.probe_set_89_trapped(PROBE_PER_CLASS, PROBE_SEED)
     # Detector ceiling: the target map itself
@@ -357,7 +379,7 @@ def build_sets(data: FrameData, n: int = EVAL_N):
     for mode in MODES:
         f = F.avg_pool2d(ev[f"image_{mode}"].float(), 2).flatten(1)  # 32 x 32 pixels
         f89 = F.avg_pool2d(pr[f"image_{mode}"].float(), 2).flatten(1)
-        pix[mode] = probes(f, ev, f89, pr)
+        pix[mode] = probes(f, ev, f89, pr, scen)
     return ev, pr, oracle, pix
 
 
@@ -382,13 +404,14 @@ def tables(results: List[Dict]) -> str:
     L.append("|---|---|---|---|---|")
     for m in models:
         rs = by[m]
-        sp = rs[0]["speed"]
+        sp = rs[0].get("speed")
         tt = [r["train_time_s"] / 60 for r in rs if r.get("train_time_s")]
         tts = _mean_std(tt, '.1f') if tt else "-"
-        L.append(f"| {m} | {len(rs)} | {rs[0]['params_encoder'] / 1e6:.2f} M | {tts} | "
-                 f"{sp['eager_bf16_ms']:.1f} / {sp['eager_fp32_ms']:.1f} / {sp['compiled_bf16_ms']:.1f} |")
+        sps = (f"{sp['eager_bf16_ms']:.1f} / {sp['eager_fp32_ms']:.1f} / "
+               f"{sp['compiled_bf16_ms']:.1f}" if sp else "-")
+        L.append(f"| {m} | {len(rs)} | {rs[0]['params_encoder'] / 1e6:.2f} M | {tts} | {sps} |")
     for mode, title in (("id", "in-distribution"), ("clean", "clean"), ("ood", "OOD")):
-        L.append(f"\n**{title}** (n = {EVAL_N})\n")
+        L.append(f"\n**{title}** (n = {results[0].get('eval_n', EVAL_N)})\n")
         L.append("| model | precision | recall | loc err (mm) | count exact | count +-1 | "
                  "ell centre (mm) | ell a / b MAE (mm) | ell angle (deg) |")
         L.append("|---|---|---|---|---|---|---|---|---|")
@@ -457,6 +480,22 @@ def tables(results: List[Dict]) -> str:
                      f"{_mean_std(g(lambda p: p['bounces']['r2']), '.3f')} | "
                      f"{_mean_std(g(lambda p: p['bounces']['mae']), '.2f')} | "
                      f"{_mean_std(g(lambda p: p['89_vs_trapped']['accuracy']), '.3f')} |")
+    if "scenario" in results[0]["probes"]["id"]:
+        L.append("\n**Linear scenario probe on z** (ridge, test half; R^2 / RMSE, all frames "
+                 "and >= 3 bounces; separation mm, laser pitch / yaw deg)\n")
+        L.append("| model | set | separation | laser pitch | laser yaw | separation >= 3 | "
+                 "pitch >= 3 | yaw >= 3 |")
+        L.append("|---|---|---|---|---|---|---|---|")
+        names = ("sep_mm", "laser_pitch_deg", "laser_yaw_deg")
+        for m, rs, get in rows:
+            for mode in MODES:
+                cells = []
+                for sfx in ("", "_ge3"):
+                    for k in names:
+                        r2 = np.mean([get(r, mode)["scenario"][k + sfx]["r2"] for r in rs])
+                        rm = np.mean([get(r, mode)["scenario"][k + sfx]["rmse"] for r in rs])
+                        cells.append(f"{r2:.3f} / {rm:.2f}")
+                L.append(f"| {m} | {mode} | " + " | ".join(cells) + " |")
     if "setup" in results[0]["probes"]["id"]:
         L.append("\n**Linear setup probe on z** (4-way, test half; all frames / >= 3 bounces / "
                  "blind)\n")
@@ -568,6 +607,11 @@ def main():
     ap.add_argument("--setups", choices=("measured", "all"), default="measured",
                     help="Eval sets of the measured cell, or of all geometry.SETUPS")
     ap.add_argument("--no-figures", action="store_true")
+    ap.add_argument("--scenarios", type=int, default=0,
+                    help="Sets from this many scenarios sampled uniformly from the atlas grid "
+                         "(plus the measured cell); 0 = --setups")
+    ap.add_argument("--scenario-seed", type=int, default=0)
+    ap.add_argument("--no-speed", action="store_true", help="Skip the forward timing")
     ap.add_argument("--out", default=os.path.join(RL_DIR, "reports"),
                     help="Directory for the tables (default rl/reports)")
     args = ap.parse_args()
@@ -576,20 +620,36 @@ def main():
     runs = args.runs or sorted(d for d in glob.glob(os.path.join(RUNS_DIR, "*"))
                                if os.path.exists(os.path.join(d, "model.pt")))
     runs = [os.path.abspath(r) for r in runs]
-    data = FrameData(data_config(args.setups), dev)
-    sfx = f"_set{data.n_setups}" if args.setups == "all" else ""
+    scen = args.scenarios > 0
+    if scen:
+        from dataclasses import replace
+
+        from find_setups import setup_geometry
+        from scenarios import sample_grid
+
+        pts = sample_grid(args.scenarios, args.scenario_seed)
+        setups = (CellGeometry(),) + tuple(setup_geometry(*p) for p in pts)
+        data = FrameData(replace(data_config("measured"), setups=setups, scan_step=0.05), dev)
+        sfx = "_full"
+        print(f"{args.scenarios} grid scenarios (seed {args.scenario_seed}): separation "
+              f"{pts[:, 0].min():g}-{pts[:, 0].max():g} mm, laser pitch {pts[:, 1].min():g}-"
+              f"{pts[:, 1].max():g}, yaw {pts[:, 2].min():g}-{pts[:, 2].max():g} deg; "
+              f"{int((data.cell_count[1:] == 0).sum())} without >= 4 bounce cells")
+    else:
+        data = FrameData(data_config(args.setups), dev)
+        sfx = f"_set{data.n_setups}" if args.setups == "all" else ""
     metrics_name = f"metrics{sfx}.json"
     os.makedirs(args.out, exist_ok=True)
     os.makedirs(os.path.join(RL_DIR, "figures"), exist_ok=True)
 
     if not args.figures_only:
         t0 = time.time()
-        ev, pr, oracle, pix = build_sets(data, args.eval_n)
+        ev, pr, oracle, pix = build_sets(data, args.eval_n, scen)
         print(f"sets built in {time.time() - t0:.0f} s: eval {args.eval_n}, probe {pr['region'].shape[0]}, "
               f"oracle recall {oracle['recall']:.3f}")
         for rd in runs:
             t0 = time.time()
-            res = evaluate_run(rd, data, ev, pr, oracle, pix)
+            res = evaluate_run(rd, data, ev, pr, oracle, pix, scen, not args.no_speed)
             with open(os.path.join(rd, metrics_name), "w") as f:
                 json.dump(res, f, indent=1)
             s = res["sets"]

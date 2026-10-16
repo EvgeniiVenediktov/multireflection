@@ -193,9 +193,12 @@ class OraclePlan:
     setup: Optional[torch.Tensor] = None  # (n,) setup index per episode
 
 
-def sim_tilts(env: AlignEnv, tilts: torch.Tensor, setups: Optional[torch.Tensor] = None) -> dict:
-    """Sim of (n, 2) controlled tilts of setups (n,) (default 0), the env's states."""
-    return env.sim.simulate(env.states(tilts, setups), store_world=False)
+def sim_tilts(env: AlignEnv, tilts: torch.Tensor, setups: Optional[torch.Tensor] = None,
+              params: Optional[torch.Tensor] = None) -> dict:
+    """Sim of (n, 2) controlled tilts of setups (n,) (default 0), the env's states, or
+    of explicit scenario params (n, 3) (env.scenario_states); no per-hit outputs."""
+    st = env.states(tilts, setups) if params is None else env.scenario_states(tilts, params)
+    return env.sim.simulate(st, store_world=False, store_hits=False)
 
 
 @dataclass
@@ -266,9 +269,14 @@ def plan_oracle(
     chunk: int = 8,
     table: Optional[MoveTable] = None,
     setups: Optional[torch.Tensor] = None,
+    scenarios: Optional[torch.Tensor] = None,
+    path_ref: Optional[torch.Tensor] = None,
 ) -> OraclePlan:
     """Exact best clamp-free plan per (initial tilt, setup), see the module docstring.
-    setups (n,): default 0; the value uses each episode's P_ref."""
+    setups (n,): default 0; the value uses each episode's P_ref. Any scenario instead:
+    scenarios (n, 3) explicit (separation, laser pitch, laser yaw) per episode (every
+    other DOF as the env's setup 0) with path_ref (n,) their P_ref; setups is then only
+    recorded in the plan."""
     dev = env.device
     c = env.cfg
     u, L = c.step_unit, env.limit
@@ -281,6 +289,11 @@ def plan_oracle(
     single = env.n_setups == 1
     setups = (torch.zeros(n, dtype=torch.long, device=dev) if setups is None
               else setups.to(device=dev, dtype=torch.long))
+    if scenarios is not None:
+        assert path_ref is not None and path_ref.shape[0] == n and scenarios.shape == (n, 3)
+        scen = scenarios.to(device=dev, dtype=torch.float32)
+        pref = path_ref.to(device=dev).double()
+        single = False
     fields: Dict[str, List[torch.Tensor]] = {
         f: [] for f in ("disp", "moves", "actions", "ret", "path0", "tp", "tb", "tt", "maxp")
     }
@@ -294,12 +307,17 @@ def plan_oracle(
         su = setups[e0 : e0 + E]
         G = reach_grid(env, s, table)
         n_clamped += G.n_clamped
-        out = sim_tilts(env, G.tilts, None if single else su.repeat_interleave(W * W))
+        if scenarios is not None:
+            ref_e = pref[e0 : e0 + E]
+            out = sim_tilts(env, G.tilts, params=scen[e0 : e0 + E].repeat_interleave(W * W, 0))
+        else:
+            ref_e = env.p_nom if single else env.path_refs.double()[su]
+            out = sim_tilts(env, G.tilts, None if single else su.repeat_interleave(W * W))
         P = out["total_path_length"].view(E, W, W)
         nb = out["hit_counts"].view(E, W, W)
         del out
         m = G.m
-        ref = env.p_nom if single else env.path_refs.double()[su][:, None, None]
+        ref = ref_e if single else ref_e[:, None, None]
         val = torch.where(G.ok, P.double() / ref - c.step_cost * m.double(), -math.inf)
         kx, ky = _best_cell(val, m)
         e = torch.arange(E, device=dev)
@@ -309,7 +327,6 @@ def plan_oracle(
         fields["moves"].append(mt)
         acts = torch.stack((G.seqx[e, kx], G.seqy[e, ky]), -1)  # (E, T, 2)
         fields["actions"].append(F.pad(acts, (0, 0, 0, 1)))
-        ref_e = env.p_nom if single else env.path_refs.double()[su]
         fields["ret"].append(
             (P[e, kx, ky].double() - p0.double()) / ref_e - c.step_cost * mt.double()
         )

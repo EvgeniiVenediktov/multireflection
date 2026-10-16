@@ -11,8 +11,9 @@ Run from rl/:  uv run python tests/test_agent.py
     2. factorized log-prob / entropy vs the joint 121-way categorical; Gumbel-max
        sampling frequencies; uniform start (small policy init)
     3. GAE on a hand-made sequence with a termination and a truncation vs a scalar loop
-    4. label alignment: every stored frame re-rendered from its stored (tilt, setup)
-       labels, path label = re-simulated path / P_ref (post-reset labels at resets)
+    4. label alignment: every stored frame re-rendered from its stored (tilt, scenario
+       parameters) labels, path label = re-simulated path / P_ref (post-reset labels at
+       resets)
     5. checkpoint save / resume: the resumed trainer continues the same rollout and gives
        an identical next update on the same data
     6. no host syncs in rollout() (torch.cuda.set_sync_debug_mode("error")), eager and
@@ -37,9 +38,9 @@ DEV = torch.device("cuda")
 
 
 def small_cfg(**kw) -> PPOConfig:
-    base = dict(num_envs=16, rollout_len=24, max_steps=6, history_len=6, d_model=64,
-                n_layers=2, n_heads=4, mlp_ratio=2.0, amp=False, compile=False, wandb=False,
-                minibatches=4, eval_every=0, seed=3)
+    base = dict(setups="all", num_envs=16, rollout_len=24, max_steps=6, history_len=6,
+                d_model=64, n_layers=2, n_heads=4, mlp_ratio=2.0, amp=False, compile=False,
+                wandb=False, minibatches=4, eval_every=0, seed=3, total_env_steps=10**6)
     base.update(kw)
     return PPOConfig(**base)
 
@@ -93,7 +94,7 @@ def test_agreement():
             d_logit = float((ev["logits"] - lg).abs().max())
             d_value = float((ev["value"] - vv).abs().max())
             d_logp = float((log_prob(ev["logits"], b.actions) - b.logp).abs().max())
-            for k in ("path", "tilt_mu", "setup_logits"):
+            for k in ("path", "tilt_mu", "scen_mu", "scen_logvar"):
                 a = torch.stack([rec.calls[t][0][k] for t in range(T)], 1)
                 assert float((ev[k] - a).abs().max()) < 1e-5, k
             # Unfrozen path: z recomputed from the stored frames
@@ -223,11 +224,14 @@ def test_labels():
     b, env = tr.buf, tr.env
     B, T, C = b.B, b.T, b.C
     tilt = b.tilt.flatten(0, 1)
-    setup = b.setup.flatten(0, 1)
-    out = env.render_tilts(tilt, setup)
+    params = tr.agent.scen_denorm(b.scen.flatten(0, 1))
+    setup = (params[:, None] - env.setup_params[None]).abs().amax(-1).argmin(1)
+    assert float((env.setup_params[setup] - params).abs().max()) < 1e-4
+    out = env.sim.simulate(env.scenario_states(tilt, params), store_world=False)
+    img = env._render(out)
     frames = b.frames[:, C:].flatten(0, 1)
-    same = (out["image"] == frames).flatten(1).all(1)
-    pn = out["path_mm"] / env.path_refs[setup]
+    same = (img == frames).flatten(1).all(1)
+    pn = out["total_path_length"] / env.path_refs[setup]
     d_path = float((pn - b.path.flatten()).abs().max())
     resets = b.first[:, C:].flatten()
     print(f"  {B * T} steps ({int(resets.sum())} at episode starts): image re-rendered from the "

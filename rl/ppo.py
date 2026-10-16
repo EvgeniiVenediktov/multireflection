@@ -1,21 +1,31 @@
 """
-ppo.py - PPO trainer for the alignment agent (PLAN phase 6: P1-P6, T1-T6)
+ppo.py - PPO trainer for the alignment agent (PLAN phase 6: P1-P6, T1-T6; stage 2)
 
 Run from rl/:
     uv run python ppo.py --encoder-init runs/encoder/<run>/model.pt          # defaults below
-    uv run python ppo.py --num-envs 64 --total-env-steps 100000 --no-wandb   # smoke
+    uv run python ppo.py --setups all --num-envs 64 --total-env-steps 100000 --no-wandb  # smoke
     uv run python ppo.py --run-dir <dir> --resume                            # continue latest.pt
 Cluster: cluster/ppo_l40s.slurm.
 
-    env        AlignEnv: the four geometry.SETUPS (--setups all) or the measured cell,
-               P_ref = per-setup P_max, auto-reset, history_len 0 (the agent keeps the
-               windows), max_steps 64, step_cost 0.01, 64 px; envs persist across
-               iterations (episodes span rollouts)
+    env        AlignEnv, auto-reset, history_len 0 (the agent keeps the windows), max_steps
+               64, step_cost 0.01, 64 px; envs persist across iterations (episodes span
+               rollouts). --setups full (default, stage 2): the scenario atlas
+               (scenarios.py; --atlas, built there if missing), P_ref per scenario =
+               max(P_max, P_floor), scenarios drawn per episode by the regret-prioritized
+               ScenarioSampler (--plr; --no-plr: uniform over the good set; 10 %
+               impossible either way). --setups all: the four geometry.SETUPS, P_ref =
+               per-setup P_max; measured: the measured cell
+    init       --encoder-init: encoder weights of a pretrain_encoder.py checkpoint.
+               --init-from: a previous ppo.py checkpoint, every tensor whose name and
+               shape match (encoder, token, core, policy / value / path / tilt heads; the
+               skipped and missing ones are printed and kept in config.json), its
+               value-norm statistics; fresh optimizer, counters, entropy coefficient
     rollout    T steps per env with agent.act(): one frame encoded per env and step,
                actions sampled per factor (Gumbel-max). Stored per env as a sequence of
                K - 1 context positions (the ring of the previous rollout) + T steps:
                frames (uint8), z, applied actions, first / real flags; labels of the
-               frame at each step (path_norm, tilt, setup of the obs the agent saw)
+               frame at each step (path_norm, tilt, scenario parameters of the obs the
+               agent saw). Episode ends update the sampler's scores (scatter ops)
     bootstrap  terminated (not move): none; truncated: V of the final (pre-reset) frame
                and its window. The final frames go into ceil(T / max_steps) slots per env
                during the rollout (no sync); their values are computed after the last
@@ -27,48 +37,70 @@ Cluster: cluster/ppo_l40s.slurm.
                correction) for the value loss; values are de-normalized for GAE
     update     epochs x minibatches by env (all T steps of B / n_minibatches envs),
                windows recomputed by agent.evaluate_windows; clipped PPO + value +
-               entropy (sum over the two factors) + auxiliary losses (path MSE, tilt
-               Gaussian NLL, setup CE); AdamW, grad clip, target-KL early stop after
-               each epoch
+               entropy (sum over the two factors) + auxiliary losses (path MSE, tilt and
+               scenario Gaussian NLL); AdamW, grad clip, target-KL early stop after each
+               epoch
+    lr         linear warmup over --lr-warmup iterations (from lr / warmup to the peak
+               --lr), then cosine decay to lr x --lr-final-frac at --total-env-steps
+               (lr_at); encoder groups at lr x --encoder-lr-scale
+    entropy    --ent-adaptive (default): coefficient alpha with a target entropy that
+               decays linearly from --ent-target-start to --ent-target-end nats (joint
+               entropy of the two factors) over the first --ent-target-frac of the env
+               steps, then stays; per minibatch log alpha -= --ent-lr x (H - target)
+               (dual gradient), clamped to [--ent-coef-min, --ent-coef-max], initial
+               --ent-coef. --no-ent-adaptive: fixed --ent-coef
     encoder    --encoder-freeze (default): the update reuses the rollout's z (no encoder
                backward). --unfreeze-at ITER: from that iteration the encoder trains at
                lr x --encoder-lr-scale; z is recomputed with grad from the stored frames
-               (checkpointed chunks), and the ring is re-encoded at each rollout start
-    eval       every --eval-every iterations and at the end: evaluation.evaluate on the
-               seeded set of (initial tilt, setup) pairs, separate env without
-               auto-reset, argmax policy; oracle reference (baselines.plan_oracle)
-               computed once and cached in the run dir
+               (bf16, channels_last, compiled; activation-checkpointed chunks, or one pass
+               without recompute with --no-enc-checkpoint), once per frame and epoch; the
+               ring is re-encoded at each rollout start
+    eval       every --eval-every iterations and at the end, separate envs without
+               auto-reset, deterministic (argmax) and sampled (one seeded sample per
+               episode and step, --eval-sampled) policies; oracle reference
+               (baselines.plan_oracle) computed once per set and cached in the run dir.
+               Sets: "full" (--setups full): --eval-n (initial tilt, scenario) pairs,
+               scenarios 90 % uniform over the good set and 10 % over the impossible set
+               (scenarios.eval_scenarios), splits all / blind / informative / good /
+               impossible / separation bins (good scenarios); "set4": the four setups'
+               set of run 4398136 (with --setups full only with --eval-set4); "measured"
+               with --setups measured. Prefixes: eval_full/, eval_full_samp/ and, for the
+               four-setup set, eval/ (the keys of run 4398136) and eval_samp/
     logging    train.csv / eval.csv in the run dir; W&B (project herriott-rl) unless
                --no-wandb, display name built at start from the config
-    checkpoint latest.pt (every --ckpt-minutes and at exit), best.pt (best eval mean
-               return): agent, optimizer, value norm, counters, RNG, env and ring state,
-               config. SIGTERM / SIGUSR1: abort the current rollout, write latest.pt,
-               exit 0
+    checkpoint latest.pt (every --ckpt-minutes and at exit), best.pt (best deterministic
+               % of the oracle: on the full set with --setups full, else on the set of
+               the run): agent, optimizer, value norm, entropy coefficient, sampler,
+               counters, RNG, env and ring state, config. SIGTERM / SIGUSR1: abort the
+               current rollout, write latest.pt, exit 0
 Host syncs: none inside a rollout step; one per epoch (KL early stop) and a few per
-iteration for logging; evaluation syncs per step (evaluation.evaluate).
+iteration for logging (sampler statistics); evaluation syncs per step
+(evaluation.evaluate).
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
+import re
 import signal
 import time
 import uuid
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from agent import Agent, AgentConfig, Ring, entropy, greedy, log_prob, param_groups, sample
 from env import AlignEnv, EnvConfig
-from evaluation import eval_initial_tilts, eval_setups, evaluate
+from evaluation import BLIND_MAX_BOUNCES, eval_initial_tilts, eval_setups, evaluate, split_metrics
 from geometry import SETUPS, CellGeometry
 
 RL_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(RL_DIR, "runs", "ppo")
+SETUP_CHOICES = ("full", "all", "measured")
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -79,16 +111,26 @@ class PPOConfig:
     """Trainer settings (CLI arguments with the same names)."""
 
     # ── Env ──
-    setups: str = "all"  # all = geometry.SETUPS, measured = the measured cell only
+    setups: str = "full"  # full = scenario atlas, all = geometry.SETUPS, measured = one cell
+    atlas: str = ""  # --setups full: atlas file ("" = scenarios.DEFAULT_ATLAS), built if missing
     num_envs: int = 1024
     rollout_len: int = 128
     max_steps: int = 64
     step_cost: float = 0.01
     img_res: int = 64
-    path_ref: str = "max"
+    path_ref: str = "max"  # --setups all / measured; full: the atlas P_ref
     init_center: Tuple[float, float] = (0.0, 0.0)
     init_radius: float = 2.0
     seed: int = 0
+
+    # ── Scenario sampler (--setups full) ──
+    plr: bool = True  # Regret-prioritized replay; False: good scenarios uniform
+    plr_impossible: float = 0.1  # Share of draws from the impossible set
+    plr_alpha: float = 0.3  # Score EMA
+    plr_p_fresh: float = 0.3  # Fresh uniform share of the good draws (1 until min_seen)
+    plr_min_seen: int = 2048
+    plr_beta: float = 1.0  # Rank temperature (0.3 put ~half of all episodes on one scenario)
+    plr_rho: float = 0.1  # Staleness share
 
     # ── Agent ──
     history_len: int = 16  # Window K of the agent (the env's own stack is off)
@@ -97,10 +139,12 @@ class PPOConfig:
     n_heads: int = 4
     mlp_ratio: float = 4.0
     encoder_init: str = ""
+    init_from: str = ""  # Previous ppo.py checkpoint (matching tensors, value norm)
     encoder_freeze: bool = True
     unfreeze_at: int = -1  # Iteration at which the encoder starts training; -1 = never
     encoder_lr_scale: float = 0.1
     enc_chunk: int = 1024
+    enc_checkpoint: bool = True  # Unfrozen encoder: checkpointed chunks (False: no recompute)
     amp: bool = True
     compile: bool = True
 
@@ -111,41 +155,92 @@ class PPOConfig:
     minibatches: int = 8
     clip: float = 0.2
     vf_coef: float = 0.5
-    ent_coef: float = 0.01
+    ent_coef: float = 0.01  # Initial (adaptive) or fixed entropy coefficient
+    ent_adaptive: bool = True
+    ent_target_start: float = 2.0  # nats, joint entropy of the two factors
+    ent_target_end: float = 0.7
+    ent_target_frac: float = 0.8  # Share of total_env_steps over which the target decays
+    ent_lr: float = 1e-3  # Dual-gradient step on log alpha per minibatch
+    ent_coef_min: float = 1e-4
+    ent_coef_max: float = 0.1
     path_coef: float = 0.5
     tilt_coef: float = 0.1
-    setup_coef: float = 0.1
-    lr: float = 3e-4
+    scen_coef: float = 0.1
+    lr: float = 3e-4  # Peak
+    lr_warmup: int = 20  # Iterations of linear warmup
+    lr_final_frac: float = 0.1  # Cosine decay to lr x this at total_env_steps
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     target_kl: float = 0.02
     value_norm_beta: float = 0.99
 
     # ── Run ──
-    total_env_steps: int = 200_000_000
-    eval_every: int = 200  # ~15 min on an L40S at B = 1024 (estimate, see the slurm header)
+    total_env_steps: int = 0  # 0 = 1e9 with --setups full, else 2e8
+    eval_every: int = 200  # ~15 min on an L40S at B = 1024 with the frozen encoder
     eval_n: int = 4096
     eval_envs: int = 2048
     eval_seed: int = 0
+    eval_impossible: float = 0.1  # Impossible share of the full eval set
+    eval_set4: bool = True  # --setups full: also the four-setup set
+    eval_sampled: bool = True  # Also the sampled policy
     ckpt_minutes: float = 15.0
     wandb: bool = True
     wandb_project: str = "herriott-rl"
     name_tag: str = ""
 
 
-def env_config(c: PPOConfig, num_envs: int, auto_reset: bool, seed: int) -> EnvConfig:
+def default_total_steps(c: PPOConfig) -> int:
+    return 1_000_000_000 if c.setups == "full" else 200_000_000
+
+
+def env_config(c: PPOConfig, num_envs: int, auto_reset: bool, seed: int,
+               setups: Optional[str] = None) -> EnvConfig:
+    """EnvConfig of the trainer; setups overrides c.setups (full: no setups, the
+    scenario table is passed to AlignEnv)."""
+    s = setups or c.setups
+    geoms = () if s == "full" else (SETUPS if s == "all" else (CellGeometry(),))
     return EnvConfig(
-        num_envs=num_envs, seed=seed, setups=SETUPS if c.setups == "all" else (CellGeometry(),),
-        path_ref=c.path_ref, max_steps=c.max_steps, step_cost=c.step_cost, auto_reset=auto_reset,
-        init_center=tuple(c.init_center), init_radius=c.init_radius, img_res=c.img_res,
-        history_len=0,
+        num_envs=num_envs, seed=seed, setups=geoms, path_ref=c.path_ref, max_steps=c.max_steps,
+        step_cost=c.step_cost, auto_reset=auto_reset, init_center=tuple(c.init_center),
+        init_radius=c.init_radius, img_res=c.img_res, history_len=0,
     )
 
 
-def agent_config(c: PPOConfig, n_bins: int, n_setups: int) -> AgentConfig:
+def agent_config(c: PPOConfig, n_bins: int) -> AgentConfig:
     return AgentConfig(window=c.history_len, d_model=c.d_model, n_layers=c.n_layers,
-                       n_heads=c.n_heads, mlp_ratio=c.mlp_ratio, n_bins=n_bins,
-                       n_setups=n_setups, amp=c.amp, enc_chunk=c.enc_chunk)
+                       n_heads=c.n_heads, mlp_ratio=c.mlp_ratio, n_bins=n_bins, amp=c.amp,
+                       enc_chunk=c.enc_chunk, enc_checkpoint=c.enc_checkpoint)
+
+
+# ── Schedules ───────────────────────────────────────────────────────────────
+
+
+def lr_at(c: PPOConfig, iteration: int, env_steps: int) -> float:
+    """Learning rate of the update at this iteration (env_steps before its rollout):
+    peak c.lr x (iteration + 1) / lr_warmup during the warmup, then cosine from the
+    peak at the end of the warmup to lr x lr_final_frac at total_env_steps (constant
+    after)."""
+    if iteration < c.lr_warmup:
+        return c.lr * (iteration + 1) / c.lr_warmup
+    s0 = c.lr_warmup * c.num_envs * c.rollout_len
+    prog = min(max((env_steps - s0) / max(c.total_env_steps - s0, 1), 0.0), 1.0)
+    lo = c.lr * c.lr_final_frac
+    return lo + (c.lr - lo) * 0.5 * (1.0 + math.cos(math.pi * prog))
+
+
+def ent_target_at(c: PPOConfig, env_steps: int) -> float:
+    """Target entropy: linear from ent_target_start to ent_target_end over the first
+    ent_target_frac of total_env_steps, then constant."""
+    f = min(env_steps / max(c.ent_target_frac * c.total_env_steps, 1.0), 1.0)
+    return c.ent_target_start + (c.ent_target_end - c.ent_target_start) * f
+
+
+def ent_coef_step(log_alpha: torch.Tensor, ent: torch.Tensor, target: float,
+                  c: PPOConfig) -> torch.Tensor:
+    """Dual-gradient step on log alpha: down when the entropy is above the target, up
+    when below; clamped to [log ent_coef_min, log ent_coef_max] (no host sync)."""
+    la = log_alpha - c.ent_lr * (ent.detach().float() - target)
+    return la.clamp(math.log(c.ent_coef_min), math.log(c.ent_coef_max))
 
 
 # ── Value normalization ─────────────────────────────────────────────────────
@@ -243,7 +338,7 @@ class Rollout:
         self.trunc = z(B, T, dtype=torch.bool)
         self.path = z(B, T)  # Labels of the frame at each step
         self.tilt = z(B, T, 2)
-        self.setup = z(B, T, dtype=torch.long)
+        self.scen = z(B, T, 3)  # Scenario parameters in scenario-head units
         self.slot_t = z(B, n_slots, dtype=torch.long)  # Truncation step per slot, -1 = none
         self.slot_frame = z(B, n_slots, 1, res, res, dtype=torch.uint8)
         self.slot_a = z(B, n_slots, 2)
@@ -253,15 +348,17 @@ class Rollout:
         self.ret = z(B, T)
 
 
-# ── Trainer ─────────────────────────────────────────────────────────────────
+# ── Evaluation ──────────────────────────────────────────────────────────────
 
 
 class EvalPolicy:
-    """evaluation.Policy adapter: argmax actions through the agent's act() path; the
-    state is the agent's Ring. Accumulates head diagnostics over active steps."""
+    """evaluation.Policy adapter through the agent's act() path; the state is the
+    agent's Ring. gen: sampled actions (Gumbel-max from this generator), else argmax.
+    Accumulates head diagnostics over active steps."""
 
-    def __init__(self, agent: Agent):
+    def __init__(self, agent: Agent, gen: Optional[torch.Generator] = None):
         self.agent = agent
+        self.gen = gen
         self.sums: Dict[str, torch.Tensor] = {}
 
     def _acc(self, k: str, v: torch.Tensor):
@@ -276,23 +373,53 @@ class EvalPolicy:
         m = info["active"].float()
         pn = info["path_mm"] / info["path_ref"]
         tilt_err = (out["tilt_mu"] * ag.cfg.tilt_scale - info["tilt"]).abs().mean(-1)
+        scen_err = (ag.scen_denorm(out["scen_mu"]) - info["scenario_params"]).abs()
         seen = (info["bounces"] >= 3).float() * m
         self._acc("n", m)
         self._acc("path_mae", (out["path"] - pn).abs() * m)
-        self._acc("setup_acc", (out["setup_logits"].argmax(-1) == info["setup"]).float() * m)
         self._acc("tilt_mae_deg", tilt_err * m)
         self._acc("n_seen", seen)
         self._acc("tilt_mae_deg_ge3", tilt_err * seen)
         self._acc("tilt_std_deg", (0.5 * out["tilt_logvar"]).exp().mean(-1) * ag.cfg.tilt_scale * m)
-        return greedy(out["logits"]), state
+        for j, k in enumerate(("sep_mae_mm", "laser_pitch_mae_deg", "laser_yaw_mae_deg")):
+            self._acc(k, scen_err[:, j] * m)
+        act = greedy(out["logits"]) if self.gen is None else sample(out["logits"], self.gen)
+        return act, state
 
     def diagnostics(self) -> Dict[str, float]:
         s = {k: float(v) for k, v in self.sums.items()}
         n, ns = max(s.get("n", 0.0), 1.0), max(s.get("n_seen", 0.0), 1.0)
-        return {"head_path_mae": s.get("path_mae", 0) / n, "head_setup_acc": s.get("setup_acc", 0) / n,
-                "head_tilt_mae_deg": s.get("tilt_mae_deg", 0) / n,
-                "head_tilt_mae_deg_ge3": s.get("tilt_mae_deg_ge3", 0) / ns,
-                "head_tilt_std_deg": s.get("tilt_std_deg", 0) / n}
+        out = {"head_path_mae": s.get("path_mae", 0) / n,
+               "head_tilt_mae_deg": s.get("tilt_mae_deg", 0) / n,
+               "head_tilt_mae_deg_ge3": s.get("tilt_mae_deg_ge3", 0) / ns,
+               "head_tilt_std_deg": s.get("tilt_std_deg", 0) / n}
+        for k in ("sep_mae_mm", "laser_pitch_mae_deg", "laser_yaw_mae_deg"):
+            out[f"head_{k}"] = s.get(k, 0) / n
+        return out
+
+
+@dataclass
+class EvalSet:
+    """A fixed evaluation set: env, (initial tilt, setup / scenario) pairs, oracle."""
+
+    name: str  # full / set4 / measured
+    env: AlignEnv
+    tilts: torch.Tensor
+    setups: torch.Tensor
+    oracle: Dict[str, Any]
+    prefix: str  # Deterministic policy
+    prefix_samp: str  # Sampled policy
+    splits: Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
+
+
+def _digest(*ts: torch.Tensor) -> str:
+    h = hashlib.sha1()
+    for t in ts:
+        h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+# ── Trainer ─────────────────────────────────────────────────────────────────
 
 
 class Trainer:
@@ -301,23 +428,64 @@ class Trainer:
     def __init__(self, cfg: PPOConfig, run_dir: str = "", device: Optional[torch.device] = None,
                  build_eval: bool = True, load_encoder: bool = True):
         """run_dir: default runs/ppo/<name>. load_encoder False: skip cfg.encoder_init
-        (resume: the weights come from the checkpoint)."""
+        and cfg.init_from (resume: the weights come from the checkpoint)."""
         self.cfg = c = cfg
+        if c.total_env_steps <= 0:
+            c.total_env_steps = default_total_steps(c)
+        assert c.setups in SETUP_CHOICES, f"setups {c.setups!r} not in {SETUP_CHOICES}"
         self.device = dev = torch.device(device or "cuda")
         torch.manual_seed(c.seed)
 
+        # ── Atlas and sampler (--setups full) ──
+        self.atlas = self.sampler = None
+        scen_kw: Dict[str, Any] = {}
+        if c.setups == "full":
+            from scenarios import DEFAULT_ATLAS, SamplerConfig, ScenarioSampler, load_or_build
+
+            c.atlas = os.path.abspath(c.atlas or DEFAULT_ATLAS)
+            t0 = time.time()
+            self.atlas = load_or_build(c.atlas, dev, log=lambda s: print(s, flush=True))
+            ec = EnvConfig()
+            self.atlas.check(ec.max_bounces, ec.geometry.m2_tilt_limit, ec.step_unit)
+            print(f"{self.atlas.summary()}\natlas ready in {time.time() - t0:.1f} s", flush=True)
+            self.sampler = ScenarioSampler(self.atlas, SamplerConfig(
+                impossible_share=c.plr_impossible, alpha=c.plr_alpha, p_fresh=c.plr_p_fresh,
+                min_seen=c.plr_min_seen, beta=c.plr_beta, rho=c.plr_rho, replay=c.plr))
+            scen_kw = {"scenarios": self.atlas.table(), "sampler": self.sampler}
+
         # ── Env and agent ──
-        self.env = AlignEnv(env_config(c, c.num_envs, True, c.seed))
+        self.env = AlignEnv(env_config(c, c.num_envs, True, c.seed), **scen_kw)
         self.names = [g.name for g in self.env.setups]
-        self.agent = Agent(agent_config(c, self.env.n_bins, self.env.n_setups)).to(dev)
-        self.encoder_info = (self.agent.load_encoder(c.encoder_init)
-                             if c.encoder_init and load_encoder else None)
+        self.agent = Agent(agent_config(c, self.env.n_bins)).to(dev)
+        self.vnorm = ValueNorm(c.value_norm_beta, dev)
+        # init_from first (all matching tensors), then encoder_init, so a freshly pretrained
+        # encoder can replace the one in the PPO checkpoint
+        self.encoder_info = None
+        self.init_info: Optional[Dict[str, Any]] = None
+        if c.init_from and load_encoder:
+            info = self.agent.init_from(c.init_from)
+            if info.get("vnorm") is not None:
+                self.vnorm.load_state_dict(info["vnorm"])
+            if info.get("encoder_info") is not None:
+                self.encoder_info = info["encoder_info"]
+            self.init_info = {k: v for k, v in info.items() if k != "vnorm"}
+            other = sorted(k for k in info["skipped"] if not k.startswith("setup."))
+            print(f"init from {info['path']} ({info['name']}, iteration {info['iteration']}): "
+                  f"{len(info['loaded'])} tensors loaded; skipped {sorted(info['skipped'])}; "
+                  f"fresh {info['missing']}; value norm from the checkpoint", flush=True)
+            if other:
+                print(f"WARNING: init-from skipped tensors beyond the setup head: {other}",
+                      flush=True)
+        if c.encoder_init and load_encoder:
+            self.encoder_info = self.agent.load_encoder(c.encoder_init)
+            if c.init_from:
+                print(f"encoder replaced by {c.encoder_init} after init-from", flush=True)
         if c.compile:
             self.agent.compile()
         self.opt = torch.optim.AdamW(
             param_groups(self.agent, c.lr, c.weight_decay, c.encoder_lr_scale),
             lr=c.lr, betas=(0.9, 0.999), eps=1e-5)
-        self.vnorm = ValueNorm(c.value_norm_beta, dev)
+        self.log_alpha = torch.tensor(math.log(c.ent_coef), device=dev)
         self.gen = torch.Generator(device=dev)  # Action sampling
         self.gen.manual_seed(c.seed * 1_000_003 + 17)
         self.gen_mb = torch.Generator(device=dev)  # Minibatch permutations
@@ -333,13 +501,13 @@ class Trainer:
         self.iteration = 0
         self.env_steps = 0
         self.best_eval = -math.inf
+        self.best_metric = "eval_full/all/pct_oracle" if c.setups == "full" else "eval/all/pct_oracle"
         self.wandb_id: Optional[str] = None
         self.name = run_name(c, self.encoder_info)
         self.run_dir = run_dir or os.path.join(RUNS_DIR, self.name)
         os.makedirs(self.run_dir, exist_ok=True)
         self.stop_signal: Optional[int] = None
-        self.eval_env: Optional[AlignEnv] = None
-        self.oracle: Optional[Dict[str, Any]] = None
+        self.eval_sets: Optional[List[EvalSet]] = None
         self._build_eval = build_eval
 
     # ── Helpers ──
@@ -395,7 +563,7 @@ class Trainer:
             b.values[:, t] = self.vnorm.denormalize(out["value"])
             b.path[:, t] = lab["path_norm"]
             b.tilt[:, t] = lab["tilt"]
-            b.setup[:, t] = lab["setup"]
+            b.scen[:, t] = ag.scen_norm(lab["scenario_params"])
             self.ring = ring
 
             obs, rew, term, trunc, info = env.step(action)
@@ -410,6 +578,9 @@ class Trainer:
                 b.slot_a[:, s] = torch.where(w[:, None], info["applied_action"], b.slot_a[:, s])
             slot_n = slot_n + trunc.long()
             done = term | trunc
+            if self.sampler is not None:
+                self.sampler.observe(info["setup"], info["ep_final_path_mm"], done,
+                                     info["scenario_src"])
             d = done.double()
             st["n"] += d.sum()
             st["ret"] += (info["ep_return"].double() * d).sum()
@@ -436,8 +607,14 @@ class Trainer:
     # ── Update ──
 
     def update(self) -> Dict[str, torch.Tensor]:
-        """GAE, value-norm update and the PPO epochs on self.buf; returns stats."""
+        """GAE, value-norm update and the PPO epochs on self.buf; returns stats. Sets
+        the learning rate of this iteration (lr_at) and, with ent_adaptive, steps the
+        entropy coefficient after every minibatch."""
         c, ag, b = self.cfg, self.agent, self.buf
+        lr = lr_at(c, self.iteration, self.env_steps)
+        for g in self.opt.param_groups:
+            g["lr"] = lr * g.get("lr_scale", 1.0)
+        target = ent_target_at(c, self.env_steps)
         adv, ret = gae(b.rewards, b.values, b.term, b.trunc, b.v_final, b.v_last,
                        c.gamma, c.gae_lambda)
         b.adv.copy_(adv)
@@ -450,8 +627,8 @@ class Trainer:
         Bm = B // c.minibatches
         assert Bm * c.minibatches == B, "num_envs must be divisible by minibatches"
         params = [p for p in ag.parameters() if p.requires_grad]
-        keys = ("loss", "pg", "vf", "ent", "path", "tilt", "setup", "kl", "clipfrac", "gn",
-                "ratio_dev")
+        keys = ("loss", "pg", "vf", "ent", "path", "tilt", "scen", "kl", "clipfrac", "gn",
+                "ent_coef", "ratio_dev")
         acc = {k: torch.zeros((), device=self.device) for k in keys}
         n_mb = 0
         epochs = 0
@@ -478,22 +655,28 @@ class Trainer:
                 tt = b.tilt[idx] / ag.cfg.tilt_scale
                 lv = out["tilt_logvar"]
                 l_tilt = (0.5 * (lv + (tt - out["tilt_mu"]) ** 2 * torch.exp(-lv))).mean()
-                l_setup = F.cross_entropy(out["setup_logits"].flatten(0, 1), b.setup[idx].flatten())
-                loss = (pg + c.vf_coef * vf - c.ent_coef * ent + c.path_coef * l_path
-                        + c.tilt_coef * l_tilt + c.setup_coef * l_setup)
+                lvs = out["scen_logvar"]
+                l_scen = (0.5 * (lvs + (b.scen[idx] - out["scen_mu"]) ** 2 * torch.exp(-lvs))).mean()
+                alpha = self.log_alpha.exp() if c.ent_adaptive else c.ent_coef
+                loss = (pg + c.vf_coef * vf - alpha * ent + c.path_coef * l_path
+                        + c.tilt_coef * l_tilt + c.scen_coef * l_scen)
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
                 gn = torch.nn.utils.clip_grad_norm_(params, c.max_grad_norm)
                 self.opt.step()
                 with torch.no_grad():
+                    if c.ent_adaptive:
+                        self.log_alpha = ent_coef_step(self.log_alpha, ent, target, c)
                     kl = ((ratio - 1) - logr).mean()
                     ekl += kl
                     if epoch == 0 and i == 0:
                         acc["ratio_dev"] += (ratio - 1).abs().max()
                     for k, v in (("loss", loss), ("pg", pg), ("vf", vf), ("ent", ent),
-                                 ("path", l_path), ("tilt", l_tilt), ("setup", l_setup),
+                                 ("path", l_path), ("tilt", l_tilt), ("scen", l_scen),
                                  ("kl", kl), ("gn", gn)):
                         acc[k] += v.detach().float()
+                    acc["ent_coef"] += torch.as_tensor(alpha, dtype=torch.float32,
+                                                       device=self.device)
                     acc["clipfrac"] += ((ratio - 1).abs() > c.clip).float().mean()
                 n_mb += 1
             epochs += 1
@@ -504,6 +687,9 @@ class Trainer:
         out = {k: v / max(n_mb, 1) for k, v in acc.items() if k != "ratio_dev"}
         out["ratio_dev_first_mb"] = acc["ratio_dev"]
         out["epochs"] = torch.tensor(float(epochs))
+        out["lr"] = torch.tensor(lr)
+        out["ent_target"] = torch.tensor(target)
+        out["ent_coef_now"] = self.log_alpha.exp() if c.ent_adaptive else torch.tensor(c.ent_coef)
         with torch.no_grad():
             vr = ret.var()
             out["explained_var"] = 1 - (ret - b.values).var() / vr.clamp(min=1e-12)
@@ -516,71 +702,136 @@ class Trainer:
 
     # ── Evaluation ──
 
-    def _eval_set(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Seeded (initial tilt, setup) pairs; tilts mapped into the init box (the
-        default box is the full +-limit box, identical to eval_initial_tilts)."""
-        c, env = self.cfg, self.eval_env
-        L = env.limit
-        u = eval_initial_tilts(c.eval_n, c.eval_seed, L)
+    def _init_tilts(self, n: int, limit: float) -> torch.Tensor:
+        """Seeded initial tilts mapped into the init box (the default box is the full
+        +-limit box, identical to eval_initial_tilts)."""
+        c = self.cfg
+        u = eval_initial_tilts(n, c.eval_seed, limit)
         center = torch.tensor(c.init_center, dtype=torch.float32)
-        tilts = (center + (c.init_radius / L) * u).clamp(-L, L)
-        setups = (eval_setups(c.eval_n, env.n_setups, c.eval_seed) if env.n_setups > 1
-                  else torch.zeros(c.eval_n, dtype=torch.long))
-        return tilts.to(self.device), setups.to(self.device)
+        return (center + (c.init_radius / limit) * u).clamp(-limit, limit).to(self.device)
 
-    def setup_eval(self):
-        """Eval env, eval set and the oracle reference (cached in the run dir)."""
+    def _oracle(self, env: AlignEnv, tilts: torch.Tensor, setups: torch.Tensor, file: str,
+                key: Dict[str, Any], label: str) -> Dict[str, Any]:
+        """Oracle plan of the set (baselines.plan_oracle), cached in the run dir by key."""
         from baselines import plan_oracle
 
-        c = self.cfg
-        self.eval_env = AlignEnv(env_config(c, c.eval_envs, False, c.eval_seed + 12345))
-        tilts, setups = self._eval_set()
-        path = os.path.join(self.run_dir, "oracle_eval.pt")
-        key = {"n": c.eval_n, "seed": c.eval_seed, "setups": c.setups,
-               "center": list(c.init_center), "radius": c.init_radius,
-               "step_cost": c.step_cost, "path_ref": c.path_ref}
-        oracle = None
+        path = os.path.join(self.run_dir, file)
         if os.path.exists(path):
             d = torch.load(path, map_location=self.device)
             if d.get("key") == key:
-                oracle = d
-        if oracle is None:
-            t0 = time.time()
-            plan = plan_oracle(self.eval_env, tilts, chunk=8, setups=setups)
-            oracle = {"key": key, "ret": plan.ret.float(), "target_path_mm": plan.target_path_mm,
-                      "plan_s": time.time() - t0}
-            torch.save(oracle, path)
-            print(f"oracle plan: {oracle['plan_s']:.1f} s, mean return {float(plan.ret.mean()):.4f}",
-                  flush=True)
-        self.oracle = oracle
-        self.eval_tilts, self.eval_setups = tilts, setups
+                return d
+        t0 = time.time()
+        plan = plan_oracle(env, tilts, chunk=8, setups=setups)
+        oracle = {"key": key, "ret": plan.ret.float(), "target_path_mm": plan.target_path_mm,
+                  "plan_s": time.time() - t0}
+        torch.save(oracle, path)
+        print(f"oracle plan ({label}, {tilts.shape[0]} episodes): {oracle['plan_s']:.1f} s, "
+              f"mean return {float(plan.ret.mean()):.4f}", flush=True)
+        return oracle
+
+    def _setup_set(self, kind: str) -> EvalSet:
+        """The four-setup (kind "all") or measured-cell set, as in run 4398136."""
+        c = self.cfg
+        env = AlignEnv(env_config(c, c.eval_envs, False, c.eval_seed + 12345, setups=kind))
+        tilts = self._init_tilts(c.eval_n, env.limit)
+        setups = (eval_setups(c.eval_n, env.n_setups, c.eval_seed) if env.n_setups > 1
+                  else torch.zeros(c.eval_n, dtype=torch.long)).to(self.device)
+        key = {"n": c.eval_n, "seed": c.eval_seed, "setups": kind,
+               "center": list(c.init_center), "radius": c.init_radius,
+               "step_cost": c.step_cost, "path_ref": c.path_ref}
+        oracle = self._oracle(env, tilts, setups, "oracle_eval.pt", key, kind)
+        names = [g.name for g in env.setups]
+
+        def splits(ep):
+            blind = ep["init_bounces"] <= BLIND_MAX_BOUNCES
+            m = {"all": torch.ones_like(blind), "blind": blind, "informative": ~blind}
+            for i, nm in enumerate(names if len(names) > 1 else []):
+                m[nm] = ep["setup"] == i
+            return m
+
+        name = "set4" if kind == "all" else kind
+        return EvalSet(name, env, tilts, setups, oracle, "eval", "eval_samp", splits)
+
+    def _full_set(self) -> EvalSet:
+        """The full-range set: (initial tilt, scenario) pairs over the atlas."""
+        from scenarios import eval_scenarios, sep_bin_masks
+
+        c, at = self.cfg, self.atlas
+        env = AlignEnv(env_config(c, c.eval_envs, False, c.eval_seed + 12345),
+                       scenarios=at.table())
+        tilts = self._init_tilts(c.eval_n, env.limit)
+        scen = eval_scenarios(at, c.eval_n, c.eval_seed, c.eval_impossible).to(self.device)
+        key = {"n": c.eval_n, "seed": c.eval_seed, "impossible": c.eval_impossible,
+               "atlas": _digest(at.params, at.path_ref), "center": list(c.init_center),
+               "radius": c.init_radius, "step_cost": c.step_cost}
+        oracle = self._oracle(env, tilts, scen, "oracle_full.pt", key, "full")
+        good_t, params = at.good, at.params
+
+        def splits(ep):
+            blind = ep["init_bounces"] <= BLIND_MAX_BOUNCES
+            good = good_t[ep["setup"]]
+            m = {"all": torch.ones_like(blind), "blind": blind, "informative": ~blind,
+                 "good": good, "impossible": ~good}
+            for nm, sm in sep_bin_masks(params[ep["setup"], 0]).items():
+                m[nm] = sm & good
+            return m
+
+        return EvalSet("full", env, tilts, scen, oracle, "eval_full", "eval_full_samp", splits)
+
+    def setup_eval(self):
+        """Eval envs, sets and oracle references (cached in the run dir)."""
+        c = self.cfg
+        sets = []
+        if c.setups == "full":
+            sets.append(self._full_set())
+            if c.eval_set4:
+                sets.append(self._setup_set("all"))
+        else:
+            sets.append(self._setup_set(c.setups))
+        self.eval_sets = sets
 
     @torch.no_grad()
-    def evaluate(self) -> Dict[str, float]:
-        """Deterministic eval; flat metrics dict (eval/<split>/<metric>)."""
-        if self.eval_env is None:
-            self.setup_eval()
-        pol = EvalPolicy(self.agent)
-        ep, met = evaluate(self.eval_env, pol, self.eval_tilts, self.oracle["target_path_mm"],
-                           self.oracle["ret"], init_setups=self.eval_setups)
-        ref = self.oracle["ret"].double()
-        blind = ep["init_bounces"] <= 2
-        masks = {"all": torch.ones_like(blind), "blind": blind, "informative": ~blind}
-        for i, nm in enumerate(self.names if len(self.names) > 1 else []):
-            masks[f"setup:{nm}"] = ep["setup"] == i
+    def _run_eval(self, es: EvalSet, sampled: bool) -> Dict[str, float]:
+        """One evaluation of a set; flat metrics <prefix>/<split>/<metric>."""
+        c = self.cfg
+        gen = None
+        if sampled:
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(c.eval_seed * 1_000_003 + 4099)  # Same noise at every eval
+        pol = EvalPolicy(self.agent, gen)
+        ep, met = evaluate(es.env, pol, es.tilts, es.oracle["target_path_mm"], es.oracle["ret"],
+                           init_setups=es.setups)
+        pre = es.prefix_samp if sampled else es.prefix
+        ref = es.oracle["ret"].double()
+        cap = es.env.cfg.max_bounces
         flat: Dict[str, float] = {}
-        for split, m in masks.items():
-            s = met[split]
-            o = float(ref[m].mean()) if bool(m.any()) else float("nan")
-            key = split.replace("setup:", "")
-            for name, val in (("return", s["return_mean"]), ("oracle_return", o),
-                              ("pct_oracle", 100.0 * s["return_mean"] / o if s["return_mean"] is not None and o else None),
-                              ("regret", s.get("regret_mean")), ("path_frac", s.get("path_frac_pref_mean")),
-                              ("success", s.get("success")), ("stop_rate", s["terminated"]),
-                              ("length", s["length_mean"]), ("n", s["n"])):
-                flat[f"eval/{key}/{name}"] = float("nan") if val is None else float(val)
-        flat.update({f"eval/{k}": v for k, v in pol.diagnostics().items()})
-        flat["eval/wall_s"] = met["wall_s"]
+        names = ("return", "oracle_return", "pct_oracle", "regret", "path_frac", "success",
+                 "stop_rate", "stop_first", "length", "n")
+        for split, m in es.splits(ep).items():
+            if not bool(m.any()):  # Keys always present (fixed CSV header)
+                flat.update({f"{pre}/{split}/{k}": float("nan") for k in names})
+                continue
+            s = split_metrics(ep, m, cap)
+            o = float(ref[m].mean())
+            r = s["return_mean"]
+            pct = 100.0 * r / o if r is not None and abs(o) > 1e-3 else None
+            vals = (r, o, pct, s.get("regret_mean"), s.get("path_frac_pref_mean"),
+                    s.get("success"), s["terminated"], s["stop_first"], s["length_mean"], s["n"])
+            for name, val in zip(names, vals):
+                flat[f"{pre}/{split}/{name}"] = float("nan") if val is None else float(val)
+        flat.update({f"{pre}/{k}": v for k, v in pol.diagnostics().items()})
+        flat[f"{pre}/wall_s"] = met["wall_s"]
+        return flat
+
+    def evaluate(self) -> Dict[str, float]:
+        """All eval sets, deterministic and (eval_sampled) sampled; flat metrics dict."""
+        if self.eval_sets is None:
+            self.setup_eval()
+        flat: Dict[str, float] = {}
+        for es in self.eval_sets:
+            flat.update(self._run_eval(es, False))
+            if self.cfg.eval_sampled:
+                flat.update(self._run_eval(es, True))
         return flat
 
     # ── Checkpoints ──
@@ -590,12 +841,16 @@ class Trainer:
             "agent": self.agent.state_dict(),
             "opt": self.opt.state_dict(),
             "vnorm": self.vnorm.state_dict(),
+            "log_alpha": self.log_alpha,
+            "sampler": self.sampler.state_dict() if self.sampler is not None else None,
             "iteration": self.iteration,
             "env_steps": self.env_steps,
             "best_eval": self.best_eval,
+            "best_metric": self.best_metric,
             "cfg": asdict(self.cfg),
             "agent_cfg": self.agent.cfg.to_dict(),
             "encoder_info": self.encoder_info,
+            "init_info": self.init_info,
             "name": self.name,
             "wandb_id": self.wandb_id,
             "rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(self.device),
@@ -616,9 +871,15 @@ class Trainer:
         self.agent.load_state_dict(d["agent"])
         self.opt.load_state_dict(d["opt"])
         self.vnorm.load_state_dict(d["vnorm"])
+        if d.get("log_alpha") is not None:
+            self.log_alpha = d["log_alpha"].to(self.device)
+        if self.sampler is not None and d.get("sampler") is not None:
+            self.sampler.load_state_dict(d["sampler"])
         self.iteration, self.env_steps = d["iteration"], d["env_steps"]
-        self.best_eval = d["best_eval"]
+        same = d.get("best_metric") == self.best_metric
+        self.best_eval = d["best_eval"] if same else -math.inf
         self.encoder_info = d.get("encoder_info", self.encoder_info)
+        self.init_info = d.get("init_info", self.init_info)
         self.name, self.wandb_id = d["name"], d.get("wandb_id")
         torch.set_rng_state(d["rng"]["torch"].cpu())
         torch.cuda.set_rng_state(d["rng"]["cuda"].cpu(), self.device)
@@ -635,7 +896,7 @@ class Trainer:
         signal.signal(signal.SIGTERM, self._signal)
         signal.signal(signal.SIGUSR1, self._signal)
         log = Logger(self.run_dir, self.name, asdict(c), self.encoder_info, c.wandb,
-                     c.wandb_project, self.wandb_id)
+                     c.wandb_project, self.wandb_id, self.init_info)
         self.wandb_id = log.wandb_id
         if self._build_eval:
             self.setup_eval()
@@ -648,6 +909,8 @@ class Trainer:
                     and self.iteration > 0:
                 print(f"iteration {self.iteration}: encoder unfrozen "
                       f"(lr x {c.encoder_lr_scale})", flush=True)
+            if self.sampler is not None:
+                self.sampler.refresh(self.iteration)
             sync()
             t0 = time.time()
             st = self.rollout()
@@ -674,9 +937,18 @@ class Trainer:
                         "ep_final_path_frac": float(st["frac"]) / n if n else float("nan"),
                         "reward_mean": float(st["reward"]) / steps_per_iter,
                         "slot_overflow": float(st["slot_overflow"])})
-            row.update({f"loss/{k}" if k in ("loss", "pg", "vf", "ent", "path", "tilt", "setup")
-                        else f"ppo/{k}": float(v) for k, v in us.items()})
-            row["lr"] = self.opt.param_groups[0]["lr"]
+            for k, v in us.items():
+                if k in ("loss", "pg", "vf", "ent", "path", "tilt", "scen"):
+                    row[f"loss/{k}"] = float(v)
+                elif k in ("ent_target", "ent_coef", "ent_coef_now"):
+                    row[f"ent/{k.replace('ent_', '')}"] = float(v)
+                elif k == "lr":
+                    row["lr"] = float(v)
+                else:
+                    row[f"ppo/{k}"] = float(v)
+            row["ent/entropy"] = row["loss/ent"]
+            if self.sampler is not None:
+                row.update(self.sampler.stats())
             last = self.env_steps >= c.total_env_steps
             ev = None
             if c.eval_every > 0 and (self.iteration % c.eval_every == 0 or last) \
@@ -685,18 +957,24 @@ class Trainer:
                 te = time.time()
                 ev = self.evaluate()
                 row["time_eval_s"] = time.time() - te
-                if ev["eval/all/return"] > self.best_eval:
-                    self.best_eval = ev["eval/all/return"]
+                if ev[self.best_metric] > self.best_eval:
+                    self.best_eval = ev[self.best_metric]
                     self.save("best.pt")
                 ev["iteration"], ev["env_steps"] = self.iteration, self.env_steps
             row["wall_min"] = (time.time() - t_start) / 60
             log.train(row)
             if ev is not None:
                 log.eval(ev)
-                print(f"  eval: return {ev['eval/all/return']:+.4f} ({ev['eval/all/pct_oracle']:.1f} % "
-                      f"of oracle), P/Pmax {ev['eval/all/path_frac']:.3f}, success "
-                      f"{ev['eval/all/success']:.3f}, stop {ev['eval/all/stop_rate']:.3f}, len "
-                      f"{ev['eval/all/length']:.1f}", flush=True)
+                for es in self.eval_sets:
+                    for pre in (es.prefix, es.prefix_samp):
+                        if f"{pre}/all/return" not in ev:
+                            continue
+                        print(f"  {pre}: return {ev[f'{pre}/all/return']:+.4f} "
+                              f"({ev[f'{pre}/all/pct_oracle']:.1f} % of oracle), P/Pref "
+                              f"{ev[f'{pre}/all/path_frac']:.3f}, success "
+                              f"{ev[f'{pre}/all/success']:.3f}, stop "
+                              f"{ev[f'{pre}/all/stop_rate']:.3f}, len "
+                              f"{ev[f'{pre}/all/length']:.1f}", flush=True)
             if time.time() - last_ckpt > 60 * c.ckpt_minutes:
                 self.save("latest.pt")
                 last_ckpt = time.time()
@@ -720,21 +998,27 @@ class Logger:
     """train.csv / eval.csv (appended on resume) and W&B."""
 
     def __init__(self, run_dir: str, name: str, config: dict, encoder_info: Optional[dict],
-                 use_wandb: bool, project: str, wandb_id: Optional[str]):
+                 use_wandb: bool, project: str, wandb_id: Optional[str],
+                 init_info: Optional[dict] = None):
         self.run_dir = run_dir
         self.files: Dict[str, Any] = {}
         self.writers: Dict[str, csv.DictWriter] = {}
         self.wb = None
         self.wandb_id = wandb_id
+        init_short = None if init_info is None else {
+            k: init_info.get(k) for k in ("path", "name", "iteration", "env_steps", "skipped",
+                                          "missing")}
         if use_wandb:
             import wandb
 
             self.wandb_id = wandb_id or uuid.uuid4().hex[:12]  # Kept in the checkpoint
             self.wb = wandb.init(project=project, name=name, id=self.wandb_id, resume="allow",
-                                 config={**config, "encoder_info": encoder_info},
+                                 config={**config, "encoder_info": encoder_info,
+                                         "init_info": init_short},
                                  dir=os.environ.get("WANDB_DIR", run_dir))
         with open(os.path.join(run_dir, "config.json"), "w") as f:
-            json.dump({"name": name, "config": config, "encoder_info": encoder_info}, f, indent=1)
+            json.dump({"name": name, "config": config, "encoder_info": encoder_info,
+                       "init_info": init_short}, f, indent=1)
 
     def _write(self, kind: str, row: Dict[str, Any]):
         if kind not in self.writers:
@@ -758,10 +1042,18 @@ class Logger:
         print(f"it {row['iteration']:5d} {row['env_steps'] / 1e6:8.2f} M  ret {row['ep_return']:+.3f} "
               f"len {row['ep_length']:5.1f} stop {row['ep_stop_rate']:.2f} frac "
               f"{row['ep_final_path_frac']:.3f} | pg {row['loss/pg']:+.4f} vf {row['loss/vf']:.4f} "
-              f"ent {row['loss/ent']:.3f} path {row['loss/path']:.4f} tilt {row['loss/tilt']:+.3f} "
-              f"setup {row['loss/setup']:.3f} kl {row['ppo/kl']:.4f} ev {row['ppo/explained_var']:+.3f} "
-              f"ep {int(row['ppo/epochs'])} | {row['fps']:.0f} fps (roll {row['time_rollout_s']:.1f} s, "
+              f"ent {row['loss/ent']:.3f} (tgt {row['ent/target']:.2f}, a {row['ent/coef_now']:.4f}) "
+              f"path {row['loss/path']:.4f} tilt {row['loss/tilt']:+.3f} scen {row['loss/scen']:+.3f} "
+              f"kl {row['ppo/kl']:.4f} ev {row['ppo/explained_var']:+.3f} ep {int(row['ppo/epochs'])} "
+              f"lr {row['lr']:.2e} | {row['fps']:.0f} fps (roll {row['time_rollout_s']:.1f} s, "
               f"upd {row['time_update_s']:.1f} s)", flush=True)
+        if "plr/seen" in row:
+            print(f"      plr: seen {row['plr/seen']} p_fresh {row['plr/p_fresh']:.2f} imp "
+                  f"{row['plr/impossible_share']:.3f} shortfall fresh {row['plr/fresh_shortfall']:.3f} "
+                  f"replay {row['plr/replay_shortfall']:.3f} score q50 {row.get('plr/score_q50', math.nan):.3f} "
+                  f"top ({row.get('plr/top_sep', math.nan):g} mm, {row.get('plr/top_laser_pitch', math.nan):g}, "
+                  f"{row.get('plr/top_laser_yaw', math.nan):g}) share {row.get('plr/top_draw_share', math.nan):.4f}",
+                  flush=True)
 
     def eval(self, row: Dict[str, Any]):
         self._write("eval", row)
@@ -776,15 +1068,29 @@ class Logger:
             self.wb.finish()
 
 
+def init_run_id(path: str) -> str:
+    """Run id of an --init-from checkpoint: its directory name (the job id on the
+    cluster)."""
+    return os.path.basename(os.path.dirname(os.path.abspath(path))) or "x"
+
+
 def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     """Display / directory name from the config, built at start:
-    ppo_cnn[-pre<S>]_k<K>_set<S>_b<B>_s<seed>[_uf<it>|_e2e][_<tag>]_<jobid>; -pre<S>: the
-    encoder was initialized from a checkpoint pretrained on S setups."""
+    ppo_cnn[-pre<S>]_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_<tag>]_<jobid>;
+    <scen>: full-plr / full-unif (atlas, prioritized / uniform good draws) or set<S>;
+    -pre<S>: the encoder was initialized from a checkpoint pretrained on S setups;
+    _ft<run>: initialized from that PPO run (--init-from)."""
     enc = "cnn"
     if encoder_info is not None:
-        enc += f"-pre{encoder_info.get('n_setups', 1)}"
-    n_set = len(SETUPS) if c.setups == "all" else 1
-    name = f"ppo_{enc}_k{c.history_len}_set{n_set}_b{c.num_envs}_s{c.seed}"
+        m = re.search(r"_grid(\d+)", encoder_info.get("name") or "")
+        enc += f"-pregrid{m.group(1)}" if m else f"-pre{encoder_info.get('n_setups', 1)}"
+    if c.setups == "full":
+        scen = "full-plr" if c.plr else "full-unif"
+    else:
+        scen = f"set{len(SETUPS) if c.setups == 'all' else 1}"
+    name = f"ppo_{enc}_k{c.history_len}_{scen}_b{c.num_envs}_s{c.seed}"
+    if c.init_from:
+        name += f"_ft{init_run_id(c.init_from)}"
     if not c.encoder_freeze:
         name += "_e2e"
     elif c.unfreeze_at >= 0:
@@ -798,7 +1104,9 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
 
 
 RESUME_OVERRIDES = ("total_env_steps", "eval_every", "ckpt_minutes", "wandb", "wandb_project",
-                    "unfreeze_at", "encoder_lr_scale", "compile", "target_kl")
+                    "unfreeze_at", "encoder_lr_scale", "compile", "target_kl", "eval_sampled",
+                    "enc_checkpoint")
+PATH_FIELDS = ("encoder_init", "init_from", "atlas")
 
 
 def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
@@ -814,12 +1122,12 @@ def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
     for f in fields(PPOConfig):
         flag = "--" + f.name.replace("_", "-")
         v = getattr(d, f.name)
-        if f.name in ("encoder_freeze", "wandb", "amp", "compile"):
+        if isinstance(v, bool):
             ap.add_argument(flag, dest=f.name, action=argparse.BooleanOptionalAction, default=dflt(v))
         elif f.name == "init_center":
             ap.add_argument(flag, type=float, nargs=2, default=dflt(list(v)))
         elif f.name == "setups":
-            ap.add_argument(flag, choices=("all", "measured"), default=dflt(v))
+            ap.add_argument(flag, choices=SETUP_CHOICES, default=dflt(v))
         else:
             ap.add_argument(flag, type=type(v), default=dflt(v))
     return ap
@@ -839,6 +1147,8 @@ def main(argv: Optional[List[str]] = None):
         assert args.run_dir, "--resume needs --run-dir"
         path = os.path.join(args.run_dir, "latest.pt")
         saved = torch.load(path, map_location="cpu", weights_only=False)["cfg"]
+        known = {f.name for f in fields(PPOConfig)}
+        saved = {k: v for k, v in saved.items() if k in known}
         saved["init_center"] = tuple(saved["init_center"])
         given = vars(build_parser(suppress=True).parse_args(argv))
         for k in RESUME_OVERRIDES:  # Run control from the flags given; the rest as saved
@@ -854,8 +1164,9 @@ def main(argv: Optional[List[str]] = None):
               f"{trainer.env_steps} env steps", flush=True)
     else:
         cfg = PPOConfig(**cli)
-        if cfg.encoder_init:
-            cfg.encoder_init = os.path.abspath(cfg.encoder_init)
+        for k in PATH_FIELDS:
+            if getattr(cfg, k):
+                setattr(cfg, k, os.path.abspath(getattr(cfg, k)))
         trainer = Trainer(cfg, args.run_dir)
     trainer.train()
 

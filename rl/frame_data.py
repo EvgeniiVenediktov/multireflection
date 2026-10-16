@@ -105,30 +105,38 @@ class FrameData:
         )
         self._scan()
 
-    def _scan(self):
+    def _scan(self, chunk_states: int = 1 << 21):
         """Nominal-geometry scan of the box per setup: cell centres by bounce class.
         cells / cells_89 / cells_trapped / scan_bounces: the first setup; cells_all
         (all setups' >= min_cell_bounces cells, concatenated), cell_start / cell_count
-        (S,) index it per setup."""
+        (S,) index it per setup. Setups are traced together in chunks of about
+        chunk_states states (per-ray results do not depend on the batching)."""
         c, dev = self.cfg, self.device
         n = int(round(2 * self.limit / c.scan_step)) + 1
         ax = torch.linspace(-self.limit, self.limit, n, device=dev)
         P, Y = torch.meshgrid(ax, ax, indexing="ij")
         centres = torch.stack((P.reshape(-1), Y.reshape(-1)), 1)
-        cells = []
-        for k in range(self.n_setups):
-            setup = torch.full((centres.shape[0],), k, dtype=torch.long, device=dev)
-            out = self.sim.simulate(self._states(centres, setup), store_world=False)
-            b, stop = out["hit_counts"], out["stop_reason"]
-            cells.append(centres[b >= c.min_cell_bounces])
-            if k == 0:
-                self.scan_bounces = b
-                self.cells = cells[0]
-                self.cells_89 = centres[b == 89]
-                self.cells_trapped = centres[stop == STOP_CAP]
-        self.cells_all = torch.cat(cells)
-        self.cell_count = torch.tensor([x.shape[0] for x in cells], device=dev)
+        G = centres.shape[0]
+        per = max(1, chunk_states // G)
+        keep_s, keep_g = [], []
+        for k0 in range(0, self.n_setups, per):
+            k1 = min(k0 + per, self.n_setups)
+            setup = torch.arange(k0, k1, device=dev).repeat_interleave(G)
+            out = self.sim.simulate(self._states(centres.repeat(k1 - k0, 1), setup),
+                                    store_world=False, store_hits=False)
+            b = out["hit_counts"].view(k1 - k0, G)
+            if k0 == 0:
+                self.scan_bounces = b[0]
+                self.cells_89 = centres[b[0] == 89]
+                self.cells_trapped = centres[out["stop_reason"][:G] == STOP_CAP]
+            s, g = torch.nonzero(b >= c.min_cell_bounces, as_tuple=True)  # Row-major
+            keep_s.append(s + k0)
+            keep_g.append(g)
+        s, g = torch.cat(keep_s), torch.cat(keep_g)
+        self.cells_all = centres[g]
+        self.cell_count = torch.bincount(s, minlength=self.n_setups)
         self.cell_start = torch.cumsum(self.cell_count, 0) - self.cell_count
+        self.cells = self.cells_all[: int(self.cell_count[0])]
 
     # ── States ──
 
@@ -158,17 +166,21 @@ class FrameData:
         c, dev = self.cfg, self.device
         frac = c.cell_frac if cell_frac is None else cell_frac
         box = self.limit * (2.0 * torch.rand(n, 2, generator=gen, device=dev) - 1.0)
+        has_cells = None
         if cells is None and setup is not None:
             cells = self.cells_all
             u = torch.rand(n, generator=gen, device=dev)
             cnt = self.cell_count[setup]
             i = self.cell_start[setup] + (u * cnt).long().clamp(max=cnt - 1)
+            has_cells = (cnt > 0)[:, None]  # Setups without cells draw from the box
         else:
             cells = self.cells if cells is None else cells
             i = torch.randint(0, cells.shape[0], (n,), generator=gen, device=dev)
         inside = c.scan_step * (torch.rand(n, 2, generator=gen, device=dev) - 0.5)
         cell = (cells[i] + inside).clamp(-self.limit, self.limit)
         pick = torch.rand(n, 1, generator=gen, device=dev) < frac
+        if has_cells is not None:
+            pick = pick & has_cells
         return torch.where(pick, cell, box)
 
     def states(self, tilts: torch.Tensor, gen: torch.Generator, jitter: bool = True,
@@ -198,6 +210,7 @@ class FrameData:
         out = self.sim.simulate(states, store_world=False)
         d = self.builder(out)
         d["tilt"] = states[:, [S_M2_PITCH, S_M2_YAW]]
+        d["scen"] = states[:, [S_SEP, S_LASER_PITCH, S_LASER_YAW]]  # Incl. the jitter
         d["state"] = states
         d["setup"] = setup if setup is not None else torch.zeros(
             states.shape[0], dtype=torch.long, device=states.device)

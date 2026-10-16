@@ -170,6 +170,19 @@ Triton kernel we compute it exactly.
    >= 0.9 P_max, stop rate on impossible scenarios, regret distribution over the atlas.
 7. **Bounce cap:** the intensity cutoff (~456) once separation varies (see D1).
 
+**Implemented (2026-10-16), first full-range run:** `scenarios.py` (atlas: grid above plus
+the four SETUPS, 0.01 deg scans at cap 128, P_floor = 20 x separation, P_ref =
+max(P_max, P_floor); sampler: 10 % impossible, PLR replay of the good set with shortfall
+`1 - P_final / P_max` as the score, fresh share 0.3), `AlignEnv(cfg, scenarios, sampler)`,
+scenario head (separation, laser tilt; Gaussian NLL) instead of the setup head,
+`ppo.py --setups full --init-from`, lr warmup + cosine, adaptive entropy, evals "full"
+(atlas, 10 % impossible) and "set4" (deterministic and sampled). Not implemented: ADR
+range widening, the initial-tilt curriculum, the intensity-cutoff cap (cap stays 128).
+Encoder check (`eval_encoder.py --scenarios 4096`, `reports/encoder_tables_full.md`): the
+four-setup encoder does not transfer (in-distribution recall 0.078 vs 0.825, count exact
+0.187 vs 0.999, tilt probe RMSE 0.54 vs 0.09 deg), so the run trains it from the start
+(`--unfreeze-at 0 --encoder-lr-scale 0.1`).
+
 ## Decisions (2026-10-15)
 
 - **D1 - trapped beams: bounce cap, default 128.** A 0.001 deg scan around the 89 island

@@ -286,6 +286,7 @@ class HerriottSim:
         state: torch.Tensor,
         backend: Optional[str] = None,
         store_world: bool = True,
+        store_hits: bool = True,
     ) -> dict:
         """
         Run simulation for given state(s).
@@ -296,6 +297,8 @@ class HerriottSim:
                 "triton" for CUDA states, "torch" otherwise
             store_world: also return the world-frame hit_sequence (otherwise
                 hit_sequence is None)
+            store_hits: also return hit_mirror / hit_local_xy (otherwise None; the
+                triton backend then skips the per-hit stores, for large scans)
 
         Returns:
             dict with (N = sim_cfg.max_bounces):
@@ -321,9 +324,13 @@ class HerriottSim:
         if backend == "triton":
             from sim_triton import simulate_triton
 
-            return simulate_triton(self, state, store_world=store_world)
+            return simulate_triton(self, state, store_world=store_world,
+                                   store_hits=store_hits)
         if backend == "torch":
-            return self._simulate_torch(state, store_world=store_world)
+            out = self._simulate_torch(state, store_world=store_world)
+            if not store_hits:
+                out["hit_mirror"] = out["hit_local_xy"] = None
+            return out
         raise ValueError(f"Unknown backend {backend!r}, expected one of {BACKENDS}")
 
     def _simulate_torch(self, state: torch.Tensor, store_world: bool = True) -> dict:
