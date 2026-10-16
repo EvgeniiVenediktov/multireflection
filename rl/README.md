@@ -43,7 +43,7 @@ an RTX A2000):
 | 31 | 2.73 | M1 hole | 3.5 x 2.5 plateau containing nominal |
 | 57 | 5.02 | M1 hole | 1.1 x 1.2 island |
 | 89 | 7.84 | M1 hole | 0.24 x 0.23 island |
-| cap (400) | 35 at cap | never leaves | 0.20 x 0.16, next to the 89 island |
+| cap (128) | 11.3 at cap | never leaves (trapped) | 0.20 x 0.16, next to the 89 island |
 
 The plateaus are nested: the higher-order re-entrant patterns sit inside smaller and
 smaller regions, and at their centre the beam never finds the hole and runs until the
@@ -52,7 +52,10 @@ plateau takes about 1 deg; the real mount resolves 0.01 deg.
 
 ## Stages
 
-1. Single geometry, random initial M2 tilt (this is where we start).
+1. Four fixed setups (the measured one plus 116, 144 and 169 mm, each with its own laser tilt,
+   see `reports/setups.md`), one sampled per episode, random initial M2 tilt. With a single
+   setup the absolute tilt alone solves the task (image-free homing reaches 99 % of the
+   oracle), so stage 1 needs several setups to force the policy to read the images.
 2. Wider initial range; jitter of separation, laser tilt and offsets (domain randomization).
 3. M1 as the controlled mirror.
 4. Sim-to-real: camera model fitted to the real setup, encoder fine-tuned on real images.

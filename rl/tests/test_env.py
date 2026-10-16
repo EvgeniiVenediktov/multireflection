@@ -13,6 +13,13 @@ Run from rl/:  uv run python tests/test_env.py
     8. HistoryStack ordering, masking after reset, peek_with without mutation
     9. no host syncs in step() / reset() (torch.cuda.set_sync_debug_mode("error"))
    10. figure figures/env_renders.png (nominal, 57, 89, trapped, 1-3 bounce states)
+   11. geometry.SETUPS: measured first and unchanged, nominal / target regression values
+   12. multi-setup sampling per env (frequencies, weights), per-env base states
+   13. per-setup normalization (P_ref = P_max per setup) and reward telescoping
+   14. info["setup"] / obs_setup around auto-resets; reset draws deterministic per
+       (seed, env, episode), Triton hash = torch reference
+   15. auto_reset=False (idle envs), reset(return_info=True), partial reset isolation
+   16. no host syncs with 4 setups and without auto-reset
 """
 
 import math
@@ -25,8 +32,8 @@ sys.path.insert(0, RL_DIR)
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
-from env import AlignEnv, EnvConfig, HistoryStack  # noqa: E402
-from geometry import NOMINAL_PATH_MM, CellGeometry  # noqa: E402
+from env import AlignEnv, EnvConfig, HistoryStack, uniforms, uniforms_torch  # noqa: E402
+from geometry import NOMINAL_PATH_MM, SETUP_INFO, SETUPS, CellGeometry  # noqa: E402
 from herriott_sim import STOP_CAP, STOP_HOLE, STOP_NAMES  # noqa: E402
 
 DEV = torch.device("cuda")
@@ -434,6 +441,250 @@ def save_figure(path: str):
     plt.close(fig)
 
 
+# ── Multi-setup tests ───────────────────────────────────────────────────────
+
+
+def multi_env(**kw) -> AlignEnv:
+    return AlignEnv(EnvConfig(setups=SETUPS, **kw))
+
+
+def test_setups():
+    print("\n== 11. geometry.SETUPS ==")
+    assert SETUPS[0] == CellGeometry() and SETUPS[0].name == "measured"
+    assert len({g.name for g in SETUPS}) == len(SETUPS) == 4
+    env = multi_env(num_envs=4, history_len=0)
+    assert env.n_setups == 4 and env.path_ref_mode == "max"
+    s = torch.arange(4, device=DEV)
+    nom = tilts(*[(g.m2_pitch, g.m2_yaw) for g in SETUPS])
+    tgt = tilts(*[SETUP_INFO[g.name].target for g in SETUPS])
+    on, ot = env.render_tilts(nom, s), env.render_tilts(tgt, s)
+    pmax = env.path_max()
+    assert torch.equal(env.path_refs, pmax)
+    for i, g in enumerate(SETUPS):
+        ref = SETUP_INFO[g.name]
+        assert int(on["bounces"][i]) == ref.plateau_bounces, (g.name, int(on["bounces"][i]))
+        assert int(on["stop_reason"][i]) == STOP_HOLE
+        assert abs(float(on["path_mm"][i]) - ref.plateau_path_mm) < 0.01
+        assert int(ot["bounces"][i]) == ref.target_bounces
+        assert abs(float(pmax[i]) - ref.pmax_mm) < 0.01, (g.name, float(pmax[i]))
+        assert float(ot["path_mm"][i]) <= float(pmax[i])
+        print(f"  {g.name:8s} {g.separation:5.0f} mm, laser ({g.laser_pitch:.2f}, "
+              f"{g.laser_yaw:.2f}): nominal ({g.m2_pitch:+.2f}, {g.m2_yaw:+.2f}) "
+              f"{int(on['bounces'][i])} bounces {float(on['path_mm'][i]) / 1000:.2f} m (hole); "
+              f"P_max {float(pmax[i]) / 1000:.2f} m, target {ref.target} "
+              f"{int(ot['bounces'][i])} bounces")
+    # path_ref "nominal" with several setups: the nominal paths, exact P_nom for measured
+    envn = multi_env(num_envs=4, history_len=0, path_ref="nominal")
+    assert envn.p_nom == NOMINAL_PATH_MM and float(envn.path_refs[0]) == float(
+        torch.tensor(NOMINAL_PATH_MM, dtype=torch.float32))
+    assert torch.allclose(envn.path_refs[1:], on["path_mm"][1:])
+    # One setup with path_ref "max": P_ref = P_max of the measured cell
+    env1 = AlignEnv(EnvConfig(num_envs=4, history_len=0, path_ref="max"))
+    assert env1.p_nom == float(pmax[0])
+    print(f"  path_ref nominal: {[round(v, 1) for v in envn.path_refs.tolist()]} mm; one setup "
+          f"with path_ref max: P_ref {env1.p_nom:.1f} mm")
+
+
+def test_setup_sampling():
+    print("\n== 12. setup sampling per env ==")
+    B = 4096
+    env = multi_env(num_envs=B, history_len=0, seed=31)
+    counts = torch.bincount(env.setup, minlength=4).double()
+    sd = math.sqrt(B * 0.25 * 0.75)
+    assert bool(((counts - B / 4).abs() < 4 * sd).all()), counts
+    t = env.tilt
+    assert bool((t.abs() <= 2.0).all()) and bool((t.mean(0).abs() < 0.1).all())
+    # Per-env base states: env path = a fresh sim of (tilt, setup)
+    ref = env.render_tilts(env.tilt, env.setup)
+    assert torch.equal(env.path, ref["path_mm"]) and torch.equal(env.bounces, ref["bounces"])
+    print(f"  uniform: counts {counts.long().tolist()} (expected {B // 4} +- {sd:.0f}); "
+          f"tilt mean {[round(v, 3) for v in t.mean(0).tolist()]}; path = fresh sim of "
+          "(tilt, setup) for every env")
+
+    envw = multi_env(num_envs=B, history_len=0, seed=32, setup_weights=(0.0, 1.0, 0.0, 3.0))
+    cw = torch.bincount(envw.setup, minlength=4)
+    assert int(cw[0]) == 0 and int(cw[2]) == 0
+    f3 = float(cw[3]) / B
+    assert abs(f3 - 0.75) < 4 * math.sqrt(0.75 * 0.25 / B), f3
+    print(f"  weights (0, 1, 0, 3): counts {cw.tolist()}")
+
+    # Setups change per env at auto-reset: run with stops and count episodes per setup
+    env = multi_env(num_envs=256, history_len=0, seed=33)
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(34)
+    n_change, n_done = 0, 0
+    for _ in range(40):
+        before = env.setup.clone()
+        _, _, term, trunc, info = env.step(random_actions(env, gen, p_stop=0.3))
+        done = term | trunc
+        assert torch.equal(info["setup"], before), "info['setup'] is the pre-reset setup"
+        assert torch.equal(env.setup[~done], before[~done]), "setup changes only at reset"
+        assert torch.equal(info["obs_setup"], env.setup)
+        n_change += int((env.setup != before).sum())
+        n_done += int(done.sum())
+        ref = env.render_tilts(info["tilt"], info["setup"])
+        assert torch.equal(info["path_mm"], ref["path_mm"])
+        new = env.render_tilts(env.tilt, env.setup)
+        assert torch.equal(env.path, new["path_mm"])
+    assert n_change > 0.6 * n_done, (n_change, n_done)
+    print(f"  40 steps x 256 envs: {n_done} resets, setup changed in {n_change} "
+          f"(expected ~75 %); post-step and post-reset paths = fresh sim of (tilt, setup)")
+
+
+def test_multi_telescoping():
+    print("\n== 13. per-setup normalization and telescoping ==")
+    env = multi_env(num_envs=512, seed=41)
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(42)
+    c = env.cfg.step_cost
+    refs = env.path_refs
+    p0, s0 = env.path.clone(), env.setup.clone()
+    ret = torch.zeros(512, device=DEV, dtype=torch.float64)
+    moves = torch.zeros(512, dtype=torch.long, device=DEV)
+    errs, n_ep, max_norm = [], 0, 0.0
+    per_setup = torch.zeros(4, dtype=torch.long)
+    for _ in range(200):
+        a = random_actions(env, gen, p_stop=0.05)
+        _, rew, term, trunc, info = env.step(a)
+        assert torch.equal(info["path_ref"], refs[info["setup"]])
+        assert torch.equal(info["path_norm"], info["path_mm"] / info["path_ref"])
+        assert torch.equal(info["obs_path_norm"], env.path / refs[env.setup])
+        mv = (a != 0).any(1)
+        max_norm = max(max_norm, float(info["path_norm"].max()))
+        ret += rew.double()
+        moves += mv.long()
+        done = term | trunc
+        if bool(done.any()):
+            d = done
+            assert torch.equal(info["setup"][d], s0[d])
+            tele = (info["ep_final_path_mm"][d].double() - p0[d].double()) / refs[s0[d]].double()
+            tele = tele - c * moves[d].double()
+            errs.append(float((ret[d] - tele).abs().max()))
+            errs.append(float((info["ep_return"][d].double() - tele).abs().max()))
+            per_setup += torch.bincount(s0[d], minlength=4).cpu()
+            n_ep += int(d.sum())
+        ret = torch.where(done, 0.0, ret)
+        moves = torch.where(done, 0, moves)
+        p0 = torch.where(done, env.path, p0)
+        s0 = torch.where(done, env.setup, s0)
+    err = max(errs)
+    print(f"  {n_ep} episodes (per setup {per_setup.tolist()}): max |sum r - (P_final - P_0) "
+          f"/ P_max(setup) + c moves| {err:.2e}; max path / P_ref over visited states "
+          f"{max_norm:.5f}")
+    assert err < 1e-4 and max_norm < 1.001
+
+
+def test_reset_draws():
+    print("\n== 14. reset draws ==")
+    key = torch.randint(0, 2**32, (10000,), device=DEV)
+    ep = torch.randint(-1, 10**7, (10000,), device=DEV)
+    assert torch.equal(uniforms(key, ep), uniforms_torch(key, ep))
+    assert torch.equal(uniforms(key.cpu(), ep.cpu()), uniforms_torch(key, ep).cpu())
+
+    # Episode j of env i starts at the same (tilt, setup) whatever the other envs do
+    starts = []
+    for run, p_stop in enumerate((0.5, 0.1)):
+        env = multi_env(num_envs=16, seed=51, history_len=0)
+        gen = torch.Generator(device=DEV)
+        gen.manual_seed(60 + run)
+        rec = {(i, 0): (tuple(env.tilt[i].tolist()), int(env.setup[i])) for i in range(16)}
+        for _ in range(60):
+            env.step(random_actions(env, gen, p_stop=p_stop))
+            for i in range(16):
+                rec.setdefault((i, int(env.episode[i])), (tuple(env.tilt[i].tolist()),
+                                                            int(env.setup[i])))
+        starts.append(rec)
+    common = set(starts[0]) & set(starts[1])
+    assert len(common) > 16 and all(starts[0][k] == starts[1][k] for k in common)
+    # Same as an explicit reset of all envs at that episode index
+    env = multi_env(num_envs=16, seed=51, history_len=0)
+    t1, s1 = env._draw(torch.full((16,), 3, dtype=torch.long, device=DEV))
+    for i in range(16):
+        if (i, 3) in starts[0]:
+            assert starts[0][(i, 3)] == (tuple(t1[i].tolist()), int(s1[i]))
+    other = multi_env(num_envs=16, seed=52, history_len=0)
+    assert not torch.equal(other.tilt, multi_env(num_envs=16, seed=51, history_len=0).tilt)
+    print(f"  Triton hash = torch reference (10k keys); {len(common)} (env, episode) starts "
+          "identical across two runs with different stop rates; seed changes the draws")
+
+
+def test_no_auto_reset():
+    print("\n== 15. auto_reset=False, reset info, partial reset ==")
+    B = 64
+    env = multi_env(num_envs=B, seed=61, auto_reset=False, history_len=4)
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(62)
+    obs, info = env.reset(return_info=True)
+    assert bool(info["reset"].all()) and torch.equal(info["setup"], env.setup)
+    assert torch.equal(info["path_norm"], env.path / env.path_refs[env.setup])
+    assert bool((info["step"] == 0).all()) and not bool(info["idle"].any())
+    ever_done = torch.zeros(B, dtype=torch.bool, device=DEV)
+    for t in range(12):
+        a = random_actions(env, gen, p_stop=0.06)
+        was_idle = env.idle.clone()
+        snap = {k: getattr(env, k).clone() for k in ("tilt", "path", "image", "step_count",
+                                                       "ep_return")}
+        hist = env.history.get()[0].clone()
+        obs, rew, term, trunc, info = env.step(a)
+        done = term | trunc
+        assert torch.equal(info["idle"], was_idle)
+        assert not bool(done[was_idle].any()) and bool((rew[was_idle] == 0).all())
+        for k, v in snap.items():
+            assert torch.equal(getattr(env, k)[was_idle], v[was_idle]), k
+        assert torch.equal(env.history.get()[0][was_idle], hist[was_idle])
+        # Done envs: state is the final frame, obs = final obs
+        assert torch.equal(obs["image"][done], info["final_image"][done])
+        assert torch.equal(obs["images"][done], info["final_obs"]["images"][done])
+        assert torch.equal(env.idle, was_idle | done)
+        ever_done |= done
+    n_idle = int(env.idle.sum())
+    assert 8 <= n_idle <= B - 8, n_idle
+    # Partial reset: only the idle envs restart; the running ones are untouched
+    run = ~env.idle
+    snap = {k: getattr(env, k).clone() for k in ("tilt", "setup", "path", "image", "episode")}
+    hist = env.history.get()[0].clone()
+    obs, info = env.reset(env.idle.clone(), return_info=True)
+    for k, v in snap.items():
+        assert torch.equal(getattr(env, k)[run], v[run]), k
+    assert torch.equal(env.history.get()[0][run], hist[run])
+    m = info["reset"]
+    assert not bool(env.idle.any()) and bool((env.step_count[m] == 0).all())
+    assert torch.equal(env.episode[m], snap["episode"][m] + 1)
+    fresh = env.render_tilts(env.tilt, env.setup)
+    assert torch.equal(env.path, fresh["path_mm"])
+    assert int((obs["image"][m].int() - fresh["image"][m].int()).abs().max()) <= 1
+    print(f"  12 steps of {B} envs: {int(ever_done.sum())} episodes ended and idled (action "
+          f"ignored, reward 0, state, history frozen); reset of the {n_idle} idle envs leaves "
+          f"the {int(run.sum())} running ones untouched")
+
+
+def test_no_sync_multi():
+    print("\n== 16. no host syncs (4 setups, without auto-reset) ==")
+    for kw in ({}, {"auto_reset": False}):
+        env = multi_env(num_envs=256, seed=71, **kw)
+        gen = torch.Generator(device=DEV)
+        gen.manual_seed(72)
+        acts = [random_actions(env, gen, p_stop=0.1) for _ in range(8)]
+        mask = torch.rand(256, generator=gen, device=DEV) < 0.5
+        setups = torch.randint(0, 4, (256,), generator=gen, device=DEV)
+        for a in acts[:2]:
+            env.step(a)
+        env.reset(mask, return_info=True)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            for a in acts[2:]:
+                env.step(a)
+            env.reset(mask, return_info=True)
+            env.reset(mask, tilts=env.tilt, setups=setups)
+            env.step(acts[0])
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+        torch.cuda.synchronize()
+    print("  steps, masked resets with drawn and explicit setups: no sync (auto-reset on "
+          "and off)")
+
+
 if __name__ == "__main__":
     geom = CellGeometry()
     print(f"device {torch.cuda.get_device_name()}")
@@ -447,4 +698,10 @@ if __name__ == "__main__":
     test_history()
     test_no_sync()
     save_figure(os.path.join(RL_DIR, "figures", "env_renders.png"))
+    test_setups()
+    test_setup_sampling()
+    test_multi_telescoping()
+    test_reset_draws()
+    test_no_auto_reset()
+    test_no_sync_multi()
     print("\nall tests passed")

@@ -70,13 +70,13 @@ correct; they go away only because the action space changes (P1) and the GRU is 
 2. **Simulator** (S1-S6). Done, `5bb72c2`: fused Triton kernel, 0.09-0.72 ms per call at
    B = 256, bit-identical to the PyTorch reference.
 3. **Environment** (E1-E8). Done, `76aaabe`: `env.py`, 3 ms per step at B = 256, 64 px.
-4. **Baselines** before trusting PPO: random policy, always-not-move, and a sim-access oracle
-   (knows the true tilt; walks to the best reachable tilt with the same action ladder) for the
-   reachable path and the step count to match. Also a scripted image-only heuristic (fixed
-   search pattern until a second spot appears, then climb on spot count) to show how much
-   the blind region costs without learning.
-5. **Encoder and history pretraining**, see the section below. Starts with the single-frame
-   encoder benchmark (CNN vs ViT), which is independent of phase 4.
+4. **Baselines.** Done: `evaluation.py`, `baselines.py`, `reports/baselines.md`,
+   `reports/baselines_multisetup.md`. Oracle mean return 3.61 (single setup) / 0.862 (four
+   setups, per-setup scale); setup-blind homing 32 % of the oracle on four setups.
+5. **Encoder and history pretraining.** Level 1 benchmark done (`reports/encoder_benchmark.md`):
+   CNN with spatial-softmax keypoints beats ViT-p8 / p4 on every metric; ViT trained stably but
+   learned ~3x slower and missed the rare 89 / trapped frames. Level 2 targets go into phase 6
+   as auxiliary heads.
 6. **Policy and PPO** `policy.py`, `train.py` (P1-P6, T1-T6). Sanity order: one fixed initial
    tilt (must solve), a small radius around nominal, then the full range (curriculum on the
    initial-tilt radius). Path head and the other auxiliary heads trained from the start.
@@ -197,3 +197,10 @@ Triton kernel we compute it exactly.
 - **D4 - action ladder: `{0, +-1, +-3, +-10, +-30, +-100} x 0.01 deg` per axis.** M2 tilts
   +-2 deg on both axes (mount limit, absolute angles in the sim frame); initial tilts uniform
   in that box. Nominal (-0.38, 0.27) and the 57 / 89 / trapped regions all lie inside it.
+
+- **D5 - four setups in stage 1** (2026-10-15). With one setup the absolute tilt solves the
+  task (homing via the mount limit reaches 99 % of the oracle). Setups: measured 88 mm plus
+  116 / 144 / 169 mm with their own laser tilts, one per episode, reward scaled by each setup's
+  best path. Setup-blind homing drops to 32 % of the oracle.
+- **D6 - encoder: CNN with spatial-softmax keypoints** (benchmark above); ViT revisited only
+  with longer training and oversampled rare patterns.

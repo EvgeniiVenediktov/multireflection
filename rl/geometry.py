@@ -7,10 +7,17 @@ M2 at z = separation facing -z, laser behind the M1 hole).
 
 At the nominal state the reference simulator gives 31 bounces (16 spots on M2),
 a 2733.27 mm path, and the beam leaves through the M1 hole.
+
+SETUPS: the measured cell (first, unchanged) and three more setups found by
+find_setups.py (reports/setups.md): same mirrors, laser offset and mirror offsets, other
+separation and laser tilt. Each records its nominal M2 tilt (deepest point of its
+plateau, the largest hole-exit region); SETUP_INFO holds the regression values at
+cap 128 (plateau order and path at the nominal tilt, longest path in the +-2 deg box on
+the 0.01 deg grid and the target tilt where it is reached).
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -44,6 +51,8 @@ NOMINAL_PATH_MM = 2733.27
 @dataclass
 class CellGeometry:
     """Measured cell: mirrors, nominal alignment, actuation limits, sim limits."""
+
+    name: str = "measured"
 
     # ── Mirrors (both) ──
     roc: float = 200.0  # Radius of curvature (mm)
@@ -130,3 +139,43 @@ class CellGeometry:
         vals[S_LASER_PITCH] = self.laser_pitch
         vals[S_LASER_YAW] = self.laser_yaw
         return vals.to(dev).expand(B, STATE_DIM).clone()
+
+
+# ── Setups ──────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SetupInfo:
+    """Regression values of a setup at cap 128 (find_setups.py, reports/setups.md)."""
+
+    plateau_bounces: int  # At the nominal M2 tilt, leaves through the M1 hole
+    plateau_path_mm: float
+    pmax_mm: float  # Longest path in the M2 box (0.01 deg grid)
+    target: Tuple[float, float]  # M2 tilt (deg) in the best region (deepest point)
+    target_bounces: int
+
+
+SETUPS: Tuple[CellGeometry, ...] = (
+    CellGeometry(),
+    CellGeometry(name="sep116", separation=116.0, laser_pitch=6.35, laser_yaw=0.45,
+                 m2_pitch=0.27, m2_yaw=0.15),
+    CellGeometry(name="sep144", separation=144.0, laser_pitch=1.75, laser_yaw=3.50,
+                 m2_pitch=0.69, m2_yaw=-0.06),
+    CellGeometry(name="sep169", separation=169.0, laser_pitch=3.55, laser_yaw=2.50,
+                 m2_pitch=0.16, m2_yaw=0.24),
+)
+
+SETUP_INFO: Dict[str, SetupInfo] = {
+    "measured": SetupInfo(31, 2733.27, 11270.63, (0.09, 1.03), 128),
+    "sep116": SetupInfo(21, 2441.57, 13348.60, (0.36, -1.24), 115),
+    "sep144": SetupInfo(33, 4757.13, 18437.93, (-0.61, -0.06), 128),
+    "sep169": SetupInfo(39, 6596.23, 21637.84, (1.00, 0.72), 128),
+}
+
+
+def setup_by_name(name: str) -> CellGeometry:
+    """The SETUPS entry with this name."""
+    for g in SETUPS:
+        if g.name == name:
+            return g
+    raise KeyError(f"unknown setup {name!r}, expected one of {[g.name for g in SETUPS]}")
