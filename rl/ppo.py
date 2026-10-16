@@ -63,7 +63,17 @@ Cluster: cluster/ppo_l40s.slurm.
                lr x --encoder-lr-scale; z is recomputed with grad from the stored frames
                (bf16, channels_last, compiled; activation-checkpointed chunks, or one pass
                without recompute with --no-enc-checkpoint), once per frame and epoch; the
-               ring is re-encoded at each rollout start
+               ring is re-encoded at each rollout start (and once more at the first rollout
+               after the encoder stopped). --encoder-epochs N (0 = all): the encoder gets
+               gradients in the first N epochs only; before epoch N + 1 the z of every
+               stored frame (context included) is recomputed once without grad by the
+               updated encoder and reused by the remaining epochs (no encoder gradients
+               there: AdamW neither steps nor decays it). --encoder-train-until F (1 =
+               never): the encoder trains only in iterations whose env steps before the
+               rollout are below round(F x total_env_steps), then the update reuses the
+               rollout's z as with the frozen encoder (Trainer.encoder_trains: one function
+               of the iteration and the config for the ring re-encoding, the update and
+               the logs; the iteration of the switch is printed)
     eval       every --eval-every iterations and at the end, separate envs without
                auto-reset, deterministic (argmax) and sampled (one seeded sample per
                episode and step, --eval-sampled) policies; oracle reference
@@ -161,7 +171,7 @@ class PPOConfig:
     laser_offset_radius: float = 1.5  # mm, offset disk around the hole centre; 0 = measured
     laser_mode: str = "landing"  # landing: angles from a uniform M2 landing point; angle
     pool_size: int = 16384
-    pool_refresh: float = 0.125  # Share of the pool rescanned per iteration
+    pool_refresh: float = 0.0625  # Share of the pool rescanned per iteration (was 0.125)
 
     # ── Scenario sampler (--setups full) ──
     plr: bool = True  # Regret-prioritized replay; False: good scenarios uniform
@@ -187,6 +197,8 @@ class PPOConfig:
     encoder_lr_scale: float = 0.1
     enc_chunk: int = 1024
     enc_checkpoint: bool = True  # Unfrozen encoder: checkpointed chunks (False: no recompute)
+    encoder_epochs: int = 0  # Unfrozen encoder: gradients in the first N PPO epochs only; 0 = all
+    encoder_train_until: float = 1.0  # Encoder frozen from env_steps >= this x total_env_steps; 1 = never
     amp: bool = True
     compile: bool = True
 
@@ -778,6 +790,7 @@ class Trainer:
             c.total_env_steps = default_total_steps(c)
         assert c.setups in SETUP_CHOICES, f"setups {c.setups!r} not in {SETUP_CHOICES}"
         assert c.scenarios in SCENARIO_CHOICES, f"scenarios {c.scenarios!r} not in {SCENARIO_CHOICES}"
+        assert c.encoder_epochs >= 0 and c.encoder_train_until >= 0, "encoder schedule"
         self.device = dev = torch.device(device or "cuda")
         torch.manual_seed(c.seed)
 
@@ -862,6 +875,7 @@ class Trainer:
         # ── Persistent rollout state ──
         B, K = c.num_envs, c.history_len
         self.ring: Ring = self.agent.init_ring(B, dev)
+        self.ring_stale = False  # The encoder changed since the ring's z: re-encode it
         self.next_first = torch.ones(B, dtype=torch.bool, device=dev)
         self.n_slots = math.ceil(c.rollout_len / c.max_steps)
         self.buf = Rollout(B, c.rollout_len, K, self.agent.cfg.encoder.z_dim, c.img_res,
@@ -893,12 +907,28 @@ class Trainer:
         self.atlas.check(ec.max_bounces, ec.geometry.m2_tilt_limit, ec.step_unit)
         print(f"{self.atlas.summary()}\natlas ready in {time.time() - t0:.1f} s", flush=True)
 
+    def encoder_stop_iteration(self) -> Optional[int]:
+        """First iteration without encoder training under --encoder-train-until (the env
+        steps before its rollout, iteration x num_envs x rollout_len, reach
+        round(encoder_train_until x total_env_steps)); None = never (>= 1)."""
+        c = self.cfg
+        if c.encoder_train_until >= 1.0:
+            return None
+        steps = round(c.encoder_train_until * c.total_env_steps)
+        return -(-steps // (c.num_envs * c.rollout_len))
+
     def encoder_trains(self, iteration: Optional[int] = None) -> bool:
+        """Whether the encoder trains in this iteration (default the current one):
+        unfrozen (--no-encoder-freeze, or from --unfreeze-at) and before
+        encoder_stop_iteration. A function of the iteration and the config only, used by
+        every code path: the ring re-encoding (rollout), the z of the update, the logs
+        (the encoder's AdamW groups get no gradients otherwise: not stepped, no decay)."""
         c = self.cfg
         it = self.iteration if iteration is None else iteration
-        if not c.encoder_freeze:
-            return True
-        return c.unfreeze_at >= 0 and it >= c.unfreeze_at
+        if c.encoder_freeze and not (c.unfreeze_at >= 0 and it >= c.unfreeze_at):
+            return False
+        stop = self.encoder_stop_iteration()
+        return stop is None or it < stop
 
     def _signal(self, signum, frame):
         self.stop_signal = signum
@@ -913,8 +943,9 @@ class Trainer:
         consistent)."""
         c, ag, env, b = self.cfg, self.agent, self.env, self.buf
         C, T = b.C, b.T
-        if self.encoder_trains():
+        if self.encoder_trains() or self.ring_stale:  # Ring z from the current encoder
             self.ring = ag.reencode_ring(self.ring)
+        self.ring_stale = False
         r = self.ring
         b.frames[:, :C] = r.frame[:, 1:]
         b.z[:, :C] = r.z[:, 1:]
@@ -987,10 +1018,23 @@ class Trainer:
 
     # ── Update ──
 
+    @torch.no_grad()
+    def reencode_buffer(self):
+        """z of every stored frame (the K - 1 context positions and the T steps)
+        recomputed by the current encoder without grad, in blocks of the update's
+        minibatch (num_envs / minibatches envs)."""
+        b, ag = self.buf, self.agent
+        Bm = b.B // self.cfg.minibatches
+        for i in range(0, b.B, Bm):
+            b.z[i:i + Bm] = ag.encode(b.frames[i:i + Bm].flatten(0, 1)).view(-1, *b.z.shape[1:])
+
     def update(self) -> Dict[str, torch.Tensor]:
         """GAE, value-norm update and the PPO epochs on self.buf; returns stats. Sets
         the learning rate of this iteration (lr_at) and, with ent_adaptive, steps the
-        entropy coefficient after every minibatch."""
+        entropy coefficient after every minibatch. When the encoder trains: z from the
+        stored frames with grad in the first encoder_epochs epochs (0 = all), then
+        self.buf.z recomputed once by the updated encoder (reencode_buffer) and used
+        without grad; the ring is marked stale for the next rollout."""
         c, ag, b = self.cfg, self.agent, self.buf
         lr = lr_at(c, self.iteration, self.env_steps)
         for g in self.opt.param_groups:
@@ -1004,6 +1048,7 @@ class Trainer:
         self.vnorm.update(ret)
         ret_n = self.vnorm.normalize(ret)
         trains_enc = self.encoder_trains()
+        enc_ep = c.encoder_epochs if 0 < c.encoder_epochs < c.epochs else c.epochs
         B = b.B
         Bm = B // c.minibatches
         assert Bm * c.minibatches == B, "num_envs must be divisible by minibatches"
@@ -1012,15 +1057,18 @@ class Trainer:
                 "ent_coef", "ratio_dev")
         acc = {k: torch.zeros((), device=self.device) for k in keys}
         n_mb = 0
-        epochs = 0
+        epochs = enc_epochs = 0
         for epoch in range(c.epochs):
+            if trains_enc and epoch == enc_ep:  # The encoder's epochs done (no KL stop)
+                self.reencode_buffer()
+            enc_grad = trains_enc and epoch < enc_ep
             perm = torch.randperm(B, generator=self.gen_mb, device=self.device)
             ekl = torch.zeros((), device=self.device)
             for i in range(c.minibatches):
                 if self.stop_signal is not None:
                     break
                 idx = perm[i * Bm:(i + 1) * Bm]
-                if trains_enc:
+                if enc_grad:
                     z = ag.encode(b.frames[idx].flatten(0, 1), grad=True).view(Bm, -1, b.z.shape[-1])
                 else:
                     z = b.z[idx]
@@ -1061,13 +1109,17 @@ class Trainer:
                     acc["clipfrac"] += ((ratio - 1).abs() > c.clip).float().mean()
                 n_mb += 1
             epochs += 1
+            enc_epochs += int(enc_grad)
             if self.stop_signal is not None:
                 break
             if float(ekl) / c.minibatches > c.target_kl:  # Host sync, once per epoch
                 break
+        if trains_enc and n_mb > 0:
+            self.ring_stale = True  # The ring's z predate this update
         out = {k: v / max(n_mb, 1) for k, v in acc.items() if k != "ratio_dev"}
         out["ratio_dev_first_mb"] = acc["ratio_dev"]
         out["epochs"] = torch.tensor(float(epochs))
+        out["enc_epochs"] = torch.tensor(float(enc_epochs))
         out["lr"] = torch.tensor(lr)
         out["ent_target"] = torch.tensor(target)
         out["ent_coef_now"] = self.log_alpha.exp() if c.ent_adaptive else torch.tensor(c.ent_coef)
@@ -1145,6 +1197,7 @@ class Trainer:
                     "gen": self.gen.get_state(), "gen_mb": self.gen_mb.get_state()},
             "env": self.env.get_state(),
             "ring": self.ring._asdict(),
+            "ring_stale": self.ring_stale,
             "next_first": self.next_first,
         }
 
@@ -1175,6 +1228,8 @@ class Trainer:
         self.gen_mb.set_state(d["rng"]["gen_mb"].cpu())
         self.env.set_state(d["env"])
         self.ring = Ring(**{k: v.to(self.device) for k, v in d["ring"].items()})
+        # Older checkpoints: stale if the encoder trained in the last iteration
+        self.ring_stale = bool(d.get("ring_stale", self.encoder_trains(self.iteration - 1)))
         self.next_first = d["next_first"].to(self.device)
 
     # ── Main loop ──
@@ -1192,11 +1247,22 @@ class Trainer:
         steps_per_iter = c.num_envs * c.rollout_len
         last_ckpt = t_start = time.time()
         print(f"{self.name}: {count(self.agent)} -> {self.run_dir}", flush=True)
+        stop = self.encoder_stop_iteration()
+        if (not c.encoder_freeze or c.unfreeze_at >= 0) and (stop is not None or c.encoder_epochs > 0):
+            ne = min(c.encoder_epochs or c.epochs, c.epochs)
+            print(f"encoder schedule: gradients in the first {ne} of {c.epochs} PPO epochs; "
+                  + ("trains until the end" if stop is None else
+                     f"frozen from iteration {stop} ({stop * steps_per_iter} env steps >= "
+                     f"{c.encoder_train_until:g} x {c.total_env_steps})"), flush=True)
         while self.env_steps < c.total_env_steps and self.stop_signal is None:
-            if self.encoder_trains() and not self.encoder_trains(self.iteration - 1) \
-                    and self.iteration > 0:
-                print(f"iteration {self.iteration}: encoder unfrozen "
-                      f"(lr x {c.encoder_lr_scale})", flush=True)
+            it = self.iteration
+            if it > 0 and self.encoder_trains() != self.encoder_trains(it - 1):
+                if self.encoder_trains():
+                    print(f"iteration {it}: encoder unfrozen (lr x {c.encoder_lr_scale})", flush=True)
+                else:
+                    print(f"iteration {it}: encoder frozen for the rest of the run (env steps "
+                          f"{self.env_steps} >= {c.encoder_train_until:g} x {c.total_env_steps}); "
+                          f"the update reuses the rollout's z", flush=True)
             if self.sampler is not None:
                 self.sampler.refresh(self.iteration)
             sync()
@@ -1391,11 +1457,13 @@ def encoder_origin(encoder_info: Optional[dict]) -> str:
 
 def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     """Display / directory name from the config, built at start:
-    ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_<tag>]_<jobid>;
+    ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_ee<N>][_eu<F>][_pr<F>][_<tag>]_<jobid>;
     <enc>: encoder_origin; <scen>: <ranges>-plr / -unif with the pool (ContRanges.tag,
     e.g. cont20-400-plr), full-plr / full-unif with the atlas (prioritized / uniform
     good draws), or set<S>, with -ho<pct>[s<seed>] when grid scenarios are held out
-    (--holdout-frac); _ft<run>: initialized from that PPO run (--init-from)."""
+    (--holdout-frac); _ft<run>: initialized from that PPO run (--init-from); _ee<N> /
+    _eu<F>: --encoder-epochs / --encoder-train-until when set; _pr<F>: --pool-refresh
+    when not the default (pool runs)."""
     enc = encoder_origin(encoder_info)
     if pool_mode(c):
         scen = cont_ranges_of(c).tag() + ("-plr" if c.plr else "-unif")
@@ -1412,6 +1480,12 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
         name += "_e2e"
     elif c.unfreeze_at >= 0:
         name += f"_uf{c.unfreeze_at}"
+    if c.encoder_epochs > 0:
+        name += f"_ee{c.encoder_epochs}"
+    if c.encoder_train_until < 1.0:
+        name += f"_eu{c.encoder_train_until:g}"
+    if pool_mode(c) and c.pool_refresh != PPOConfig.pool_refresh:
+        name += f"_pr{c.pool_refresh:g}"
     if c.name_tag:
         name += f"_{c.name_tag}"
     return name + "_" + os.environ.get("SLURM_JOB_ID", "local")
@@ -1422,7 +1496,8 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
 
 RESUME_OVERRIDES = ("total_env_steps", "eval_every", "ckpt_minutes", "wandb", "wandb_project",
                     "unfreeze_at", "encoder_lr_scale", "compile", "target_kl", "eval_sampled",
-                    "enc_checkpoint", "eval_offgrid", "eval_extrap", "eval_tables")
+                    "enc_checkpoint", "eval_offgrid", "eval_extrap", "eval_tables",
+                    "encoder_epochs", "encoder_train_until")
 PATH_FIELDS = ("encoder_init", "init_from", "atlas", "eval_tables")
 TUPLE_FIELDS = tuple(f.name for f in fields(PPOConfig) if isinstance(getattr(PPOConfig(), f.name), tuple))
 LEGACY_DEFAULTS = {"scenarios": "atlas"}  # Checkpoints from before the field: the grid atlas

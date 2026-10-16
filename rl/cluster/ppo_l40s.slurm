@@ -8,7 +8,7 @@
 # separation SEP_RANGE 20-400 mm, laser offset uniform over the M1 hole disk of
 # LASER_OFFSET_RADIUS 1.5 mm, laser pitch / yaw from a uniform M2 landing point within
 # LASER_RANGE -8..8 deg, beams clipped by the hole or missing M2 discarded; a pool of
-# 16,384 scanned scenarios, 1/8 rescanned per iteration, regret-prioritized replay within
+# 16,384 scanned scenarios, 1/16 rescanned per iteration, regret-prioritized replay within
 # it, 10 % impossible scenarios), B = 1024 envs, rollout 128, K = 16, frozen encoder
 # initialized from ENCODER_INIT, 1e9 env steps (the 1-day limit and a resume job handle
 # the rest), lr warmup 20 iterations then cosine to 10 %, adaptive entropy (target 2.0 ->
@@ -20,11 +20,14 @@
 # latest.pt every 15 min, W&B project herriott-rl (auth from ~/.netrc; add --no-wandb to
 # EXTRA_ARGS for an unlogged run). The W&B display name is built at start, e.g.
 # ppo_cnn-ftcont_k16_cont20-400-plr_b1024_s0_ft4407578_<jobid> (encoder origin, scenario
-# source and range, _ft<run> when INIT_FROM is set, _uf<it> with --unfreeze-at).
+# source and range, _ft<run> when INIT_FROM is set, _uf<it> with --unfreeze-at, _e2e with
+# --no-encoder-freeze, _ee<N> / _eu<F> with --encoder-epochs / --encoder-train-until,
+# _pr<F> with a --pool-refresh other than 0.0625).
 # Per-iteration rollout / update / eval times are in train.csv and W&B (time_rollout_s,
-# time_update_s, time_eval_s, fps*), the pool refresh in pool/refresh_s (estimate ~1-1.5 s
-# per refresh on the L40S: ~4,900 candidates, ~4,000 box scans; halve with
-# EXTRA_ARGS="--pool-refresh 0.0625"). Grid-atlas runs as before (run 4407578):
+# time_update_s, time_eval_s, fps*), the pool refresh in pool/refresh_s (1.25 s per
+# iteration on the L40S at the former default --pool-refresh 0.125, so ~0.6 s at the
+# default 0.0625; runs resumed from older checkpoints keep their 0.125). Grid-atlas runs
+# as before (run 4407578):
 # SCENARIOS=atlas; four-setup runs: add --setups all to EXTRA_ARGS (ATLAS then unused).
 #
 # Startup of a new pool run: the pool is filled (16,384 slots: ~39k candidates, ~32k box
@@ -41,7 +44,11 @@
 # the training scenarios only).
 #
 # Environment variables (sbatch --export=ALL,NAME=value,...):
-#   ENCODER_INIT  encoder checkpoint (pretrain_encoder.py model.pt); default the copy of
+#   ENCODER_INIT  encoder checkpoint (pretrain_encoder.py model.pt), new runs only; it
+#                 replaces the encoder of INIT_FROM. "none" (or set empty): no
+#                 --encoder-init, the encoder comes from INIT_FROM (required then), and
+#                 the run name's encoder origin from that checkpoint's encoder_info.
+#                 Default (unset) the copy of
 #                 the D7 fine-tuned encoder that encoder_l40s.slurm writes:
 #                 /ix1/kchen/evv/multireflection/rl_runs/encoder/cnn_w160_lr0.0003_b256_8k_s0_ft-grid16384_cont20-400x16384.pt
 #   SCENARIOS     pool (default, continuous) or atlas (grid), new runs only
@@ -83,6 +90,20 @@
 #   sbatch --time=01:00:00 --export=ALL,SCENARIOS=atlas,INIT_FROM=/ix1/kchen/evv/multireflection/rl_runs/4398136/best.pt,EXTRA_ARGS="--unfreeze-at 0 --encoder-lr-scale 0.1 --total-env-steps 2621440 --eval-every 10 --eval-n 1024 --no-wandb --name-tag smoke" rl/cluster/ppo_l40s.slurm
 #   sbatch --export=ALL,SCENARIOS=atlas,INIT_FROM=/ix1/kchen/evv/multireflection/rl_runs/4398136/best.pt,EXTRA_ARGS="--unfreeze-at 0 --encoder-lr-scale 0.1 --eval-every 40" rl/cluster/ppo_l40s.slurm
 #
+# Encoder trained for part of the run, first PPO epoch only (r4b): everything, the
+# fine-tuned encoder included, from a previous pool run's best checkpoint (ENCODER_INIT=none
+# keeps its encoder; snapshot best.pt to a fixed file first, the run keeps writing it).
+# The encoder trains at 0.1 x lr with gradients in the first of the 4 PPO epochs
+# (--encoder-epochs 1; then the z of all stored frames are recomputed once without grad
+# and the other 3 epochs train the rest) until 30 % of the env steps (--encoder-train-until
+# 0.3: frozen from iteration 1145 of 3815, logged as "iteration 1145: encoder frozen for
+# the rest of the run"). Expected update ~12-13 s per iteration while the encoder trains
+# (36 s with gradients in all 4 epochs), 2.8 s after; --eval-every 60 is ~15 min in the
+# first phase at ~15 s per iteration (~5 min after the switch):
+#   INIT=/ix1/kchen/evv/multireflection/rl_runs/4410759/best_snapshot_it<N>.pt
+#   sbatch --export=ALL,ENCODER_INIT=none,INIT_FROM=$INIT,EXTRA_ARGS="--no-encoder-freeze --encoder-lr-scale 0.1 --lr 1e-4 --total-env-steps 500000000 --encoder-epochs 1 --encoder-train-until 0.3 --eval-every 60" rl/cluster/ppo_l40s.slurm
+# (run name ppo_cnn-ftcont_k16_cont20-400-plr_b1024_s0_ft4410759_e2e_ee1_eu0.3_<jobid>)
+#
 # Learning sanity checks (short jobs; set --time on the sbatch line):
 #   (a) measured cell only, every episode starts at the nominal tilt (-0.38, 0.27); the
 #       agent must reach the trapped region and stop. Oracle return from that start
@@ -98,9 +119,11 @@
 #
 # Resume / continue (same run dir; the config comes from latest.pt, only the run-control
 # flags total-env-steps, eval-every, ckpt-minutes, wandb, wandb-project, unfreeze-at,
-# encoder-lr-scale, compile, target-kl, eval-sampled, enc-checkpoint, eval-offgrid,
-# eval-extrap, eval-tables may change; ATLAS, INIT_FROM, SCENARIOS and the ranges are not
-# passed (the pool's slots and stream position come from latest.pt); a run started
+# encoder-lr-scale, encoder-epochs, encoder-train-until, compile, target-kl, eval-sampled,
+# enc-checkpoint, eval-offgrid, eval-extrap, eval-tables may change; ATLAS, INIT_FROM,
+# SCENARIOS, the ranges and pool-refresh are not passed (the pool's slots, refresh share
+# and stream position come from latest.pt; a changed total-env-steps moves the
+# encoder-train-until step with it, like the lr schedule); a run started
 # before the off-grid sets evaluates them from the resume on, in W&B only: eval.csv keeps
 # its header):
 #   sbatch --export=ALL,RUN_ID=<jobid of the first job> rl/cluster/ppo_l40s.slurm
@@ -135,7 +158,8 @@ PROJECT_DIR="${PROJECT_DIR:-/ihome/kchen/evv13/multireflection}"
 RUNS_ROOT="${RUNS_ROOT:-/ix1/kchen/evv/multireflection/rl_runs}"
 RUN_DIR="$RUNS_ROOT/${RUN_ID:-${SLURM_JOB_ID:-manual}}"
 VENV_PY="${VENV_PY:-$PROJECT_DIR/.venv/bin/python}"
-ENCODER_INIT="${ENCODER_INIT:-$RUNS_ROOT/encoder/cnn_w160_lr0.0003_b256_8k_s0_ft-grid16384_cont20-400x16384.pt}"
+# Unset: the default encoder; "none" or empty: the encoder of INIT_FROM
+ENCODER_INIT="${ENCODER_INIT-$RUNS_ROOT/encoder/cnn_w160_lr0.0003_b256_8k_s0_ft-grid16384_cont20-400x16384.pt}"
 SCENARIOS="${SCENARIOS:-pool}"
 SEP_RANGE="${SEP_RANGE:-20 400}"
 LASER_RANGE="${LASER_RANGE:--8 8}"
@@ -163,9 +187,16 @@ if [ -f "$RUN_DIR/latest.pt" ]; then
     START_ARGS=(--resume)
     MODE="resume $RUN_DIR/latest.pt"
 else
-    [ -f "$ENCODER_INIT" ] || { echo "no encoder checkpoint at $ENCODER_INIT"; exit 1; }
-    START_ARGS=(--encoder-init "$ENCODER_INIT" --atlas "$ATLAS" --scenarios "$SCENARIOS")
-    MODE="new run, encoder from $ENCODER_INIT, scenarios $SCENARIOS, atlas $ATLAS"
+    START_ARGS=(--atlas "$ATLAS" --scenarios "$SCENARIOS")
+    if [ -z "$ENCODER_INIT" ] || [ "$ENCODER_INIT" = "none" ]; then
+        [ -n "$INIT_FROM" ] || { echo "ENCODER_INIT=${ENCODER_INIT:-(empty)} needs INIT_FROM (the encoder comes from it)"; exit 1; }
+        MODE="new run, encoder from INIT_FROM"
+    else
+        [ -f "$ENCODER_INIT" ] || { echo "no encoder checkpoint at $ENCODER_INIT"; exit 1; }
+        START_ARGS+=(--encoder-init "$ENCODER_INIT")
+        MODE="new run, encoder from $ENCODER_INIT"
+    fi
+    MODE="$MODE, scenarios $SCENARIOS, atlas $ATLAS"
     if [ "$SCENARIOS" = "pool" ]; then
         START_ARGS+=(--sep-range $SEP_RANGE --laser-range $LASER_RANGE
                      --laser-offset-radius "$LASER_OFFSET_RADIUS")
