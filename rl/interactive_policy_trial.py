@@ -16,8 +16,8 @@ Panels
                colored by bounce count or P / P_max; one Triton scan per scenario change.
                Overlay: the episode's tilt trajectory, start, current tilt, best tilt
                (P_max), the tilt-head estimate (mean +- 1 std) and, once the episode
-               ended, the oracle's target. Click or drag on the map sets the start tilt
-               (new episode). Below: the scenario and the last episode vs its oracle
+               ended, the oracle's target. Below: the scenario and the last episode vs its
+               oracle
     camera     the 64 px uint8 image the agent receives (env.SpotRenderer), step, bounce
                count, path, stop reason, episode state
     beam       x-z and y-z side views (z / separation) of the ray between the mirrors
@@ -26,33 +26,50 @@ Panels
     policy     per-axis ladder probabilities (zero step highlighted, next / taken step
                outlined), P(not move) = p_pitch(0) p_yaw(0), value (de-normalized), path,
                tilt and scenario heads (mean +- std) against the true values
-Controls (keys in brackets)
-    scenario   named setups (measured, sep116, sep144, sep169; they also move the start to
-               the setup's nominal tilt), random good scenario from the atlas [g], random
-               short (20-49 mm) / long (201-350 mm) separation with laser pitch / yaw in 0-8
-               deg (the first good one of up to 32 candidates, else the closest), sliders for
-               separation (20-350 mm, 0.5 mm steps; [ ] -/+0.5 mm, { } -/+5 mm) and laser
-               pitch / yaw. P_max, best tilt and good / impossible come from the atlas when
-               the scenario is on its grid (or a named setup), otherwise from one box scan
-               (same grid and rule: good = P_max >= 20 x separation). Separations outside
-               the trained 50-200 mm are marked as extrapolation (scenario text, episode
-               log column in_training_range)
-    episode    Step [right, s], Run [space: run / pause] and Pause (timer, until not move or
-               max_steps), Reset [r] (restart at the start tilt), Random start [n] (uniform
-               in the run's init box), argmax / sampled policy [d], map color [m]; M2 pitch /
-               yaw sliders set the start tilt and work without a policy; checkpoint path
-               box (Enter loads)
+Scenario space: (separation 20-400 mm, laser pitch and yaw -8..+8 deg, laser dx / dy: the
+offset from the M1 hole centre, anywhere in the hole disk of radius 1.5 mm; measured cell
+0.75 / 1.04 mm). Validity from the box scan: CLIPPED BY HOLE (0 bounces and BLOCKED at
+zero M2 tilt: the laser hits the back of M1 at the hole edge, independent of the tilt),
+MISSES M2 (0 bounces at every tilt), else VALID; good = valid and P_max >= 20 x
+separation. P_max, best tilt and good come from the atlas for its grid points and named
+setups (measured offset), otherwise from the scan. Training range of the loaded
+checkpoint: its scenario-head range (agent config scen_lo / scen_hi; the offsets count as
+trained when the head predicts laser_dx / laser_dy, else only the measured offset);
+4407578: separation 50-200 mm, laser 0-8 deg, measured offset. Scenarios outside it are
+marked EXTRAPOLATION. The scenario head's parameters and normalization come from the
+checkpoint config (a scen* list of names, else 3 or 5 values in the order separation,
+laser pitch, laser yaw, laser dx, laser dy); a head this agent.py cannot load (another
+number of values) is reported as not loaded.
+Controls and keys
+    mouse      landscape: click or drag sets the start tilt (new episode, mount resolution
+               0.01 deg); laser-offset disk: click or drag sets laser dx / dy (kept inside the
+               hole); sliders: separation (0.5 mm steps), laser pitch / yaw, M2 pitch / yaw
+               (start tilt; work without a policy); checkpoint path box (Enter loads)
+    buttons    named setups (measured, sep116, sep144, sep169: their separation, laser tilt
+               and measured offset; the start moves to the setup's nominal tilt), random
+               good (separation 20-400 mm), random short (20-49 mm), random long (201-400
+               mm): laser angles uniform in -8..+8 deg, offset uniform in the hole disk, only
+               valid scenarios, the first good one of up to 64 candidates (else the valid one
+               closest to good); Step, Run, Pause, Reset (restart at the start tilt), Random
+               start (uniform in the run's init box), policy argmax / sampled, map color
+    keys       right or s: step; space: run / pause; r: reset; n: random start; d: argmax /
+               sampled; m: map color; g: random good scenario; [ / ]: separation -/+0.5 mm;
+               { / }: -/+5 mm
 Decision log (one pair of files per session in runs/viewer_logs/, gitignored; --no-log):
-    <session>_steps.csv     a row per agent step: tilt before / after, the action (ladder
+    <session>_steps.csv     a row per agent step: the scenario (incl. laser_dx_mm /
+                            laser_dy_mm), tilt before / after, the action (ladder
                             step and applied delta, deg; not_move), P(not move), the
                             probability of the taken step and the top 3 steps per axis,
                             the full per-axis distributions (p_pitch_<units>, p_yaw_...),
                             value, path head vs the true path (m, P / P_ref), tilt head
-                            (mean, std) vs the tilt before, scenario head (mean, std) vs the
-                            scenario, reward, return so far, stop reason, done flags
+                            (mean, std) vs the tilt before, scenario head (mean, std per
+                            parameter, scen_head_<sep_mm|laser_pitch|laser_yaw|laser_dx_mm|
+                            laser_dy_mm>, nan where the head has no value) vs the scenario,
+                            reward, return so far, stop reason, done flags
     <session>_episodes.csv  a row per played episode (stopped, truncated, or abandoned by
-                            a new start / scenario / checkpoint): scenario, P_max,
-                            in_training_range (0: extrapolation), start,
+                            a new start / scenario / checkpoint): scenario (incl.
+                            laser_dx_mm / laser_dy_mm), P_max, valid / invalid_reason,
+                            in_training_range (0: extrapolation) / range_note, start,
                             steps, moves, final tilt and path, P / P_max, return, and the
                             oracle of that scenario and start (baselines.plan_oracle):
                             return, regret, % of the oracle, target tilt, path, moves
@@ -104,7 +121,8 @@ from baselines import MoveTable, ladder_units, plan_oracle
 from env import AlignEnv, EnvConfig, Scenarios
 from find_setups import box_grid, candidate_states
 from geometry import SETUPS, CellGeometry, setup_by_name
-from herriott_sim import DEVICE, STOP_HOLE, STOP_MISSED, STOP_NAMES, HerriottSim
+from herriott_sim import (DEVICE, S_LASER_DX, S_LASER_DY, STOP_BLOCKED, STOP_HOLE, STOP_MISSED,
+                          STOP_NAMES, HerriottSim)
 from ppo import PPOConfig, ValueNorm, agent_config, env_config
 from scenarios import DEFAULT_ATLAS, AtlasConfig, load_atlas
 
@@ -146,34 +164,40 @@ def _px(x: float, y: float, w: float, h: float) -> Tuple[float, float, float, fl
 
 MAP_RECT = _px(85, 580, 450, 450)
 CBAR_RECT = _px(548, 580, 12, 450)
-SCEN_TXT_RECT = _px(30, 395, 590, 83)
-LAST_TXT_RECT = _px(30, 305, 590, 90)
-CAM_RECT = _px(700, 760, 270, 270)
-CAM_TXT_RECT = _px(655, 612, 460, 132)
-FACE_RECTS = (_px(690, 385, 195, 195), _px(925, 385, 195, 195))
-HIT_CBAR_RECT = _px(1135, 400, 9, 165)
-SIDE_RECTS = (_px(1265, 935, 595, 95), _px(1265, 790, 595, 95))
-BAR_RECTS = (_px(1265, 625, 265, 80), _px(1595, 625, 265, 80))
-POL_RECT = _px(1215, 328, 645, 178)
-MSG_RECT = _px(655, 145, 1205, 25)
-INFO_RECT = _px(655, 88, 1205, 50)
-HELP_RECT = _px(655, 26, 1205, 54)
-FRAME_BLIT = (_px(0, 300, 1880, 760), _px(0, 0, 640, 62))  # Frame-layer blit areas
+SCEN_TXT_RECT = _px(30, 392, 590, 90)
+LAST_TXT_RECT = _px(30, 305, 590, 80)
+CAM_RECT = _px(690, 730, 300, 300)
+CAM_TXT_RECT = _px(655, 588, 520, 130)
+FACE_RECTS = (_px(675, 318, 215, 215), _px(905, 318, 215, 215))
+HIT_CBAR_RECT = _px(1135, 335, 9, 180)
+SIDE_RECTS = (_px(1265, 925, 595, 105), _px(1265, 768, 595, 105))
+BAR_RECTS = (_px(1265, 600, 265, 95), _px(1595, 600, 265, 95))
+POL_RECT = _px(1240, 290, 620, 230)
+HOLE_RECT = _px(535, 160, 95, 95)
+HOLE_TXT_RECT = _px(522, 120, 125, 36)
+MSG_RECT = _px(655, 100, 1205, 22)
+INFO_RECT = _px(655, 14, 1205, 82)
+FRAME_BLIT = (_px(0, 290, 1880, 770), _px(0, 0, 640, 62))  # Frame-layer blit areas
 
 # ── Font sizes (pt) ──
 FS_TICK = 9.0
 FS_LABEL = 10.0
 FS_TITLE = 11.0
 FS_TEXT = 10.0  # Panel values and labels (monospace)
-FS_SMALL = 9.0  # Legend, info and help lines
+FS_SMALL = 9.0  # Legend and info lines
 FS_HEAD = 11.5  # Control group headers
 
-# ── Separations outside the trained 50-200 mm (extrapolation) ──
-SEP_SLIDER = (20.0, 350.0)  # mm, slider range (step 0.5 mm; keys [ ] and { })
+# ── Scenario space: (separation, laser pitch, laser yaw, laser dx, laser dy), the offsets
+# from the M1 hole centre anywhere in the hole disk (the training space of the runs after
+# 4407578, which trained on 50-200 mm, 0-8 deg and the measured offsets) ──
+SEP_RANGE = (20.0, 400.0)  # mm (slider step 0.5 mm; keys [ ] and { })
+ANGLE_RANGE = (-8.0, 8.0)  # deg, laser pitch and yaw
 SHORT_SEPS = (20.0, 49.0)  # "random short"
-LONG_SEPS = (201.0, 350.0)  # "random long"
-OUTSIDE_TRIES = 32  # Random short / long: candidates scanned for a good one (at most)
-OUTSIDE_BATCH = 8  # Candidates per box scan (good long ones are ~9 % of the draws)
+LONG_SEPS = (201.0, 400.0)  # "random long"
+RANDOM_TRIES = 64  # Random scenario buttons: candidates scanned at most
+RANDOM_BATCH = 8  # Candidates per box scan
+PARAM_NAMES = ("separation", "laser_pitch", "laser_yaw", "laser_dx", "laser_dy")
+PARAM_COLS = ("sep_mm", "laser_pitch", "laser_yaw", "laser_dx_mm", "laser_dy_mm")  # Log names
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -184,12 +208,43 @@ def ratio(a: float, b: float) -> float:
     return a / b if b > 0 else math.nan
 
 
+def canonical_param(name: str) -> str:
+    """Scenario-head parameter name in PARAM_NAMES terms (sep..., ...pitch, ...yaw, ...dx,
+    ...dy), else unchanged."""
+    k = name.lower()
+    for key, canon in (("sep", "separation"), ("pitch", "laser_pitch"), ("yaw", "laser_yaw"),
+                       ("dx", "laser_dx"), ("dy", "laser_dy")):
+        if key in k:
+            return canon
+    return name
+
+
+def head_spec(agent_cfg: dict) -> Tuple[Tuple[str, ...], Tuple[float, ...], Tuple[float, ...]]:
+    """Scenario-head parameter names and normalization range (lo, hi) of a checkpoint's
+    agent config: lo / hi from scen_lo / scen_hi (AgentConfig defaults if absent), names
+    from a scen* field holding as many strings (canonicalized), else PARAM_NAMES[:n] for
+    n = 3 or 5. The head predicts (x - mid) / half per parameter, mid / half of lo / hi."""
+    d = AgentConfig()
+    lo = tuple(float(v) for v in agent_cfg.get("scen_lo", d.scen_lo))
+    hi = tuple(float(v) for v in agent_cfg.get("scen_hi", d.scen_hi))
+    n = len(lo)
+    names = None
+    for k, v in agent_cfg.items():
+        if ("scen" in k and isinstance(v, (list, tuple)) and len(v) == n
+                and all(isinstance(x, str) for x in v)):
+            names = tuple(canonical_param(x) for x in v)
+            break
+    if names is None:
+        names = PARAM_NAMES[:n] if n in (3, 5) else tuple(f"param{i}" for i in range(n))
+    return names, lo, hi
+
+
 @dataclass
 class ViewerConfig:
     """Viewer settings (CLI arguments with the same names)."""
 
     ckpt: str = DEFAULT_CKPT  # "" = simulator only
-    atlas: str = DEFAULT_ATLAS  # Missing file = no atlas (scans only, no random good scenario)
+    atlas: str = DEFAULT_ATLAS  # Missing file = no atlas (box scans only)
     device: str = ""  # "" = herriott_sim.DEVICE
     seed: int = 0  # Random starts, random good scenarios, sampled actions
     cuda_graph: bool = True  # agent.act() in a CUDA graph (GraphAct); False: eager
@@ -209,15 +264,18 @@ class ScenarioInfo:
     """A scenario and its M2 landscape (host copies)."""
 
     name: str
-    params: Tuple[float, float, float]  # Separation (mm), laser pitch, laser yaw (deg)
+    params: Tuple[float, ...]  # Separation (mm), laser pitch, yaw (deg), laser dx, dy (mm)
     atlas_index: int  # -1: not in the atlas (values from the scan)
     pmax: float  # mm, longest path in the box
     best_tilt: Tuple[float, float]  # M2 pitch, yaw (deg) reaching P_max
     best_bounces: int
     p_floor: float  # floor_bounces x separation
     path_ref: float  # P_ref = max(P_max, P_floor), the env's reward scale
-    good: bool  # P_max >= P_floor
-    in_training_range: bool  # Separation and laser tilt inside the atlas ranges (50-200 mm)
+    good: bool  # Valid and P_max >= P_floor
+    valid: bool  # The laser enters the cavity and reaches M2 at some tilt
+    invalid_reason: str  # "", "clipped by hole" (BLOCKED at bounce 0), "misses M2" (0 bounces)
+    in_training_range: bool  # Inside the loaded checkpoint's training range
+    range_note: str  # The violated training ranges ("" inside)
     bounces: np.ndarray  # (W, W) int16, rows = pitch, cols = yaw
     path: np.ndarray  # (W, W) float32 mm
     scan_ms: float
@@ -233,8 +291,8 @@ class PolicyView:
     path_norm: float  # Path head: P_t / P_ref
     tilt_mu: np.ndarray  # (2,) deg
     tilt_std: np.ndarray  # (2,) deg
-    scen_mu: np.ndarray  # (3,) mm, deg, deg
-    scen_std: np.ndarray  # (3,)
+    scen_mu: np.ndarray  # (n,) scenario head means in Session.head_names order (0 if none)
+    scen_std: np.ndarray  # (n,)
     act_greedy: np.ndarray  # (2,) ladder indices (argmax per axis)
     act_sample: np.ndarray  # (2,) ladder indices (one Gumbel-max sample)
 
@@ -480,8 +538,14 @@ class Session:
         self.grid, self.W = box_grid(self.acfg.limit, self.acfg.step, dev)
         self.ladder_units = np.asarray(self.ecfg.step_ladder, dtype=np.int64)
         self.ladder = self.ladder_units * self.ecfg.step_unit  # deg
+        self.hole_r = self.geom.m1_hole_radius
+        self._center = (self.W // 2) * self.W + self.W // 2  # Grid cell of zero M2 tilt
+        # Training range of the loaded checkpoint (without one: the new scenario space)
+        self.train_ranges: Dict[str, object] = {
+            "separation": SEP_RANGE, "laser_pitch": ANGLE_RANGE, "laser_yaw": ANGLE_RANGE,
+            "offset": "disk"}
 
-        # ── Atlas (host copies: lookup and random good scenarios) ──
+        # ── Atlas (host copies: lookup of grid / named scenarios) ──
         self.atlas = None
         self.atlas_msg = "no atlas"
         if cfg.atlas and os.path.exists(cfg.atlas):
@@ -490,9 +554,8 @@ class Session:
                 at.check(self.cap, self.limit, self.ecfg.step_unit)
                 self.atlas = at
                 self._atlas_params = at.params.double().numpy()
-                self._good_ids = at.good_ids.numpy()
                 self.atlas_msg = (f"atlas {short_path(cfg.atlas)}: {at.n} scenarios, "
-                                  f"{self._good_ids.size} good")
+                                  f"{int(at.good.sum())} good")
             except (AssertionError, KeyError) as e:
                 self.atlas_msg = f"atlas not used: {e}"
         self.log(self.atlas_msg)
@@ -502,8 +565,11 @@ class Session:
         self.agent: Optional[Agent] = None
         self._act_fn = None  # agent.act or its GraphAct
         self.vnorm: Optional[ValueNorm] = None
-        self.scen_head = False
+        self.scen_head = False  # Scenario head loaded and matching its parameter list
+        self.head_names: Tuple[str, ...] = ()
+        self.head_mid = self.head_half = None  # (n,) device tensors
         self.ckpt_msg = "no checkpoint (simulator only)"
+        self.ckpt_lines: Tuple[str, ...] = ("checkpoint: none (simulator only)",)
         self.gen = torch.Generator(device=dev)  # Sampled actions
         self.gen.manual_seed(cfg.seed * 1_000_003 + 17)
         self.rng = np.random.default_rng(cfg.seed)  # Random starts and scenarios
@@ -554,13 +620,29 @@ class Session:
         vn = ValueNorm(pcfg.value_norm_beta, self.device)
         if ck.get("vnorm") is not None:
             vn.load_state_dict(ck["vnorm"])
+        names, lo, hi = head_spec(ck.get("agent_cfg") or {})
         del ck
         agent = Agent(acfg)
         info = agent.init_from(path)
         agent.to(self.device).eval().requires_grad_(False)
         self.agent, self.vnorm, self.pcfg = agent, vn, pcfg
         self.ckpt_path = path
-        self.scen_head = not any(k.startswith("scenario.") for k in info["missing"])
+        try:  # Outputs of the scenario head of this agent.py: mean and log-variance per value
+            n_out = agent.scenario[-1].out_features // 2
+        except (AttributeError, IndexError, TypeError):
+            n_out = -1
+        loaded = not any(k.startswith("scenario.") for k in info["missing"])
+        self.scen_head = loaded and n_out == len(names)
+        self.head_names = names
+        lo_t, hi_t = (torch.tensor(v, dtype=torch.float32, device=self.device) for v in (lo, hi))
+        self.head_mid, self.head_half = (hi_t + lo_t) / 2, (hi_t - lo_t) / 2
+        rng = dict(zip(names, zip(lo, hi)))
+        self.train_ranges = {k: rng.get(k, d) for k, d in (
+            ("separation", SEP_RANGE), ("laser_pitch", ANGLE_RANGE), ("laser_yaw", ANGLE_RANGE))}
+        self.train_ranges["offset"] = "disk" if "laser_dx" in names else "fixed"
+        head = (f"scenario head: {', '.join(names)}" if self.scen_head else
+                f"scenario head not loaded (checkpoint: {len(names)} values, this agent.py: "
+                f"{n_out})")
         with torch.inference_mode():
             self.ring = agent.init_ring(1, self.device)
             self._act_fn = agent.act
@@ -572,85 +654,143 @@ class Session:
                 except RuntimeError as e:  # Capture failed: stay eager
                     self.log(f"CUDA graph capture failed ({e}); agent.act runs eager")
         steps = info.get("env_steps") or 0
-        self.ckpt_msg = (f"{short_path(path)}: {info.get('name')}, iteration "
-                         f"{info.get('iteration')} ({steps / 1e6:.0f} M env steps), "
-                         f"act {mode}"
-                         + ("" if self.scen_head else "; no scenario head in the checkpoint")
-                         + (f"; skipped {sorted(info['skipped'])}" if info["skipped"] else ""))
-        self.log(f"checkpoint {self.ckpt_msg}")
+        self.ckpt_lines = (f"checkpoint {short_path(path)}: {info.get('name')}",
+                           f"iteration {info.get('iteration')} ({steps / 1e6:.0f} M env steps), "
+                           f"act {mode}; {head}")
+        self.ckpt_msg = ", ".join(self.ckpt_lines)
+        self.log(self.ckpt_msg)
         if self.scenario is not None:  # Env settings of the new run
             sc = self.scenario
-            self._build_env(torch.tensor([sc.params]), torch.tensor([sc.path_ref]))
+            self.scenario.in_training_range, self.scenario.range_note = (
+                self.training_range(sc.params))
+            self._build_env(sc.params, torch.tensor([sc.path_ref]))
             self.start(self.start_tilt)
         return self.ckpt_msg
 
     # ── Scenario ──
 
+    def full_params(self, params) -> Tuple[float, float, float, float, float]:
+        """(separation, laser pitch, laser yaw, laser dx, laser dy); 3 values: the measured
+        laser offset."""
+        v = [float(x) for x in params]
+        if len(v) == 3:
+            v += [self.geom.laser_dx, self.geom.laser_dy]
+        assert len(v) == 5, f"scenario needs 3 or 5 parameters, got {len(v)}"
+        return tuple(v)
+
     def atlas_index(self, params) -> int:
-        """Atlas row of the scenario (grid point or named setup), -1 if none."""
-        if self.atlas is None:
+        """Atlas row of the scenario (grid point or named setup, measured offset only), -1
+        if none."""
+        sep, lp, ly, dx, dy = self.full_params(params)
+        if self.atlas is None or abs(dx - self.geom.laser_dx) > 1e-6 or \
+                abs(dy - self.geom.laser_dy) > 1e-6:
             return -1
-        d = np.abs(self._atlas_params - np.asarray(params, dtype=np.float64)[None]).max(1)
+        d = np.abs(self._atlas_params - np.array([sep, lp, ly])[None]).max(1)
         i = int(d.argmin())
         return i if d[i] < 1e-4 else -1
 
-    def random_good(self) -> Tuple[float, float, float]:
-        """Parameters of a good atlas scenario drawn uniformly."""
-        assert self.atlas is not None and self._good_ids.size, "no atlas with good scenarios"
-        i = int(self.rng.choice(self._good_ids))
-        return tuple(float(v) for v in self._atlas_params[i])
+    def _states(self, prm: torch.Tensor) -> torch.Tensor:
+        """(n * G, 13) states of scenarios prm (n, 5) over the M2 box grid."""
+        n, G = prm.shape[0], self.grid.shape[0]
+        s = candidate_states(self.geom, prm[:, :3], self.grid).view(n, G, -1)
+        s[..., S_LASER_DX] = prm[:, 3, None]
+        s[..., S_LASER_DY] = prm[:, 4, None]
+        return s.view(n * G, -1)
+
+    def _scan(self, prm: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Box scan of scenarios prm (n, 5) (one Triton call): bounces / path / stop (n, G),
+        P_max (n,) and validity: clipped = 0 bounces and BLOCKED at zero M2 tilt (the
+        laser hits the back of M1 at the hole edge, independent of the tilt), misses = no
+        bounce at any tilt."""
+        n = prm.shape[0]
+        out = self.sim.simulate(self._states(prm), store_world=False, store_hits=False)
+        b = out["hit_counts"].view(n, -1)
+        p = out["total_path_length"].view(n, -1)
+        st = out["stop_reason"].view(n, -1)
+        c = self._center
+        clipped = (b[:, c] == 0) & (st[:, c] == STOP_BLOCKED)
+        misses = (b.amax(1) == 0) & ~clipped
+        return {"b": b, "p": p, "clipped": clipped, "misses": misses}
+
+    def invalid_reason(self, clipped: bool, misses: bool) -> str:
+        return "clipped by hole" if clipped else ("misses M2" if misses else "")
+
+    def training_range(self, params) -> Tuple[bool, str]:
+        """Inside the loaded checkpoint's training range (self.train_ranges), and the
+        violated ranges."""
+        sep, lp, ly, dx, dy = self.full_params(params)
+        tr, e = self.train_ranges, 1e-6
+        viol = []
+        lo, hi = tr["separation"]
+        if not lo - e <= sep <= hi + e:
+            viol.append(f"sep {lo:g}-{hi:g} mm")
+        (plo, phi), (ylo, yhi) = tr["laser_pitch"], tr["laser_yaw"]
+        if not (plo - e <= lp <= phi + e and ylo - e <= ly <= yhi + e):
+            viol.append(f"laser {plo:g}-{phi:g} deg" if (plo, phi) == (ylo, yhi) else
+                        f"laser {plo:g}-{phi:g} / {ylo:g}-{yhi:g} deg")
+        if tr["offset"] == "fixed":
+            if abs(dx - self.geom.laser_dx) > e or abs(dy - self.geom.laser_dy) > e:
+                viol.append("fixed offset")
+        elif math.hypot(dx, dy) > self.hole_r + e:
+            viol.append("offset in the hole")
+        return not viol, ", ".join(viol)
 
     @torch.inference_mode()
-    def random_outside(self, seps: Tuple[float, float]) -> Tuple[Tuple[float, float, float],
-                                                                 int, bool]:
-        """A scenario with separation in seps (0.5 mm steps) and laser pitch / yaw uniform
-        in the atlas range (0.01 deg steps), preferring a good one (P_max >= floor_bounces x
-        separation): up to OUTSIDE_TRIES candidates, scanned for P_max in batches of
-        OUTSIDE_BATCH (one box scan each), stopping at the first good one; else the one
-        closest to good. Returns (params, candidates drawn, good found)."""
+    def random_scenario(self, seps: Tuple[float, float]) -> Tuple[Tuple[float, ...], int, str]:
+        """A valid scenario with separation in seps (0.5 mm steps), laser pitch / yaw
+        uniform in ANGLE_RANGE (0.01 deg) and the laser offset uniform in the hole disk
+        (0.01 mm), preferring a good one: up to RANDOM_TRIES candidates, box-scanned in
+        batches of RANDOM_BATCH, stopping at the first valid good one; else the valid one
+        closest to good, else the last draw. Returns (params, draws, "good" / "valid" /
+        "invalid")."""
         lo, hi = seps
-        best, best_score, drawn = None, -1.0, 0
-        while drawn < OUTSIDE_TRIES:
-            n = min(OUTSIDE_BATCH, OUTSIDE_TRIES - drawn)
+        r_max = self.hole_r - 0.01  # Rounding to 0.01 mm stays inside the disk
+        best, best_score, drawn, last = None, -1.0, 0, None
+        while drawn < RANDOM_TRIES:
+            n = min(RANDOM_BATCH, RANDOM_TRIES - drawn)
             sep = lo + 0.5 * self.rng.integers(0, int(round((hi - lo) / 0.5)) + 1, n)
-            las = [np.round(self.rng.uniform(r[0], r[1], n), 2) for r in (self.acfg.pitch,
-                                                                          self.acfg.yaw)]
-            prm = np.stack([sep] + las, 1)
-            pt = torch.tensor(prm, dtype=torch.float32, device=self.device)
-            out = self.sim.simulate(candidate_states(self.geom, pt, self.grid),
-                                    store_world=False, store_hits=False)
-            pmax = out["total_path_length"].view(n, -1).amax(1).cpu().numpy()
-            score = pmax.astype(np.float64) / (self.acfg.floor_bounces * sep)  # >= 1: good
-            good = np.nonzero(score >= 1.0)[0]
+            ang = np.round(self.rng.uniform(ANGLE_RANGE[0], ANGLE_RANGE[1], (n, 2)), 2)
+            r = r_max * np.sqrt(self.rng.uniform(0.0, 1.0, n))
+            th = self.rng.uniform(0.0, 2 * math.pi, n)
+            off = np.round(np.stack((r * np.cos(th), r * np.sin(th)), 1), 2)
+            prm = np.concatenate((sep[:, None], ang, off), 1)
+            sc = self._scan(torch.tensor(prm, dtype=torch.float32, device=self.device))
+            h = to_host({"pmax": sc["p"].amax(1), "ok": ~(sc["clipped"] | sc["misses"])})
+            score = h["pmax"].astype(np.float64) / (self.acfg.floor_bounces * sep)  # >= 1: good
+            ok = h["ok"] > 0.5
+            good = np.nonzero(ok & (score >= 1.0))[0]
             if good.size:
-                return tuple(float(v) for v in prm[good[0]]), drawn + int(good[0]) + 1, True
-            i = int(score.argmax())
-            if score[i] > best_score:
-                best, best_score = tuple(float(v) for v in prm[i]), float(score[i])
+                return tuple(float(v) for v in prm[good[0]]), drawn + int(good[0]) + 1, "good"
+            if ok.any():
+                i = int(np.where(ok, score, -1.0).argmax())
+                if score[i] > best_score:
+                    best, best_score = tuple(float(v) for v in prm[i]), float(score[i])
+            last = tuple(float(v) for v in prm[-1])
             drawn += n
-        return best, drawn, False
+        return (best, drawn, "valid") if best is not None else (last, drawn, "invalid")
 
     @torch.inference_mode()
     def set_scenario(self, params, name: str = "") -> ScenarioInfo:
-        """Scan the M2 box of the scenario (one Triton call, one host copy), take P_max /
-        best tilt / good from the atlas when it has the scenario, build its env (while the
-        scan runs: P_ref stays on the device)."""
+        """Scan the M2 box of the scenario (one Triton call, one host copy): P_max, best
+        tilt, validity; P_max / best tilt / good from the atlas when it has the scenario
+        (measured offset); build its env (while the scan runs: P_ref stays on the
+        device)."""
         t0 = time.perf_counter()
         self._finish_open()
-        sep, lp, ly = (float(v) for v in params)
-        dev = self.device
-        prm = torch.tensor([[sep, lp, ly]], dtype=torch.float32, device=dev)
-        out = self.sim.simulate(candidate_states(self.geom, prm, self.grid),
-                                store_world=False, store_hits=False)
-        b, p = out["hit_counts"], out["total_path_length"]
+        prm5 = self.full_params(params)
+        sep = prm5[0]
+        pt = torch.tensor([prm5], dtype=torch.float32, device=self.device)
+        scan = self._scan(pt)
+        b, p = scan["b"][0], scan["p"][0]
         pmax, imax = p.max(0)
-        idx = self.atlas_index((sep, lp, ly))
+        idx = self.atlas_index(prm5)
         pf = self.acfg.floor_bounces * sep
-        self._build_env(prm, pmax.clamp(min=pf).view(1) if idx < 0 else
+        self._build_env(prm5, pmax.clamp(min=pf).view(1) if idx < 0 else
                         self.atlas.path_ref[idx].view(1))
         h = to_host({"pmax": pmax.view(1), "tilt": self.grid[imax], "bb": b[imax].view(1),
-                     "b": b, "p": p})
+                     "clipped": scan["clipped"], "misses": scan["misses"], "b": b, "p": p})
         W = self.W
+        reason = self.invalid_reason(h["clipped"][0] > 0.5, h["misses"][0] > 0.5)
         if idx >= 0:
             at = self.atlas
             pm, bt, bb = float(at.pmax[idx]), at.pmax_tilt[idx].tolist(), int(at.pmax_bounces[idx])
@@ -660,23 +800,30 @@ class Session:
             good, pref = pm >= pf, max(pm, pf)
         if not name and idx >= 0:
             name = next((k for k, v in self.atlas.named.items() if v == idx), "grid")
-        a = self.acfg
-        inside = (a.sep[0] <= sep <= a.sep[1] and a.pitch[0] <= lp <= a.pitch[1]
-                  and a.yaw[0] <= ly <= a.yaw[1])
+        inside, note = self.training_range(prm5)
         self.scenario = ScenarioInfo(
-            name=name or "custom", params=(sep, lp, ly), atlas_index=idx, pmax=pm,
-            best_tilt=(bt[0], bt[1]), best_bounces=bb, p_floor=pf, path_ref=pref, good=good,
-            in_training_range=inside,
+            name=name or "custom", params=prm5, atlas_index=idx, pmax=pm,
+            best_tilt=(bt[0], bt[1]), best_bounces=bb, p_floor=pf, path_ref=pref,
+            good=good and not reason, valid=not reason, invalid_reason=reason,
+            in_training_range=inside, range_note=note,
             bounces=h["b"].reshape(W, W).astype(np.int16), path=h["p"].reshape(W, W),
             scan_ms=1000 * (time.perf_counter() - t0))
         return self.scenario
 
-    def _build_env(self, params: torch.Tensor, path_ref: torch.Tensor):
-        """AlignEnv of the run's settings with one scenario, params (1, 3) and P_ref (1,)."""
+    def make_env(self, params, path_ref: torch.Tensor) -> AlignEnv:
+        """AlignEnv of the run's settings with one scenario (5 parameters): separation and
+        laser tilt as its one-row table, the laser offset in its geometry; P_ref (1,)."""
+        sep, lp, ly, dx, dy = self.full_params(params)
         ec = env_config(self.pcfg, 1, False, self.cfg.seed, setups="full")
-        tab = Scenarios(params=params.float(), path_ref=path_ref.float())
-        self.env = AlignEnv(ec, scenarios=tab)
-        assert self.env.n_bins == self.ladder_units.size
+        ec = replace(ec, geometry=replace(ec.geometry, laser_dx=dx, laser_dy=dy))
+        tab = Scenarios(params=torch.tensor([[sep, lp, ly]], dtype=torch.float32),
+                        path_ref=path_ref.float().reshape(1))
+        env = AlignEnv(ec, scenarios=tab)
+        assert env.n_bins == self.ladder_units.size
+        return env
+
+    def _build_env(self, params, path_ref: torch.Tensor):
+        self.env = self.make_env(params, path_ref)
 
     # ── Episode ──
 
@@ -752,9 +899,10 @@ class Session:
                 path_head=out["path"][:1],
                 tilt_mu=out["tilt_mu"][0] * ts,
                 tilt_std=(0.5 * out["tilt_logvar"][0]).exp() * ts,
-                scen_mu=ag.scen_denorm(out["scen_mu"][0]),
-                scen_std=(0.5 * out["scen_logvar"][0]).exp() * ag.scen_half,
                 act_g=self._act[0][0], act_s=self._act[1][0])
+            if self.scen_head:  # De-normalized with the checkpoint's range
+                items.update(scen_mu=out["scen_mu"][0] * self.head_half + self.head_mid,
+                             scen_std=(0.5 * out["scen_logvar"][0]).exp() * self.head_half)
         h = to_host(items)
         n = int(h["count"][0])
         f = Frame(step=int(h["step"][0]), tilt=h["tilt"].astype(np.float64),
@@ -772,7 +920,7 @@ class Session:
             f.policy = PolicyView(
                 probs=pr, p_stop=float(pr[0, 0] * pr[1, 0]), value=float(h["value"][0]),
                 path_norm=float(h["path_head"][0]), tilt_mu=h["tilt_mu"], tilt_std=h["tilt_std"],
-                scen_mu=h["scen_mu"], scen_std=h["scen_std"],
+                scen_mu=h.get("scen_mu", np.zeros(0)), scen_std=h.get("scen_std", np.zeros(0)),
                 act_greedy=h["act_g"].astype(np.int64), act_sample=h["act_s"].astype(np.int64))
         return f
 
@@ -782,7 +930,7 @@ class Session:
         """Log row of one step: the decision on frame prev (heads vs the true values of
         prev) and its result f."""
         p, sc = prev.policy, self.scenario
-        sep, lp, ly = sc.params
+        sep, lp, ly, dx, dy = sc.params
         pref, pmax = sc.path_ref, sc.pmax
         a = f.action
         d = self.ladder[a]
@@ -790,6 +938,7 @@ class Session:
             "session": self.log_writer.session if self.log_writer else "",
             "episode": self.episode, "step": f.step, "mode": mode, "scenario": sc.name,
             "sep_mm": sep, "laser_pitch_deg": lp, "laser_yaw_deg": ly,
+            "laser_dx_mm": dx, "laser_dy_mm": dy,
             "pitch_before": prev.tilt[0], "yaw_before": prev.tilt[1],
             "pitch_after": f.tilt[0], "yaw_after": f.tilt[1],
             "act_pitch_deg": d[0], "act_yaw_deg": d[1],
@@ -801,7 +950,6 @@ class Session:
             for r, i in enumerate(np.argsort(-p.probs[k], kind="stable")[:3], 1):
                 row[f"{axis}_top{r}_deg"] = self.ladder[i]
                 row[f"{axis}_top{r}_p"] = p.probs[k, i]
-        sh = self.scen_head
         row.update({
             "value": p.value,
             "path_head_m": p.path_norm * pref / 1000, "path_head_pref": p.path_norm,
@@ -812,18 +960,23 @@ class Session:
             "reward": f.reward, "ep_return": f.ep_return,
             "tilt_head_pitch": p.tilt_mu[0], "tilt_head_pitch_std": p.tilt_std[0],
             "tilt_head_yaw": p.tilt_mu[1], "tilt_head_yaw_std": p.tilt_std[1],
-            "scen_head_sep_mm": p.scen_mu[0] if sh else math.nan,
-            "scen_head_sep_std": p.scen_std[0] if sh else math.nan,
-            "scen_head_laser_pitch": p.scen_mu[1] if sh else math.nan,
-            "scen_head_laser_pitch_std": p.scen_std[1] if sh else math.nan,
-            "scen_head_laser_yaw": p.scen_mu[2] if sh else math.nan,
-            "scen_head_laser_yaw_std": p.scen_std[2] if sh else math.nan,
-            "terminated": int(f.terminated), "truncated": int(f.truncated),
         })
+        for name, col in zip(PARAM_NAMES, PARAM_COLS):  # nan where the head has no value
+            mu, sd = self.head_value(p, name)
+            std = col[:-3] if col.endswith("_mm") else col
+            row[f"scen_head_{col}"], row[f"scen_head_{std}_std"] = mu, sd
+        row.update({"terminated": int(f.terminated), "truncated": int(f.truncated)})
         for k, axis in enumerate(("pitch", "yaw")):
             for i in np.argsort(self.ladder_units, kind="stable"):
                 row[f"p_{axis}_{self.ladder_units[i]:+d}"] = p.probs[k, i]
         return row
+
+    def head_value(self, p: PolicyView, name: str) -> Tuple[float, float]:
+        """(mean, std) of the scenario head for a parameter, (nan, nan) if not predicted."""
+        if not self.scen_head or name not in self.head_names:
+            return math.nan, math.nan
+        i = self.head_names.index(name)
+        return float(p.scen_mu[i]), float(p.scen_std[i])
 
     def _move_table(self) -> MoveTable:
         if self._table is None:
@@ -850,8 +1003,10 @@ class Session:
             "mode": modes[0] if len(modes) == 1 else "mixed",
             "scenario": sc.name, "atlas_index": sc.atlas_index, "sep_mm": sc.params[0],
             "laser_pitch_deg": sc.params[1], "laser_yaw_deg": sc.params[2],
+            "laser_dx_mm": sc.params[3], "laser_dy_mm": sc.params[4],
             "pmax_m": sc.pmax / 1000, "pref_m": sc.path_ref / 1000, "good": int(sc.good),
-            "in_training_range": int(sc.in_training_range),
+            "valid": int(sc.valid), "invalid_reason": sc.invalid_reason,
+            "in_training_range": int(sc.in_training_range), "range_note": sc.range_note,
             "best_pitch": sc.best_tilt[0], "best_yaw": sc.best_tilt[1],
             "start_pitch": f0.tilt[0], "start_yaw": f0.tilt[1],
             "start_path_m": f0.path_mm / 1000, "start_bounces": f0.bounces,
@@ -872,7 +1027,8 @@ class Session:
         if self.log_writer is not None:
             self.log_writer.write("episodes", r)
         pct = r["pct_oracle"]
-        ext = "" if r["in_training_range"] else ", extrapolation"
+        ext = ("" if r["in_training_range"] else ", extrapolation") + (
+            f", invalid: {r['invalid_reason']}" if r["invalid_reason"] else "")
         self.log(f"episode {r['episode']} [{r['scenario']}, {r['mode']}{ext}]: start "
                  f"{r['start_pitch']:+.2f} / {r['start_yaw']:+.2f} -> {r['end']} after "
                  f"{r['steps']} steps ({r['moves']} moves) at {r['final_pitch']:+.2f} / "
@@ -1062,6 +1218,7 @@ class Viewer:
         self.message = ""
         self._msg_dirty = False
         self._dragging_map = False
+        self._dragging_hole = False
         self._build()
         c = self.canvas
         c.mpl_connect("draw_event", self._on_draw)
@@ -1142,7 +1299,7 @@ class Viewer:
                            self.ln_oracle],
                   loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=3, fontsize=FS_SMALL,
                   frameon=False, handlelength=1.6, columnspacing=1.2, labelcolor=INK2)
-        ax.set_title("M2 tilt landscape (click or drag: start tilt)", **tit)
+        ax.set_title("M2 tilt landscape", **tit)
         for a in (self.im_map, self.ln_best):
             A(a, "scene")
         for a in (self.ln_traj, self.ln_head, self.ln_head_c, self.ln_start, self.ln_cur,
@@ -1219,6 +1376,8 @@ class Viewer:
             ax.set_xlabel("local x (mm)", labelpad=1, **lab)
             if k == 0:
                 ax.set_ylabel("local y (mm)", **lab)
+            else:
+                ax.tick_params(labelleft=False)  # Same scale as M1
             ax.set_title(title, **tit)
             sc = ax.scatter(np.zeros(0), np.zeros(0), c=np.zeros(0), s=18, cmap=cmap_hit,
                             vmin=0, vmax=cap, edgecolors="none")
@@ -1256,7 +1415,8 @@ class Viewer:
             self.bars.append(A(pc))
         _, pax = self._text(POL_RECT, "\nnext action\nP(not move)\nvalue (P_ref units)\n"
                             "path (m), P / P_ref\ntilt pitch (deg)\ntilt yaw (deg)\n"
-                            "separation (mm)\nlaser pitch (deg)\nlaser yaw (deg)", layer=None)
+                            "separation (mm)\nlaser pitch (deg)\nlaser yaw (deg)\n"
+                            "laser dx (mm)\nlaser dy (mm)", layer=None)
         self._text(None, "agent (heads: mean +- std)", layer=None, x=0.27, ax=pax)
         self._text(None, "true", layer=None, x=0.7, ax=pax)
         self.tx_pol, _ = self._text(None, ax=pax, x=0.27)
@@ -1264,10 +1424,10 @@ class Viewer:
 
         # ── Controls ──
         for x, y, t in ((30, 268, "scenario"), (30, 66, "M2 tilt (episode start)"),
-                        (655, 268, "episode and policy")):
+                        (655, 214, "episode and policy")):
             fig.text(x / _W, y / _H, t, fontsize=FS_HEAD, color=INK, weight="bold")
 
-        def button(x, w, label, cb, y=225):
+        def button(x, y, w, label, cb):
             b = Button(fig.add_axes(_px(x, y, w, 32)), label, color=BTN, hovercolor=BTN)
             b.drawon = False
             b.label.set_fontsize(FS_LABEL)
@@ -1276,7 +1436,7 @@ class Viewer:
             return b
 
         def slider(y, label, lo, hi, v0, step, fmt, cb, layer):
-            ax = fig.add_axes(_px(150, y, 370, 20))
+            ax = fig.add_axes(_px(150, y, 290, 20))
             sl = Slider(ax, label, lo, hi, valinit=v0, valstep=step, valfmt=fmt,
                         initcolor="none", track_color=GRID, color=BLUE)
             sl.drawon = False
@@ -1292,18 +1452,17 @@ class Viewer:
         x = 30
         for g in SETUPS:
             w = 100 if g.name == "measured" else 85
-            self.buttons[g.name] = button(x, w, g.name, lambda n=g.name: self._on_named(n))
+            self.buttons[g.name] = button(x, 225, w, g.name, lambda n=g.name: self._on_named(n))
             x += w + 8
         x = 30
-        for name, w, cb in (("random good", 125, self._on_random_good),
-                            ("random short", 125, lambda: self._on_random_outside("short")),
-                            ("random long", 125, lambda: self._on_random_outside("long"))):
-            self.buttons[name] = button(x, w, name, cb, y=186)
-            x += w + 8
+        for kind in ("good", "short", "long"):
+            self.buttons[f"random {kind}"] = button(x, 186, 125, f"random {kind}",
+                                                    lambda k=kind: self._on_random(k))
+            x += 133
         g0 = SETUPS[0]
-        rows = (("separation", SEP_SLIDER, g0.separation, 0.5, "%.1f mm", 152),
-                ("laser pitch", s.acfg.pitch, g0.laser_pitch, 0.01, "%.2f deg", 124),
-                ("laser yaw", s.acfg.yaw, g0.laser_yaw, 0.01, "%.2f deg", 96))
+        rows = (("separation", SEP_RANGE, g0.separation, 0.5, "%.1f mm", 152),
+                ("laser pitch", ANGLE_RANGE, g0.laser_pitch, 0.01, "%+.2f deg", 124),
+                ("laser yaw", ANGLE_RANGE, g0.laser_yaw, 0.01, "%+.2f deg", 96))
         self.sl_sep, self.sl_lp, self.sl_ly = (
             slider(y, label, rng[0], rng[1], v0, st, fmt, self._on_scen_slider, "scene")
             for label, rng, v0, st, fmt, y in rows)
@@ -1313,17 +1472,34 @@ class Viewer:
         self.sl_yaw = slider(8, "M2 yaw", -L, L, s.start_tilt[1], 0.01, "%+.2f deg",
                              self._on_tilt_slider, "frame")
 
+        # Laser offset in the M1 hole (click / drag inside the disk)
+        ax = self.ax_hole = fig.add_axes(HOLE_RECT)
+        hr = s.hole_r
+        ax.set_aspect("equal")
+        ax.set_xlim(-1.2 * hr, 1.2 * hr)
+        ax.set_ylim(-1.2 * hr, 1.2 * hr)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.add_patch(Circle((0, 0), hr, fc="#f2f1ed", ec=INK2, lw=1.2))
+        ax.plot([g0.laser_dx], [g0.laser_dy], "+", color=INK2, ms=7, mew=1.2)  # Measured
+        ax.set_title("laser offset", fontsize=FS_LABEL, color=INK, pad=3)
+        self.ln_hole = A(ax.plot([], [], "o", ms=7, mfc=ORANGE, mec=INK, mew=0.8)[0], "scene")
+        self.tx_hole, _ = self._text(HOLE_TXT_RECT, layer="scene", size=FS_SMALL)
+        self.offset = (g0.laser_dx, g0.laser_dy)
+
         x = 655
         for name, w, cb in (("Step", 75, self._on_step), ("Run", 75, self._on_run),
                             ("Pause", 75, self._on_pause), ("Reset", 75, self._on_reset),
                             ("Random start", 130, self._on_random_start),
                             ("policy", 165, self._on_mode), ("map", 165, self._on_map_mode)):
-            self.buttons[name] = button(x, w, name, cb)
+            self.buttons[name] = button(x, 172, w, name, cb)
             x += w + 8
         for name in ("policy", "map"):
             A(self.buttons[name].label, "scene")
         self._set_toggle_labels()
-        ax = fig.add_axes(_px(770, 182, 1090, 30))
+        ax = fig.add_axes(_px(770, 130, 1090, 30))
         self.textbox = _fast_textbox_class()(
             ax, "checkpoint ", initial=short_path(self.s.cfg.ckpt), color="white",
             hovercolor="white", textalignment="left", redraw=lambda: self._blit(scene=True),
@@ -1334,13 +1510,6 @@ class Viewer:
         self.tx_msg, _ = self._text(MSG_RECT, layer="scene")
         self.tx_info, _ = self._text(INFO_RECT, layer=None, size=FS_SMALL)
         self._show_info()
-        self._text(HELP_RECT, layer=None, size=FS_SMALL, text=(
-            "keys: right / s step   space run / pause   r reset (start tilt)   n random start   "
-            "d argmax / sampled   m map color   g random good scenario\n"
-            "[ ] separation -/+0.5 mm, { } -/+5 mm (slider 20-350 mm; trained 50-200 mm)   "
-            "map: click or drag sets the start tilt\n"
-            "M2 sliders set the start tilt; named setups start at their nominal tilt; every "
-            "played episode is logged (steps, oracle comparison) to the files above"))
 
     @staticmethod
     def _slider_parts(sl) -> list:
@@ -1422,20 +1591,25 @@ class Viewer:
     def _show_scenario(self):
         """Scene-layer artists of the scenario (drawn by the next _show(scene=True))."""
         sc = self.s.scenario
-        sep, lp, ly = sc.params
+        sep, lp, ly, dx, dy = sc.params
         for sl, v in ((self.sl_sep, sep), (self.sl_lp, lp), (self.sl_ly, ly)):
             self._set_slider(sl, v)
-        src = f"atlas #{sc.atlas_index}" if sc.atlas_index >= 0 else "off the atlas grid"
+        self.offset = (dx, dy)
+        self.ln_hole.set_data([dx], [dy])
+        self.tx_hole.set_text(f"{dx:+.2f} / {dy:+.2f} mm")
+        src = f"atlas #{sc.atlas_index}" if sc.atlas_index >= 0 else "off the atlas"
+        valid = "VALID" if sc.valid else sc.invalid_reason.upper()
         state = (f"GOOD: P_max >= 20 x sep = {sc.p_floor / 1000:.2f} m" if sc.good else
-                 f"IMPOSSIBLE: P_max < 20 x sep = {sc.p_floor / 1000:.2f} m")
-        a = self.s.acfg
-        extra = ("" if sc.in_training_range else
-                 f"\nEXTRAPOLATION: outside trained {a.sep[0]:g}-{a.sep[1]:g} mm")
+                 f"IMPOSSIBLE: P_max < 20 x sep = {sc.p_floor / 1000:.2f} m" if sc.valid else
+                 f"not alignable (20 x sep = {sc.p_floor / 1000:.2f} m)")
+        trained = ("inside the checkpoint's training range" if sc.in_training_range else
+                   f"EXTRAPOLATION, trained: {sc.range_note}")
         self.tx_scen.set_text(
-            f"{sc.name}: sep {sep:.1f} mm, laser {lp:.2f} / {ly:.2f} deg ({src})\n"
-            f"P_max {sc.pmax / 1000:.2f} m ({sc.best_bounces} b) at {sc.best_tilt[0]:+.2f} / "
-            f"{sc.best_tilt[1]:+.2f} deg, P_ref {sc.path_ref / 1000:.2f} m\n"
-            f"{state}; scan + env {sc.scan_ms:.1f} ms{extra}")
+            f"{sc.name}: sep {sep:.1f} mm, laser {lp:+.2f} / {ly:+.2f} deg\n"
+            f"offset {dx:+.2f} / {dy:+.2f} mm in the hole; {src}\n"
+            f"{valid}; P_max {sc.pmax / 1000:.2f} m ({sc.best_bounces} b) at "
+            f"{sc.best_tilt[0]:+.2f} / {sc.best_tilt[1]:+.2f}\n"
+            f"{state}; P_ref {sc.path_ref / 1000:.2f} m\n{trained}")
         self.ln_best.set_data([sc.best_tilt[1]], [sc.best_tilt[0]])
         g, R = self.s.geom, self.s.geom.diameter / 2
         for k, art in enumerate(self.side):  # M1, laser origin, hole: fixed per scenario
@@ -1445,7 +1619,7 @@ class Viewer:
             u[k] = R
             e = np.stack((p1 - R1 @ u, p1 + R1 @ u))
             art["m1"].set_data(e[:, 2] / sep, e[:, k])
-            o = R1 @ np.array([g.laser_dx, g.m1_hole_offset_y + g.laser_dy, -5.0]) + p1
+            o = R1 @ np.array([dx, g.m1_hole_offset_y + dy, -5.0]) + p1
             art["laser"].set_data([o[2] / sep], [o[k]])
             if "hole" in art:
                 c = R1 @ np.array([0.0, g.m1_hole_offset_y, 0.0]) + p1
@@ -1474,8 +1648,13 @@ class Viewer:
         log = (f"decision log {short_path(s.log_writer.paths['steps'])}, "
                f"{os.path.basename(s.log_writer.paths['episodes'])}" if s.log_writer
                else "no decision log")
-        self.tx_info.set_text(f"checkpoint {s.ckpt_msg}\n{s.atlas_msg}; device {s.device}\n"
-                              f"{log}")
+        tr = s.train_ranges
+        (a, b), (c, d), (e, f) = tr["separation"], tr["laser_pitch"], tr["laser_yaw"]
+        laser = f"{c:g}-{d:g} deg" if (c, d) == (e, f) else f"{c:g}-{d:g} / {e:g}-{f:g} deg"
+        offset = "in the hole" if tr["offset"] == "disk" else "fixed (measured)"
+        self.tx_info.set_text("\n".join(s.ckpt_lines) + f"\ntraining range: separation "
+                              f"{a:g}-{b:g} mm, laser {laser}, offset {offset}\n"
+                              f"{s.atlas_msg}; device {s.device}\n{log}")
 
     def _set_slider(self, sl, v: float):
         """Move a slider without its callback (and without a redraw)."""
@@ -1522,15 +1701,16 @@ class Viewer:
         """Oracle comparison of the last logged episode."""
         r = self.s.last_result
         if r is None:
-            return "last episode vs oracle: none yet (Step or Run an episode)"
+            return "last episode vs oracle: none yet"
+        tags = ("" if r["in_training_range"] else " (extrapolation)") + (
+            " (invalid)" if r["invalid_reason"] else "")
         return (f"last episode {r['episode']} ({r['scenario']}, {r['mode']}): {r['end']}, "
                 f"{r['steps']} steps, {r['moves']} moves\n"
                 f"final {r['final_path_m']:.3f} m = {r['final_pmax']:.3f} P_max, "
-                f"return {r['return']:+.4f}"
-                f"{'' if r['in_training_range'] else ' (extrapolation)'}\n"
-                f"oracle return {r['oracle_return']:+.4f}: {r['oracle_moves']} moves to "
-                f"{r['oracle_target_pitch']:+.2f} / {r['oracle_target_yaw']:+.2f}\n"
-                f"  ({r['oracle_target_path_m']:.3f} m, {r['oracle_target_bounces']} bounces)\n"
+                f"return {r['return']:+.4f}{tags}\n"
+                f"oracle {r['oracle_return']:+.4f}: {r['oracle_moves']} moves to "
+                f"{r['oracle_target_pitch']:+.2f} / {r['oracle_target_yaw']:+.2f} "
+                f"({r['oracle_target_path_m']:.2f} m, {r['oracle_target_bounces']} b)\n"
                 f"regret {r['regret']:+.4f}, {r['pct_oracle']:.1f} % of the oracle")
 
     def _episode_state(self, f: Frame) -> str:
@@ -1552,12 +1732,12 @@ class Viewer:
 
     def _show_beam(self, f: Frame):
         s, g = self.s, self.s.geom
-        sep, lp, ly = s.scenario.params
+        sep, lp, ly, dx, dy = s.scenario.params
         R1 = rotation(g.m1_pitch, g.m1_yaw)
         R2 = rotation(f.tilt[0], f.tilt[1])
         p1 = np.array([g.m1_tx, g.m1_ty, 0.0])
         p2 = np.array([g.m2_tx, g.m2_ty, sep])
-        origin = R1 @ np.array([g.laser_dx, g.m1_hole_offset_y + g.laser_dy, -5.0]) + p1
+        origin = R1 @ np.array([dx, g.m1_hole_offset_y + dy, -5.0]) + p1
         d0 = R1 @ rotation(lp, ly) @ np.array([0.0, 0.0, 1.0])
         pts = np.vstack((origin[None], f.hits.astype(np.float64)))
         centers = {1: p1 + R1 @ np.array([0, 0, 1.0]) * g.roc,
@@ -1603,20 +1783,22 @@ class Viewer:
             nxt = f"{d[0]:+.2f} / {d[1]:+.2f} deg ({mode}{', stop' if not act.any() else ''})"
         sc = s.scenario
         pref = sc.path_ref
-        mu, sd, m, e = p.tilt_mu, p.tilt_std, p.scen_mu, p.scen_std
+        mu, sd = p.tilt_mu, p.tilt_std
         rows = ["", nxt, f"{p.p_stop:.3f}", f"{p.value:+.3f}",
                 f"{p.path_norm * pref / 1000:.3f} = {p.path_norm:.3f} P_ref",
                 f"{mu[0]:+.3f} +- {sd[0]:.3f}", f"{mu[1]:+.3f} +- {sd[1]:.3f}"]
-        if s.scen_head:
-            rows += [f"{m[0]:.1f} +- {e[0]:.1f}", f"{m[1]:.2f} +- {e[1]:.2f}",
-                     f"{m[2]:.2f} +- {e[2]:.2f}"]
-        else:
-            rows += ["not in the checkpoint", "", ""]
-        sep, lp, ly = sc.params
+        fmts = ("{:.1f} +- {:.1f}", "{:+.2f} +- {:.2f}", "{:+.2f} +- {:.2f}",
+                "{:+.2f} +- {:.2f}", "{:+.2f} +- {:.2f}")
+        for k, (name, fmt) in enumerate(zip(PARAM_NAMES, fmts)):
+            m, e = s.head_value(p, name)
+            rows.append(fmt.format(m, e) if not math.isnan(m) else
+                        ("not predicted" if s.scen_head else
+                         "scenario head not loaded" if k == 0 else ""))
+        sep, lp, ly, dx, dy = sc.params
         self.tx_pol.set_text("\n".join(rows))
         self.tx_true.set_text(
             f"\n\n\n\n{f.path_mm / 1000:.3f} = {f.path_mm / pref:.3f}\n{f.tilt[0]:+.3f}\n"
-            f"{f.tilt[1]:+.3f}\n{sep:.1f}\n{lp:.2f}\n{ly:.2f}")
+            f"{f.tilt[1]:+.3f}\n{sep:.1f}\n{lp:+.2f}\n{ly:+.2f}\n{dx:+.2f}\n{dy:+.2f}")
 
     # ── Actions ──
 
@@ -1631,9 +1813,8 @@ class Viewer:
         self.s.set_scenario(params, name)
         f = self.s.start(nominal if nominal is not None else self.s.start_tilt)
         sc = self.s.scenario
-        self._say(note or f"scenario {sc.name}: separation {sc.params[0]:.1f} mm, laser "
-                  f"{sc.params[1]:.2f} / {sc.params[2]:.2f} deg; new episode at "
-                  f"{f.tilt[0]:+.2f} / {f.tilt[1]:+.2f} deg")
+        self._say(note or f"scenario {sc.name}; new episode at {f.tilt[0]:+.2f} / "
+                  f"{f.tilt[1]:+.2f} deg")
         self._show_scenario()
         self._show(f, scene=True)
 
@@ -1646,33 +1827,31 @@ class Viewer:
         self._apply_scenario((g.separation, g.laser_pitch, g.laser_yaw), g.name,
                              (g.m2_pitch, g.m2_yaw))
 
-    def _on_random_good(self):
-        if self.s.atlas is None:
-            self._say("no atlas: random good scenario unavailable")
-            self._show(self.s.frame)
-            return
-        self._apply_scenario(self.s.random_good())
+    def _on_random(self, kind: str):
+        """Random valid scenario over the scenario space (good: separation 20-400 mm;
+        short / long), preferring a good one (Session.random_scenario)."""
+        seps = {"good": SEP_RANGE, "short": SHORT_SEPS, "long": LONG_SEPS}[kind]
+        prm, k, status = self.s.random_scenario(seps)
+        found = {"good": f"good (draw {k})",
+                 "valid": f"valid, but no good one in {k} draws",
+                 "invalid": f"no valid scenario in {k} draws"}[status]
+        self._apply_scenario(prm, f"random {kind}", note=f"random {kind}: {found}")
 
-    def _on_random_outside(self, kind: str):
-        """Random scenario with a separation outside the trained range (short / long),
-        preferring a good one (see Session.random_outside)."""
-        prm, k, good = self.s.random_outside(SHORT_SEPS if kind == "short" else LONG_SEPS)
-        found = (f"good (draw {k})" if good else
-                 f"no good scenario in {k} draws (P_max < 20 x sep), kept the closest")
-        self._apply_scenario(prm, f"random {kind}", note=(
-            f"random {kind}: separation {prm[0]:.1f} mm, laser {prm[1]:.2f} / {prm[2]:.2f} deg"
-            f": {found}"))
+    def _controls(self, offset=None) -> Tuple[float, ...]:
+        """Scenario of the controls: sliders and the laser offset (or offset)."""
+        dx, dy = self.offset if offset is None else offset
+        return (self.sl_sep.val, self.sl_lp.val, self.sl_ly.val, dx, dy)
 
     def _nudge_sep(self, d: float):
         """Separation -/+ d mm from the keyboard (throttled like the slider)."""
-        lo, hi = SEP_SLIDER
+        lo, hi = SEP_RANGE
         v = float(np.clip(round((self.sl_sep.val + d) * 2) / 2, lo, hi))
         self._set_slider(self.sl_sep, v)
-        if not self.th_scen((v, self.sl_lp.val, self.sl_ly.val)):
+        if not self.th_scen(self._controls()):
             self._blit_slider(self.sl_sep)
 
     def _on_scen_slider(self, sl):
-        if not self.th_scen((self.sl_sep.val, self.sl_lp.val, self.sl_ly.val)):
+        if not self.th_scen(self._controls()):
             self._blit_slider(sl)
 
     def _on_tilt_slider(self, sl):
@@ -1688,7 +1867,7 @@ class Viewer:
         if self.s.agent is None:
             self._say("no policy loaded")
         elif self.s.frame.done:
-            self._say("episode over: Reset (r) or Random start (n)")
+            self._say("episode over")
         else:
             return True
         self._show(self.s.frame)
@@ -1770,18 +1949,41 @@ class Viewer:
     def _map_tilt(event) -> Tuple[float, float]:
         return round(float(event.ydata), 2), round(float(event.xdata), 2)  # Mount resolution
 
+    def _hole_offset(self, event) -> Optional[Tuple[float, float]]:
+        """Laser offset (mm, 0.01 steps) at a click in the hole panel, kept inside the disk;
+        None outside the panel."""
+        if event.inaxes is not self.ax_hole or event.xdata is None:
+            return None
+        x, y = float(event.xdata), float(event.ydata)
+        r, r_max = math.hypot(x, y), self.s.hole_r - 0.01  # Rounding stays inside
+        if r > r_max:
+            x, y = x * r_max / r, y * r_max / r
+        return round(x, 2), round(y, 2)
+
     def _on_press(self, event):
-        if event.button == 1 and self._map_event(event):
+        if event.button != 1:
+            return
+        if self._map_event(event):
             self._dragging_map = True
             self.th_tilt.last = -math.inf  # A click always applies at once
             self.th_tilt(self._map_tilt(event))
+            return
+        off = self._hole_offset(event)
+        if off is not None:
+            self._dragging_hole = True
+            self.th_scen.last = -math.inf
+            self.th_scen(self._controls(off))
 
     def _on_motion(self, event):
         if self._dragging_map and self._map_event(event):
             self.th_tilt(self._map_tilt(event))
+        elif self._dragging_hole:
+            off = self._hole_offset(event)
+            if off is not None:
+                self.th_scen(self._controls(off))
 
     def _on_release(self, _event):
-        self._dragging_map = False
+        self._dragging_map = self._dragging_hole = False
         self.th_tilt.flush()
         self.th_scen.flush()
 
@@ -1790,7 +1992,7 @@ class Viewer:
             return
         acts = {"right": self._on_step, "s": self._on_step, " ": self._toggle_run,
                 "r": self._on_reset, "n": self._on_random_start, "d": self._on_mode,
-                "m": self._on_map_mode, "g": self._on_random_good,
+                "m": self._on_map_mode, "g": lambda: self._on_random("good"),
                 "[": lambda: self._nudge_sep(-0.5), "]": lambda: self._nudge_sep(0.5),
                 "{": lambda: self._nudge_sep(-5.0), "}": lambda: self._nudge_sep(5.0)}
         fn = acts.get(event.key)
@@ -1834,9 +2036,7 @@ def _reference_episode(s: Session, tilt) -> Dict[str, object]:
     from ppo import EvalPolicy
 
     sc = s.scenario
-    ec = env_config(s.pcfg, 1, False, s.cfg.seed, setups="full")
-    env = AlignEnv(ec, scenarios=Scenarios(torch.tensor([sc.params], dtype=torch.float32),
-                                           torch.tensor([sc.path_ref], dtype=torch.float32)))
+    env = s.make_env(sc.params, torch.tensor([sc.path_ref]))
     tilts = torch.tensor([tilt], dtype=torch.float32)
     plan = plan_oracle(env, tilts, chunk=8)
     ep, _ = evaluate(env, EvalPolicy(s.agent), tilts, ref_path_mm=plan.target_path_mm,
@@ -1934,7 +2134,7 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
     for name in ("sep116", "sep144", "sep169"):
         v._on_named(name)
     for _ in range(3):
-        v._on_random_good()
+        v._on_random("good")
     v._on_named("measured")
     for i in range(10):  # Back-to-back drag events: coalesced, the last one applied
         v.sl_sep.set_val(80.0 + 0.5 * i)
@@ -1989,22 +2189,85 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
     checks["abandoned episode logged"] = (r["episode"] == n and r["end"] == "abandoned"
                                           and r["steps"] == 2)
 
-    # Outside the trained separations (random short / long) and a scenario with P_max = 0
-    for kind, (lo, hi) in (("short", SHORT_SEPS), ("long", LONG_SEPS)):
-        v._on_random_outside(kind)
-        sc = s.scenario
-        f = run_episode(f"random {kind} ({sc.params[0]:.1f} mm, laser {sc.params[1]:.2f} / "
-                        f"{sc.params[2]:.2f} deg, {'good' if sc.good else 'impossible'}), "
-                        f"argmax")
+    # Scenario space: random short / long (valid by construction), a random valid one with
+    # negative laser angles and an offset, validity (clipped by the hole, misses M2)
+    def label(sc: ScenarioInfo) -> str:
+        sep, lp, ly, dx, dy = sc.params
+        state = "good" if sc.good else ("valid" if sc.valid else sc.invalid_reason)
+        return (f"{sep:.1f} mm, laser {lp:+.2f} / {ly:+.2f} deg, offset {dx:+.2f} / {dy:+.2f} "
+                f"mm, {state}{'' if sc.in_training_range else ', extrapolation'}")
+
+    def logged(sc: ScenarioInfo, f: Frame) -> bool:
         ep = _read_csv(s.log_writer.paths["episodes"])[-1]
-        checks[f"random {kind}: episode played and logged"] = (
-            lo <= sc.params[0] <= hi and not sc.in_training_range and f.done
-            and int(ep["episode"]) == s.episode and ep["in_training_range"] == "0"
-            and "EXTRAPOLATION" in v.tx_scen.get_text())
-    v._apply_scenario((200.0, 8.0, 8.0))  # The beam misses M2 at every tilt: P_max = 0
-    f = run_episode("200 mm, laser 8.00 / 8.00 deg (P_max = 0), argmax")
-    checks["P_max = 0 scenario logged"] = (s.scenario.pmax == 0.0 and f.done
-                                           and s.last_result["episode"] == s.episode)
+        steps = [r for r in _read_csv(s.log_writer.paths["steps"])
+                 if r["episode"] == ep["episode"]]
+        offsets = (("laser_dx_mm", sc.params[3]), ("laser_dy_mm", sc.params[4]))
+        return (f.done and int(ep["episode"]) == s.episode and len(steps) == f.step
+                and ep["valid"] == str(int(sc.valid))
+                and ep["invalid_reason"] == sc.invalid_reason
+                and ep["in_training_range"] == str(int(sc.in_training_range))
+                and all(abs(float(ep[k]) - val) < 1e-6 and abs(float(steps[-1][k]) - val) < 1e-6
+                        for k, val in offsets)
+                and ("EXTRAPOLATION" in v.tx_scen.get_text()) != sc.in_training_range)
+
+    for kind, (lo, hi) in (("short", SHORT_SEPS), ("long", LONG_SEPS)):
+        v._on_random(kind)
+        sc = s.scenario
+        f = run_episode(f"random {kind} ({label(sc)}), argmax")
+        checks[f"random {kind}: valid, played and logged"] = (
+            lo <= sc.params[0] <= hi and sc.valid and logged(sc, f))
+    for _ in range(50):
+        prm, _, status = s.random_scenario(SEP_RANGE)
+        if status != "invalid" and prm[1] < 0 and prm[2] < 0 and math.hypot(*prm[3:]) > 0.3:
+            break
+    v._apply_scenario(prm, "random negative")
+    sc = s.scenario
+    f = run_episode(f"random ({label(sc)}), argmax")
+    checks["negative angles and offset: played and logged"] = (
+        sc.valid and sc.params[1] < 0 and sc.params[2] < 0 and logged(sc, f))
+    v._apply_scenario((88.0, 0.0, 8.0, 1.45, 0.0))  # Pointing out of the hole edge
+    clipped = s.scenario.invalid_reason == "clipped by hole"
+    clipped &= "CLIPPED BY HOLE" in v.tx_scen.get_text()
+    f = run_episode(f"clipped ({label(s.scenario)}), argmax")
+    clipped &= logged(s.scenario, f)
+    v._apply_scenario((400.0, 0.0, 8.0, 0.0, 0.0))  # 56 mm off-axis at M2: misses it
+    f = run_episode(f"misses M2 ({label(s.scenario)}), argmax")
+    misses = (s.scenario.invalid_reason == "misses M2" and s.scenario.pmax == 0.0
+              and "MISSES M2" in v.tx_scen.get_text() and logged(s.scenario, f))
+    checks["validity: clipped by hole / misses M2, played and logged"] = clipped and misses
+
+    # A five-parameter scenario head (synthesized checkpoint: this agent's weights, head
+    # with 2 x 5 outputs, range over the scenario space): loads, plays and logs; its head
+    # shows if this agent.py builds five-value heads, else it is reported as not loaded
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ck = torch.load(s.ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+        sd = {k: v.clone() for k, v in ck["agent"].items()}
+        for k in ("scenario.2.weight", "scenario.2.bias"):
+            w = sd[k]
+            sd[k] = torch.zeros((10,) + tuple(w.shape[1:]), dtype=w.dtype)
+        acfg = dict(ck["agent_cfg"])
+        r = s.hole_r
+        acfg.update(scen_lo=(SEP_RANGE[0], ANGLE_RANGE[0], ANGLE_RANGE[0], -r, -r),
+                    scen_hi=(SEP_RANGE[1], ANGLE_RANGE[1], ANGLE_RANGE[1], r, r),
+                    scen_names=PARAM_NAMES)
+        path5 = os.path.join(tmp, "best_5param.pt")
+        torch.save({"agent": sd, "agent_cfg": acfg, "cfg": ck["cfg"], "vnorm": ck["vnorm"],
+                    "name": "synthesized_5param", "iteration": 0, "env_steps": 0}, path5)
+        del ck
+        s.load_checkpoint(path5)
+        v._show_info()
+        v._on_random("good")
+        sc = s.scenario
+        f = run_episode(f"five-value head checkpoint ({label(sc)}), argmax")
+        step = _read_csv(s.log_writer.paths["steps"])[-1]
+        head_ok = (step["scen_head_laser_dx_mm"] != "") == s.scen_head
+        checks["five-value head checkpoint: loads, plays, logs"] = (
+            s.head_names == PARAM_NAMES and s.train_ranges["offset"] == "disk"
+            and sc.in_training_range and logged(sc, f) and head_ok)
+        print(f"    head names {s.head_names}; scenario head "
+              f"{'loaded' if s.scen_head else 'not loaded with this agent.py (3-value head)'}")
 
     # Checkpoint box: click in, type (x, backspace), click outside (submit: load); bad path
     step0 = s.frame.step
@@ -2048,9 +2311,18 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     d = ViewerConfig()
-    ap = argparse.ArgumentParser(description="Interactive Herriott-cell simulator and policy "
-                                             "viewer")
-    ap.add_argument("--ckpt", default=d.ckpt, help="ppo.py checkpoint (default: the newest runs/ppo/*/best*.pt)")
+    ap = argparse.ArgumentParser(
+        description="Interactive Herriott-cell simulator and policy viewer",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=(
+            "mouse: click or drag on the landscape sets the start tilt (new episode); click or\n"
+            "  drag in the laser-offset disk sets laser dx / dy; Enter in the checkpoint box\n"
+            "  loads it\n"
+            "keys: right or s step, space run / pause, r reset (start tilt), n random start,\n"
+            "  d argmax / sampled, m map color, g random good scenario, [ / ] separation\n"
+            "  -/+0.5 mm, { / } -/+5 mm\n"
+            "every played episode is logged (steps and oracle comparison) under --log-dir"))
+    ap.add_argument("--ckpt", default=d.ckpt,
+                    help="ppo.py checkpoint (default: the newest runs/ppo/*/best*.pt)")
     ap.add_argument("--no-ckpt", action="store_true", help="Simulator only")
     ap.add_argument("--atlas", default=d.atlas, help="Scenario atlas (scenarios.py)")
     ap.add_argument("--device", default=d.device)
