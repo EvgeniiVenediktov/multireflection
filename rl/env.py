@@ -50,6 +50,13 @@ B independent episodes, all state on the device, no host syncs in step() / reset
                episode, independent of the other envs and of step timing, no generator
                state and no host sync (a torch.Generator would have to draw for all B
                envs every step, or sync to learn how many reset)
+    near-best  pool mode, EnvConfig.near_best_frac F > 0 (fine-tuning, reverse
+               curriculum): an episode of a good scenario starts with probability F at
+               best tilt + r (cos t, sin t), r uniform in near_best_radius, t uniform,
+               clamped to the +-limit box (best tilt = the slot's pmax_tilt, copied at the
+               draw like its parameters); otherwise, and always for impossible
+               scenarios, uniform in the init box. Coin, r and t come from a second
+               counter-based hash of (seed, env, episode); F = 0: not computed
     partial    rows that need no simulation (unmasked envs in reset(mask), not-move
                envs, envs that do not reset) are traced as a dead state that stops
                before the first bounce, so the kernel's 32-ray programs made only of
@@ -119,6 +126,8 @@ class EnvConfig:
     # ── Reset: initial tilts uniform in center +- radius, clamped to the limits ──
     init_center: Tuple[float, float] = (0.0, 0.0)  # deg
     init_radius: float = 2.0  # deg
+    near_best_frac: float = 0.0  # Pool mode: share of good-scenario starts near the best tilt
+    near_best_radius: Tuple[float, float] = (0.05, 0.5)  # deg, ring around it (r uniform)
 
     # ── Observation (D3) ──
     img_res: int = 64
@@ -151,6 +160,7 @@ def set_scenario(states: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
 
 _M32 = 0xFFFFFFFF
 _STREAMS = (0x9E3779B9, 0x85EBCA6B, 0xC2B2AE35)  # Tilt x, tilt y, setup
+_NEAR_KEY = 0x27D4EB2F  # Env key salt of the near-best draws (coin, radius, angle)
 
 
 def _mul32(x: torch.Tensor, c: int) -> torch.Tensor:
@@ -545,6 +555,10 @@ class AlignEnv:
         k = hash32(torch.full((B,), sd & _M32, dtype=torch.long, device=dev))
         k = hash32(k ^ hash32(torch.full((B,), (sd >> 32) & _M32, dtype=torch.long, device=dev)))
         self._env_key = hash32(k ^ torch.arange(B, device=dev))
+        self._near_key = hash32(self._env_key ^ _NEAR_KEY)
+        r0, r1 = c.near_best_radius
+        assert 0.0 <= c.near_best_frac <= 1.0 and 0.0 <= r0 <= r1, "near-best settings"
+        assert c.near_best_frac == 0 or pool is not None, "near-best starts need the pool"
         self._setup0 = torch.zeros(B, dtype=torch.long, device=dev)
         self._src0 = torch.full((B,), -1, dtype=torch.int8, device=dev)
         self._gen0 = torch.zeros(B, dtype=torch.long, device=dev)
@@ -648,20 +662,44 @@ class AlignEnv:
         if radius is not None:
             self.init_radius = torch.as_tensor(radius, dtype=torch.float32).to(self.device)
 
-    def _draw_src(self, episode: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _draw_src(self, episode: torch.Tensor, setups: Optional[torch.Tensor] = None
+                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Initial tilts (B, 2) in the init box (clamped), setups (B,) and sampler
         sources (B,) int8 of the given per-env episode indices; a function of (seed,
-        env, episode) only (with a sampler: and of its current distribution)."""
+        env, episode) only (with a sampler: and of its current distribution). setups
+        (B,) int64: explicit setups instead of the draw (source -1). Near-best starts
+        (near_best_frac > 0) replace the tilts of the chosen episodes (_near_best)."""
         u = uniforms(self._env_key, episode)
         t = (self.init_center + self.init_radius * (2.0 * u[:, :2] - 1.0)).clamp(
             -self.limit, self.limit)
-        if self.sampler is not None:
+        if setups is not None:
+            s, src = setups, self._src0
+        elif self.sampler is not None:
             s, src = self.sampler.draw(u[:, 2].contiguous())
-            return t, s, src
-        if self.n_setups == 1:
-            return t, self._setup0, self._src0
-        s = torch.searchsorted(self._setup_cdf, u[:, 2].contiguous(), right=True)
-        return t, s.clamp(max=self.n_setups - 1), self._src0
+        elif self.n_setups == 1:
+            s, src = self._setup0, self._src0
+        else:
+            s = torch.searchsorted(self._setup_cdf, u[:, 2].contiguous(), right=True)
+            s, src = s.clamp(max=self.n_setups - 1), self._src0
+        if self.cfg.near_best_frac > 0:
+            t = self._near_best(t, s, episode)
+        return t, s, src
+
+    def _near_best(self, t: torch.Tensor, slot: torch.Tensor, episode: torch.Tensor) -> torch.Tensor:
+        """Near-best starts (pool mode): rows whose slot holds a good scenario get, with
+        probability near_best_frac, best tilt (pmax_tilt) + r (cos a, sin a), r uniform in
+        near_best_radius, a uniform in [0, 2 pi), clamped to the +-limit box; the other
+        rows keep t (B, 2). Draws from the second hash of (seed, env, episode); no sync."""
+        c = self.cfg
+        v = uniforms(self._near_key, episode)
+        at = self.pool.atlas
+        r0, r1 = (float(x) for x in c.near_best_radius)
+        r = r0 + (r1 - r0) * v[:, 1]
+        a = (2.0 * math.pi) * v[:, 2]
+        near = (at.pmax_tilt[slot] + r[:, None] * torch.stack((torch.cos(a), torch.sin(a)), 1)
+                ).clamp(-self.limit, self.limit)
+        use = at.good[slot] & (v[:, 0] < c.near_best_frac)
+        return torch.where(use[:, None], near, t)
 
     def _pool_rows(self, slot: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Parameters (n, 5), P_ref (n,) and generation (n,) of pool slots (n,) (gathers,
@@ -815,11 +853,10 @@ class AlignEnv:
         if mask is None:
             mask = torch.ones(B, dtype=torch.bool, device=self.device)
         ep = torch.where(mask, self.episode + 1, self.episode)
-        d_tilt, d_setup, d_src = self._draw_src(ep)
+        d_tilt, new_s, new_src = self._draw_src(
+            ep, None if setups is None else setups.to(device=self.device, dtype=torch.long))
         new = d_tilt if tilts is None else tilts.to(
             device=self.device, dtype=torch.float32).clamp(-self.limit, self.limit)
-        new_s = d_setup if setups is None else setups.to(device=self.device, dtype=torch.long)
-        new_src = d_src if setups is None else self._src0
         m1 = mask[:, None]
         tilt = torch.where(m1, new, self.tilt)
         setup = torch.where(mask, new_s, self.setup)

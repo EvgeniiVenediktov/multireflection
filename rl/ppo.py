@@ -119,6 +119,18 @@ Cluster: cluster/ppo_l40s.slurm.
                and, for the four-setup set, eval/ (the keys of run 4398136) and
                eval_samp/. Per split: FLAT_METRICS (stop_low: share of episodes ended
                by not move below 0.9 P_ref, stop_low_path_frac: their mean P / P_ref)
+    fine-tune  (pool runs, all off by default) --near-best-frac F --near-best-radius RMIN
+               RMAX: a share F of the good-scenario episodes starts at the slot's best
+               tilt plus a ring offset, r uniform in [RMIN, RMAX] deg, angle uniform,
+               clamped to the box (env.py near-best; impossible scenarios and the rest
+               uniform). --pool-region-mix a,b,c,d: good-slot shares per target-region bin
+               (tiny / small / medium / large), filled and refreshed by rejection with
+               per-bin quotas (scenarios.py region quotas; logged: pool/candidates,
+               pool/refresh_s, pool/region_<bin>, pool/rejected). --best-metric region:
+               best.pt on the mean over the four region bins of the eval_region/
+               deterministic % of the oracle (eval_region/bin_mean/pct_oracle, logged
+               with every region eval); the value used is logged as best/value. Run-name
+               markers _nb<F>[r<RMIN>-<RMAX>], _rmix, _bmregion
     holdout    --holdout-frac F (default 0): a seeded (--holdout-seed) random share F of
                the grid scenarios, stratified good / impossible, never drawn in
                training (scenarios.holdout_mask, removed from the sampler's segments)
@@ -126,7 +138,8 @@ Cluster: cluster/ppo_l40s.slurm.
                --no-wandb, display name built at start from the config
     checkpoint latest.pt (every --ckpt-minutes and at exit), best.pt (best deterministic
                % of the oracle: on the cont set with the pool, the full set with the
-               atlas, else on the set of the run; that set must be in --eval-sets):
+               atlas, else on the set of the run; --best-metric region: the region-bin
+               mean of eval_region/; that set must be in --eval-sets):
                agent, optimizer, value norm, entropy coefficient, sampler (with the pool:
                its slots), counters, RNG, env and ring state, config. SIGTERM / SIGUSR1:
                abort the current rollout, write latest.pt, exit 0
@@ -159,6 +172,8 @@ RL_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(RL_DIR, "runs", "ppo")
 SETUP_CHOICES = ("full", "all", "measured")
 SCENARIO_CHOICES = ("pool", "atlas")  # --setups full: continuous pool or grid atlas
+BEST_METRICS = ("cont", "region")  # --best-metric
+REGION_BIN_MEAN = "eval_region/bin_mean/pct_oracle"  # Mean over the region bins (--best-metric region)
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -181,6 +196,8 @@ class PPOConfig:
     path_ref: str = "max"  # --setups all / measured; full: the atlas P_ref
     init_center: Tuple[float, float] = (0.0, 0.0)
     init_radius: float = 2.0
+    near_best_frac: float = 0.0  # Pool: share of good-scenario starts near the best tilt
+    near_best_radius: Tuple[float, float] = (0.05, 0.5)  # deg, ring around the best tilt
     seed: int = 0
 
     # ── Continuous scenarios (--scenarios pool) ──
@@ -190,6 +207,7 @@ class PPOConfig:
     laser_mode: str = "landing"  # landing: angles from a uniform M2 landing point; angle
     pool_size: int = 16384
     pool_refresh: float = 0.0625  # Share of the pool rescanned per iteration (was 0.125)
+    pool_region_mix: str = ""  # Good-slot shares per target-region bin "a,b,c,d"; "" = natural
 
     # ── Scenario sampler (--setups full) ──
     plr: bool = True  # Regret-prioritized replay; False: good scenarios uniform
@@ -256,6 +274,7 @@ class PPOConfig:
     eval_sets: str = ""  # Comma list of <set>[_samp] (EVAL_SET_NAMES); "" = eval_entries default
     eval_tables: str = ""  # Eval tables dir ("" = scenarios.EVAL_TABLES_DIR), built if missing
     eval_sampled: bool = True  # The <set>_samp entries (sampled policy); False: skipped
+    best_metric: str = "cont"  # best.pt: cont (the run's default set) or region (bin mean)
     ckpt_minutes: float = 15.0
     wandb: bool = True
     wandb_project: str = "herriott-rl"
@@ -904,6 +923,15 @@ def run_eval(agent: Agent, es: EvalSet, eval_seed: int, sampled: bool,
     return flat, ep, pol
 
 
+def region_bin_mean(ev: Dict[str, float], prefix: str = "eval_region",
+                    metric: str = "pct_oracle") -> float:
+    """Mean of <prefix>/region_<bin>/<metric> over the target-region bins (bin-balanced;
+    NaN if a bin is empty)."""
+    from scenarios import REGION_BINS
+
+    return sum(ev[f"{prefix}/region_{b}/{metric}"] for b in REGION_BINS) / len(REGION_BINS)
+
+
 # ── Trainer ─────────────────────────────────────────────────────────────────
 
 
@@ -920,6 +948,9 @@ class Trainer:
         assert c.setups in SETUP_CHOICES, f"setups {c.setups!r} not in {SETUP_CHOICES}"
         assert c.scenarios in SCENARIO_CHOICES, f"scenarios {c.scenarios!r} not in {SCENARIO_CHOICES}"
         assert c.encoder_epochs >= 0 and c.encoder_train_until >= 0, "encoder schedule"
+        assert c.best_metric in BEST_METRICS, f"best_metric {c.best_metric!r} not in {BEST_METRICS}"
+        assert pool_mode(c) or (c.near_best_frac == 0 and not c.pool_region_mix), \
+            "--near-best-frac / --pool-region-mix need --scenarios pool"
         self.device = dev = torch.device(device or "cuda")
         torch.manual_seed(c.seed)
 
@@ -939,12 +970,13 @@ class Trainer:
             if not pool_mode(c) or (build_eval and any(n in ATLAS_SETS for n in eval_set_names(c))):
                 self._load_atlas()
         if pool_mode(c):
-            from scenarios import PoolConfig, ScenarioPool
+            from scenarios import PoolConfig, ScenarioPool, parse_region_mix
 
             assert c.holdout_frac == 0, "--holdout-frac needs --scenarios atlas"
             self.pool = self.sampler = ScenarioPool(
                 PoolConfig(size=c.pool_size, ranges=cont_ranges_of(c), refresh_frac=c.pool_refresh,
-                           seed=c.seed), scfg, device=dev, log=log)
+                           seed=c.seed, region_mix=parse_region_mix(c.pool_region_mix)),
+                scfg, device=dev, log=log)
             self.pool.atlas.check(ec.max_bounces, ec.geometry.m2_tilt_limit, ec.step_unit)
             scen_kw = {"pool": self.pool}
         elif c.setups == "full":
@@ -958,7 +990,13 @@ class Trainer:
             scen_kw = {"scenarios": self.atlas.table(), "sampler": self.sampler}
 
         # ── Env and agent ──
-        self.env = AlignEnv(env_config(c, c.num_envs, True, c.seed), **scen_kw)
+        ecfg = env_config(c, c.num_envs, True, c.seed)
+        ecfg.near_best_frac, ecfg.near_best_radius = c.near_best_frac, tuple(c.near_best_radius)
+        self.env = AlignEnv(ecfg, **scen_kw)
+        if c.near_best_frac > 0:
+            print(f"near-best starts: {c.near_best_frac:g} of the good-scenario episodes start "
+                  f"{c.near_best_radius[0]:g}-{c.near_best_radius[1]:g} deg from the best tilt",
+                  flush=True)
         self.names = [g.name for g in self.env.setups]
         self.agent = Agent(agent_config(c, self.env.n_bins)).to(dev)
         self.vnorm = ValueNorm(c.value_norm_beta, dev)
@@ -1016,6 +1054,8 @@ class Trainer:
                             if c.setups == "full" else "eval/all/pct_oracle")
         best_set = ("cont" if pool_mode(c) else "full" if c.setups == "full"
                     else "set4" if c.setups == "all" else c.setups)
+        if c.best_metric == "region":
+            self.best_metric, best_set = REGION_BIN_MEAN, "region"
         entries = eval_entries(c)  # Validates --eval-sets
         assert c.eval_every <= 0 or best_set in entries, \
             f"--eval-sets {c.eval_sets!r} lacks {best_set} (deterministic), the set of best.pt"
@@ -1300,7 +1340,8 @@ class Trainer:
 
     def evaluate(self) -> Dict[str, float]:
         """The evaluations of eval_entries: per set the deterministic (<set>) and the
-        sampled policy (<set>_samp); flat metrics dict."""
+        sampled policy (<set>_samp); flat metrics dict, with the region set also
+        REGION_BIN_MEAN (region_bin_mean of its deterministic % of the oracle)."""
         if self.eval_sets is None:
             self.setup_eval()
         entries = eval_entries(self.cfg)
@@ -1310,6 +1351,8 @@ class Trainer:
                 flat.update(self._run_eval(es, False))
             if es.name + SAMP in entries:
                 flat.update(self._run_eval(es, True))
+        if "region" in entries:
+            flat[REGION_BIN_MEAN] = region_bin_mean(flat)
         return flat
 
     # ── Checkpoints ──
@@ -1449,9 +1492,12 @@ class Trainer:
                 te = time.time()
                 ev = self.evaluate()
                 row["time_eval_s"] = time.time() - te
-                if ev[self.best_metric] > self.best_eval:
-                    self.best_eval = ev[self.best_metric]
+                val, saved = ev[self.best_metric], False
+                if val > self.best_eval:
+                    self.best_eval = val
                     self.save("best.pt")
+                    saved = True
+                ev["best/value"], ev["best/best"] = val, self.best_eval
                 ev["iteration"], ev["env_steps"] = self.iteration, self.env_steps
             row["wall_min"] = (time.time() - t_start) / 60
             log.train(row)
@@ -1467,6 +1513,8 @@ class Trainer:
                               f"{ev[f'{pre}/all/success']:.3f}, stop "
                               f"{ev[f'{pre}/all/stop_rate']:.3f}, len "
                               f"{ev[f'{pre}/all/length']:.1f}", flush=True)
+                print(f"  best.pt metric {self.best_metric}: {ev['best/value']:.2f} (best "
+                      f"{self.best_eval:.2f}{', best.pt written' if saved else ''})", flush=True)
             if time.time() - last_ckpt > 60 * c.ckpt_minutes:
                 self.save("latest.pt")
                 last_ckpt = time.time()
@@ -1556,6 +1604,10 @@ class Logger:
                   f"valid {100 * row['pool/valid_share']:.1f} %, {int(row['pool/scans'])} box scans, good "
                   f"{100 * row['pool/good_share']:.1f} % of valid | good slots % by sep: {hist}",
                   flush=True)
+            reg = " ".join(f"{k[len('pool/region_'):]} {100 * v:.1f}" for k, v in row.items()
+                           if k.startswith("pool/region_"))
+            print(f"      pool: good slots % by target region: {reg}; good candidates discarded "
+                  f"{row.get('pool/rejected', math.nan):.0f}", flush=True)
 
     def eval(self, row: Dict[str, Any]):
         self._write("eval", row)
@@ -1595,13 +1647,16 @@ def encoder_origin(encoder_info: Optional[dict]) -> str:
 
 def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     """Display / directory name from the config, built at start:
-    ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_ee<N>][_eu<F>][_pr<F>][_<tag>]_<jobid>;
+    ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_ee<N>][_eu<F>][_pr<F>][_nb<F>[r<lo>-<hi>]]
+    [_rmix][_bm<metric>][_<tag>]_<jobid>;
     <enc>: encoder_origin; <scen>: <ranges>-plr / -unif with the pool (ContRanges.tag,
     e.g. cont20-400-plr), full-plr / full-unif with the atlas (prioritized / uniform
     good draws), or set<S>, with -ho<pct>[s<seed>] when grid scenarios are held out
     (--holdout-frac); _ft<run>: initialized from that PPO run (--init-from); _ee<N> /
     _eu<F>: --encoder-epochs / --encoder-train-until when set; _pr<F>: --pool-refresh
-    when not the default (pool runs)."""
+    when not the default (pool runs); _nb<F>: --near-best-frac (r<lo>-<hi>: a
+    --near-best-radius other than the default); _rmix: --pool-region-mix; _bm<metric>:
+    --best-metric other than cont."""
     enc = encoder_origin(encoder_info)
     if pool_mode(c):
         scen = cont_ranges_of(c).tag() + ("-plr" if c.plr else "-unif")
@@ -1624,6 +1679,15 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
         name += f"_eu{c.encoder_train_until:g}"
     if pool_mode(c) and c.pool_refresh != PPOConfig.pool_refresh:
         name += f"_pr{c.pool_refresh:g}"
+    if c.near_best_frac > 0:
+        name += f"_nb{c.near_best_frac:g}"
+        lo, hi = c.near_best_radius
+        if (lo, hi) != PPOConfig.near_best_radius:
+            name += f"r{lo:g}-{hi:g}"
+    if c.pool_region_mix:
+        name += "_rmix"
+    if c.best_metric != "cont":
+        name += f"_bm{c.best_metric}"
     if c.name_tag:
         name += f"_{c.name_tag}"
     return name + "_" + os.environ.get("SLURM_JOB_ID", "local")
@@ -1635,7 +1699,7 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
 RESUME_OVERRIDES = ("total_env_steps", "eval_every", "ckpt_minutes", "wandb", "wandb_project",
                     "unfreeze_at", "encoder_lr_scale", "compile", "target_kl", "eval_sampled",
                     "enc_checkpoint", "eval_sets", "eval_tables", "encoder_epochs",
-                    "encoder_train_until")
+                    "encoder_train_until", "near_best_frac", "near_best_radius", "best_metric")
 PATH_FIELDS = ("encoder_init", "init_from", "atlas", "eval_tables")
 TUPLE_FIELDS = tuple(f.name for f in fields(PPOConfig) if isinstance(getattr(PPOConfig(), f.name), tuple))
 LEGACY_DEFAULTS = {"scenarios": "atlas"}  # Checkpoints from before the field: the grid atlas
@@ -1673,13 +1737,16 @@ def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
             ap.add_argument(flag, dest=f.name, action=argparse.BooleanOptionalAction, default=dflt(v))
         elif isinstance(v, tuple):
             ap.add_argument(flag, type=float, nargs=len(v), default=dflt(list(v)),
-                            metavar=("MIN", "MAX") if f.name.endswith("_range") else None)
+                            metavar=("MIN", "MAX") if f.name.endswith(("_range", "_radius"))
+                            else None)
         elif f.name == "setups":
             ap.add_argument(flag, choices=SETUP_CHOICES, default=dflt(v))
         elif f.name == "scenarios":
             ap.add_argument(flag, choices=SCENARIO_CHOICES, default=dflt(v))
         elif f.name == "laser_mode":
             ap.add_argument(flag, choices=("landing", "angle"), default=dflt(v))
+        elif f.name == "best_metric":
+            ap.add_argument(flag, choices=BEST_METRICS, default=dflt(v))
         else:
             ap.add_argument(flag, type=type(v), default=dflt(v))
     return ap

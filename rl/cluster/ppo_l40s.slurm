@@ -25,7 +25,8 @@
 # ppo_cnn-ftcont_k16_cont20-400-plr_b1024_s0_ft4407578_<jobid> (encoder origin, scenario
 # source and range, _ft<run> when INIT_FROM is set, _uf<it> with --unfreeze-at, _e2e with
 # --no-encoder-freeze, _ee<N> / _eu<F> with --encoder-epochs / --encoder-train-until,
-# _pr<F> with a --pool-refresh other than 0.0625).
+# _pr<F> with a --pool-refresh other than 0.0625, _nb<F> / _rmix / _bmregion with
+# --near-best-frac / --pool-region-mix / --best-metric region).
 # Per-iteration rollout / update / eval times are in train.csv and W&B (time_rollout_s,
 # time_update_s, time_eval_s, fps*), the pool refresh in pool/refresh_s (1.25 s per
 # iteration on the L40S at the former default --pool-refresh 0.125, so ~0.6 s at the
@@ -108,6 +109,20 @@
 #   sbatch --export=ALL,ENCODER_INIT=none,INIT_FROM=$INIT,EXTRA_ARGS="--no-encoder-freeze --encoder-lr-scale 0.1 --lr 1e-4 --total-env-steps 500000000 --encoder-epochs 1 --encoder-train-until 0.3 --eval-every 60" rl/cluster/ppo_l40s.slurm
 # (run name ppo_cnn-ftcont_k16_cont20-400-plr_b1024_s0_ft4410759_e2e_ee1_eu0.3_<jobid>)
 #
+# Hard-target fine-tuning (PLAN.md "Future fine-tuning"): from a pool run's best snapshot,
+# encoder frozen (ENCODER_INIT=none keeps its encoder); a quarter of the good-scenario
+# episodes start on a ring 0.05-0.5 deg around the slot's best tilt (--near-best-frac,
+# --near-best-radius; covers the neighbouring lower-order pattern), the good pool slots
+# 20 / 20 / 25 / 35 % per target-region bin (--pool-region-mix, rejection with per-bin
+# quotas: the refresh scans ~3.2x the candidates of the natural pool, ~2 s instead of
+# ~0.6 s per iteration on the L40S, the start fill ~30 s; pool/refresh_s, pool/region_*,
+# pool/rejected in the logs), best.pt on the mean over the four eval_region/ bins
+# (--best-metric region, logged as best/value), the entropy target from the base
+# policy's ~1.5 nats; ~6 s per iteration, so --eval-every 150 is ~15 min:
+#   INIT=/ix1/kchen/evv/multireflection/rl_runs/4413333/best_snapshot_it<N>.pt
+#   sbatch --time=06:00:00 --export=ALL,ENCODER_INIT=none,INIT_FROM=$INIT,EXTRA_ARGS="--near-best-frac 0.25 --near-best-radius 0.05 0.5 --pool-region-mix 0.2,0.2,0.25,0.35 --best-metric region --lr 1e-4 --total-env-steps 200000000 --ent-target-start 1.5 --ent-target-end 0.7 --eval-every 150" rl/cluster/ppo_l40s.slurm
+# (run name ppo_cnn-ftcont_k16_cont20-400-plr_b1024_s0_ft4413333_nb0.25_rmix_bmregion_<jobid>)
+#
 # Learning sanity checks (short jobs; set --time on the sbatch line):
 #   (a) measured cell only, every episode starts at the nominal tilt (-0.38, 0.27); the
 #       agent must reach the trapped region and stop. Oracle return from that start
@@ -124,12 +139,13 @@
 # Resume / continue (same run dir; the config comes from latest.pt, only the run-control
 # flags total-env-steps, eval-every, ckpt-minutes, wandb, wandb-project, unfreeze-at,
 # encoder-lr-scale, encoder-epochs, encoder-train-until, compile, target-kl, eval-sampled,
-# enc-checkpoint, eval-sets, eval-tables may change; ATLAS, INIT_FROM,
-# SCENARIOS, the ranges and pool-refresh are not passed (the pool's slots, refresh share
-# and stream position come from latest.pt; a changed total-env-steps moves the
-# encoder-train-until step with it, like the lr schedule); a run started before
-# --eval-sets keeps the sets it evaluated (cont, full, offgrid, extrap_*, set4, each also
-# sampled) unless EXTRA_ARGS="--eval-sets cont,cont_samp,region,set4" is given; new keys
+# enc-checkpoint, eval-sets, eval-tables, near-best-frac, near-best-radius, best-metric
+# may change (a new best metric restarts the best value); ATLAS, INIT_FROM,
+# SCENARIOS, the ranges, pool-refresh and pool-region-mix are not passed (the pool's
+# slots, refresh share, region quotas and stream position come from latest.pt; a changed
+# total-env-steps moves the encoder-train-until step with it, like the lr schedule); a run
+# started before --eval-sets keeps the sets it evaluated (cont, full, offgrid, extrap_*,
+# set4, each also sampled) unless EXTRA_ARGS="--eval-sets cont,cont_samp,region,set4" is given; new keys
 # (e.g. eval_region/) of a resumed run go to W&B only: eval.csv keeps its header):
 #   sbatch --export=ALL,RUN_ID=<jobid of the first job> rl/cluster/ppo_l40s.slurm
 #   sbatch --export=ALL,RUN_ID=<jobid>,EXTRA_ARGS="--total-env-steps 300000000 --unfreeze-at 1600" rl/cluster/ppo_l40s.slurm

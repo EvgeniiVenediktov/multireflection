@@ -313,3 +313,15 @@ checkpoints keep their sets). Run 4410759 at iteration 1600 (argmax, region set)
   pattern at 0.55-0.65 of P_ref after 8-10 moves.
 - Option not yet decided: fill the pool stratified by target-region size (tiny / small /
   medium / large 25 % each instead of the natural 6 / 9 / 19 / 66 %).
+
+**Implemented (2026-10-16), fine-tuning options** (all off by default; defaults bit-identical
+to 493776e, `tests/test_finetune.py`): `--near-best-frac F --near-best-radius RMIN RMAX`
+(pool runs: a share F of the good-scenario episodes starts at the slot's best tilt plus a
+ring offset, r uniform in [RMIN, RMAX], clamped to the box; impossible scenarios uniform;
+22 % of the good slots have their best tilt on the box edge, so ~16 % of the ring starts
+are clamped and ~3.5 % land closer than 0.05 deg); `--pool-region-mix a,b,c,d` (good-slot
+shares per target-region bin, rejection with per-bin quotas; a refresh refills each slot
+from its own bin, so the shares stay exact); `--best-metric region` (best.pt on the
+bin-balanced mean of eval_region/ % of the oracle). Planned run from r4b's best snapshot:
+F 0.25, ring 0.05-0.5 deg, mix 20 / 20 / 25 / 35 %, lr 1e-4, 2e8 env steps, entropy target
+1.5 -> 0.7 nats (`cluster/ppo_l40s.slurm`).

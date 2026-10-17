@@ -96,7 +96,16 @@ reset and their generation (slot_gen) increments: the env copies parameters, P_r
 generation at the draw, and an episode updates its slot's score only if the generation
 still matches. Draws and the PLR replay as ScenarioSampler, within the pool. stats() adds
 pool/... (fill time, candidates, clipped / missed shares, good share of the valid ones per
-separation bin, slot histogram). Host syncs only in refresh() and stats().
+separation bin, slot histogram, target-region bin shares of the good slots). Host syncs
+only in refresh() and stats().
+Region quotas (PoolConfig.region_mix, one share per target-region bin of REGION_EDGES;
+empty = the natural distribution): the good slots are filled by rejection with per-bin
+quotas (region_quotas: largest remainder of share x good slots), the next good scenarios
+of each bin in stream order until its quota is met (good ones of a full bin inside the
+used prefix are discarded), placed in stream order; a refresh replaces the same oldest
+slots and refills each with a scenario of the bin it held, so the realized shares stay
+exactly the initial quotas. The scan cost per fill grows with the rarest bin's quota /
+natural share (tiny: 20 % / 6.3 % = 3.2x the natural cost).
 
 Continuous eval table (ContConfig, build_cont_table; ppo.py eval_cont/): the valid
 candidates of the shortest prefix of STREAM_EVAL (seeded) that holds n x 0.9 good and n x
@@ -1451,9 +1460,35 @@ class PoolConfig:
     round_min: int = 1024  # Candidates per scan round: the expected need x 1.1, clamped
     round_max: int = 1 << 16
     max_candidates: int = 1 << 25  # Per fill; beyond: error (ranges without good scenarios)
+    region_mix: Tuple[float, ...] = ()  # Good-slot share per target-region bin; () = natural
+
+
+def region_quotas(mix, n: int) -> List[int]:
+    """Per-bin counts of n slots for the shares mix (normalized): floor of share x n,
+    the remainder one each to the largest fractional parts (ties: lower bin first)."""
+    m = np.asarray(mix, dtype=np.float64)
+    assert m.ndim == 1 and bool((m >= 0).all()) and float(m.sum()) > 0, f"region mix {mix}"
+    x = m / m.sum() * n
+    q = np.floor(x).astype(np.int64)
+    for j in np.argsort(-(x - q), kind="stable")[:n - int(q.sum())]:
+        q[j] += 1
+    return [int(v) for v in q]
+
+
+def parse_region_mix(spec: str) -> Tuple[float, ...]:
+    """--pool-region-mix a,b,c,d: one share per target-region bin (REGION_BINS), >= 0,
+    summing to 1 (within 1e-3); "" = () (the natural distribution)."""
+    if not spec:
+        return ()
+    m = tuple(float(x) for x in spec.split(","))
+    assert len(m) == len(REGION_BINS), f"region mix {spec!r}: one share per bin {REGION_BINS}"
+    assert all(x >= 0 for x in m) and abs(sum(m) - 1.0) < 1e-3, f"region mix {spec!r}: shares >= 0, sum 1"
+    return m
 
 
 POOL_ROWS = ("candidates", "angle_rejected", "clipped", "missed", "valid", "good", "box_zero")
+_POS = "_pos"  # Fill rows: stream position (not a slot field)
+_RBIN = "_rbin"  # Fill rows: target-region bin
 
 
 class ScenarioPool(ScenarioSampler):
@@ -1479,6 +1514,12 @@ class ScenarioPool(ScenarioSampler):
         self.n_good_slots, self.n_imp_slots = N - n_imp, n_imp
         assert self.n_good_slots > 0, "pool too small"
         self.bins = cont_sep_bins(*pc.ranges.sep)
+        self.cell = float(self.scanner.cfg.step) ** 2  # Box cell area (deg^2)
+        self.quotas = region_quotas(pc.region_mix, self.n_good_slots) if pc.region_mix else None
+        if pc.region_mix:
+            assert len(pc.region_mix) == len(REGION_EDGES) + 1, "one region share per bin"
+        # Lifetime good scenarios per target-region bin over the used stream prefix
+        self.cum_rbin = np.zeros(len(REGION_EDGES) + 1, dtype=np.int64)
         self.cursor = 0  # Next candidate of the stream
         self.ptr = [0, 0]  # Oldest good / impossible slot (ring order)
         self.filled_iter = 0
@@ -1489,7 +1530,7 @@ class ScenarioPool(ScenarioSampler):
         self.cum = np.zeros((len(POOL_ROWS), nb), dtype=np.int64)
         _sync(dev)
         t0 = time.perf_counter()
-        g, i, st = self._fill(self.n_good_slots, self.n_imp_slots)
+        g, i, st = self._fill(self.n_good_slots, self.n_imp_slots, self.quotas)
         d = {k: torch.cat((g[k], i[k])) for k in Atlas.TENSORS}
         _sync(dev)
         st["refresh_s"] = time.perf_counter() - t0
@@ -1506,6 +1547,11 @@ class ScenarioPool(ScenarioSampler):
             f"{pc.ranges.tag()} (laser pitch {pc.ranges.pitch}, yaw {pc.ranges.yaw} deg, offsets "
             f"over r = {pc.ranges.offset_radius} mm), filled in {st['refresh_s']:.1f} s: "
             + self._fill_text(st))
+        log("pool: good slots per target-region bin (" + "/".join(REGION_BINS) + ") "
+            + " / ".join(f"{100 * v:.1f}" for v in self.region_shares().values()) + " %"
+            + (f" (quotas {'/'.join(map(str, self.quotas))} of mix {pc.region_mix}; "
+               f"{st['rejected']} good candidates of the prefix discarded)" if self.quotas else
+               " (natural)"))
 
     def key(self) -> Dict[str, Any]:
         """Scan settings of the slot table (Atlas.check) and the pool settings."""
@@ -1525,40 +1571,54 @@ class ScenarioPool(ScenarioSampler):
     # ── Filling ──
 
     @torch.no_grad()
-    def _fill(self, k_g: int, k_i: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor],
-                                                  Dict[str, float]]:
+    def _fill(self, k_g: int, k_i: int, quotas: Optional[List[int]] = None
+              ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, float]]:
         """The next k_g good and k_i impossible valid scenarios of the candidate stream
-        (atlas fields, on the device) and the fill statistics (host syncs). Rounds of
-        candidates from the cursor (candidate_batch: angle bounds, beam check), box scan
-        of the valid ones only; the used prefix ends at the last scenario taken, the
-        cursor moves to its end (candidates scanned past it are read again by the next
-        fill)."""
+        (atlas fields, on the device, plus _pos stream position and _rbin target-region
+        bin per row) and the fill statistics (host syncs). Rounds of candidates from the
+        cursor (candidate_batch: angle bounds, beam check), box scan of the valid ones
+        only; the used prefix ends at the last scenario taken, the cursor moves to its end
+        (candidates scanned past it are read again by the next fill). quotas (per
+        target-region bin, sum k_g): the next quotas[j] good ones of each bin instead
+        (rejection: good ones of a full bin inside the prefix are discarded), the good
+        rows in stream order; round sizes from the running share of the scarcest bin."""
         pc, sc = self.pcfg, self.scanner
-        nb = len(self.bins)
-        need = [k_g, k_i]
-        taken: List[List[Dict[str, torch.Tensor]]] = [[], []]
+        nb, nr = len(self.bins), len(REGION_EDGES) + 1
+        if quotas is not None:
+            assert len(quotas) == nr and sum(quotas) == k_g, (quotas, k_g)
+        need = [k_g, k_i] if quotas is None else list(quotas) + [k_i]  # Groups: good..., impossible
+        ng = len(need) - 1
+        taken: List[List[Dict[str, torch.Tensor]]] = [[] for _ in need]
         cnt = np.zeros((len(POOL_ROWS), nb), dtype=np.int64)
+        cnt_r = np.zeros(nr, dtype=np.int64)  # Good per target-region bin, used prefix
         scanned = scans = 0
-        while need[0] > 0 or need[1] > 0:
+        while any(k > 0 for k in need):
             tot = (self.cum + cnt).sum(1)  # Running shares: lifetime and this fill
-            share_g = (tot[5] + 1.0) / (tot[0] + 2.0)
             share_i = (tot[4] - tot[5] + 1.0) / (tot[0] + 2.0)
-            want = max(need[0] / share_g, need[1] / share_i)
+            if quotas is None:
+                share_g = (tot[5] + 1.0) / (tot[0] + 2.0)
+                want = max(need[0] / share_g, need[1] / share_i)
+            else:
+                share_r = (self.cum_rbin + cnt_r + 1.0) / (tot[0] + 2.0)
+                want = max(max(need[j] / share_r[j] for j in range(nr)), need[-1] / share_i)
             n = int(min(max(math.ceil(1.1 * want), pc.round_min), pc.round_max))
             b = candidate_batch(pc.ranges, pc.seed, self.cursor, n, STREAM_POOL, sc)
             vid = np.nonzero(b["valid"])[0]
             d = sc.scan(torch.from_numpy(b["params"][vid]), zero_cells=True)
             scans += vid.size
             good = d["good"]
+            d[_POS] = torch.from_numpy(vid + self.cursor).to(good.device)
+            d[_RBIN] = region_bin(d["near_cells"].double() * self.cell)
             end = n  # Used prefix of this round
             lasts = []
-            for j, grp in enumerate((good, ~good)):
+            grps = ((good,) if quotas is None else tuple(good & (d[_RBIN] == j) for j in range(nr)))
+            for j, grp in enumerate(grps + (~good,)):
                 rows = torch.nonzero(grp).squeeze(1)[:need[j]]
                 if rows.numel():
                     taken[j].append({k: v[rows] for k, v in d.items()})
                     need[j] -= rows.numel()
                     lasts.append(int(vid[int(rows[-1])]))
-            if need[0] == 0 and need[1] == 0:
+            if all(k == 0 for k in need):
                 end = max(lasts) + 1 if lasts else 0
             # Stage counts over the used prefix of the round, per separation bin
             band = sep_band(b["params"][:end, 0], self.bins)
@@ -1571,26 +1631,36 @@ class ScenarioPool(ScenarioSampler):
                 np.add.at(cnt[row], band[sel], 1)
             np.add.at(cnt[5], bv[gv], 1)
             np.add.at(cnt[6], bv[zv], 1)
+            np.add.at(cnt_r, d[_RBIN].cpu().numpy()[vin][gv], 1)
             self.cursor += end
             scanned += n
             if scanned > pc.max_candidates:
                 raise RuntimeError(f"pool: {scanned} candidates without filling {k_g} good / {k_i} "
-                                   f"impossible slots; check the ranges or the impossible share")
+                                   f"impossible slots (region quotas {quotas}); check the ranges, "
+                                   f"the impossible share or the region mix")
         self.cum += cnt
+        self.cum_rbin += cnt_r
         tot = cnt.sum(1)
-        cat = lambda j: {k: torch.cat([t[k] for t in taken[j]]) for k in taken[j][0]} \
-            if taken[j] else {k: v[:0] for k, v in d.items()}
+        cat = lambda lst: {k: torch.cat([t[k] for t in lst]) for k in lst[0]} \
+            if lst else {k: v[:0] for k, v in d.items()}
+        g = cat([t for j in range(ng) for t in taken[j]])
+        if quotas is not None:  # Bins concatenated: back to stream order
+            o = torch.argsort(g[_POS])
+            g = {k: v[o] for k, v in g.items()}
         c0, cv = max(int(tot[0]), 1), max(int(tot[4]), 1)
         st = {"candidates": scanned, "prefix": int(tot[0]), "valid": int(tot[4]), "scans": scans,
               "angle_rejected_share": float(tot[1] / c0), "clipped_share": float(tot[2] / c0),
               "missed_share": float(tot[3] / c0), "valid_share": float(tot[4] / c0),
-              "good_share": float(tot[5] / cv), "box_zero_share": float(tot[6] / cv)}
-        return cat(0), cat(1), st
+              "good_share": float(tot[5] / cv), "box_zero_share": float(tot[6] / cv),
+              "rejected": int(tot[5]) - k_g}
+        return g, cat(taken[ng]), st
 
     @torch.no_grad()
     def _replace(self, iteration: int):
         """Refill the oldest refresh_frac of the good and of the impossible slots; their
-        scores reset, their generation increments (host syncs)."""
+        scores reset, their generation increments (host syncs). Region quotas: the quotas
+        of the fill are the bins of the replaced good slots, each refilled with a
+        scenario of its bin (in slot order within a bin)."""
         pc = self.pcfg
         dev = self.device
         ng, ni = self.n_good_slots, self.n_imp_slots
@@ -1598,9 +1668,15 @@ class ScenarioPool(ScenarioSampler):
         k_i = max(1, int(round(pc.refresh_frac * ni))) if ni else 0
         _sync(dev)
         t0 = time.perf_counter()
-        g, i, st = self._fill(k_g, k_i)
         sg = (self.ptr[0] + torch.arange(k_g, device=dev)) % ng
         si = ng + (self.ptr[1] + torch.arange(k_i, device=dev)) % max(ni, 1)
+        if self.quotas is None:
+            g, i, st = self._fill(k_g, k_i)
+        else:
+            rb = self.slot_rbin(sg)
+            g, i, st = self._fill(k_g, k_i, torch.bincount(rb, minlength=len(self.quotas)).tolist())
+            sg = sg[torch.argsort(rb, stable=True)]  # Slots and rows grouped by bin alike
+            g = {k: v[torch.argsort(g[_RBIN], stable=True)] for k, v in g.items()}
         slots = torch.cat((sg, si))
         at = self.atlas
         for k in Atlas.TENSORS:
@@ -1618,6 +1694,17 @@ class ScenarioPool(ScenarioSampler):
         st["refresh_s"] = time.perf_counter() - t0
         st["replaced"] = k_g + k_i
         self.last_fill = st
+
+    def slot_rbin(self, slots: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Target-region bin (int64) of slots (default all), from their near_cells."""
+        nc = self.atlas.near_cells if slots is None else self.atlas.near_cells[slots]
+        return region_bin(nc.double() * self.cell)
+
+    def region_shares(self) -> Dict[str, float]:
+        """Share of the good slots per target-region bin (region_<bin>; host sync)."""
+        rb = self.slot_rbin(torch.arange(self.n_good_slots, device=self.device))
+        c = torch.bincount(rb, minlength=len(REGION_BINS)).double() / max(self.n_good_slots, 1)
+        return {f"region_{nm}": float(v) for nm, v in zip(REGION_BINS, c.tolist())}
 
     @torch.no_grad()
     def refresh(self, iteration: int):
@@ -1645,7 +1732,10 @@ class ScenarioPool(ScenarioSampler):
         out of bounds, clipped, missed M2, valid (box-scanned) shares of the candidates,
         good share and box-check disagreement of the valid ones), lifetime good share of
         the valid candidates and valid share per separation bin, the separation
-        histogram of the good slots, mean slot age."""
+        histogram of the good slots, mean slot age, the target-region bin shares of the
+        good slots (pool/region_<bin>) and the good candidates of the last fill's used
+        prefix not taken (pool/rejected: of full region bins, or past the last good slot
+        while impossible ones were still needed)."""
         out = super().stats()
         out["plr/top_laser_dx"] = out["plr/top_laser_dy"] = math.nan
         p = self.p_replay
@@ -1665,6 +1755,8 @@ class ScenarioPool(ScenarioSampler):
         for nm, m in sep_bin_masks(sep, self.bins).items():
             out[f"pool/hist_{nm}"] = float(m.float().mean())
         out["pool/age_mean"] = float((self.iteration - self.born).double().mean())
+        out["pool/rejected"] = float(lf.get("rejected", math.nan))
+        out.update({f"pool/{k}": v for k, v in self.region_shares().items()})
         return out
 
     # ── Checkpoint ──
@@ -1674,12 +1766,13 @@ class ScenarioPool(ScenarioSampler):
         d.update(pool={k: getattr(self.atlas, k) for k in Atlas.TENSORS}, slot_gen=self.slot_gen,
                  born=self.born, cursor=self.cursor, ptr=list(self.ptr),
                  filled_iter=self.filled_iter, cum=self.cum.copy(), last_fill=dict(self.last_fill),
-                 pool_cfg=asdict(self.pcfg))
+                 pool_cfg=asdict(self.pcfg), cum_rbin=self.cum_rbin.copy())
         return d
 
     def load_state_dict(self, d: Dict[str, Any]):
         dev = self.device
-        assert d["pool_cfg"] == asdict(self.pcfg), "pool settings differ from the checkpoint"
+        have = {"region_mix": (), **d["pool_cfg"]}  # Checkpoints from before region_mix
+        assert have == asdict(self.pcfg), "pool settings differ from the checkpoint"
         for k in Atlas.TENSORS:
             getattr(self.atlas, k).copy_(d["pool"][k].to(dev))
         self.pmax = self.atlas.pmax.clamp(min=1e-6)
@@ -1687,6 +1780,7 @@ class ScenarioPool(ScenarioSampler):
         self.cursor, self.ptr, self.filled_iter = int(d["cursor"]), list(d["ptr"]), int(d["filled_iter"])
         self.cum = np.array(d["cum"], dtype=np.int64)
         self.last_fill = dict(d["last_fill"])
+        self.cum_rbin = np.array(d.get("cum_rbin", np.zeros_like(self.cum_rbin)), dtype=np.int64)
         super().load_state_dict(d)
 
 
