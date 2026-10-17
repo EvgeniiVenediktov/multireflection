@@ -1014,6 +1014,8 @@ class Trainer:
             # Expected: the old setup head; the scenario head when its range or width changed
             scen_ok = lambda k: k.startswith("scenario.") and (  # noqa: E731
                 info.get("scen_reinit") or info["skipped"][k].startswith("shape"))
+            for e in info.get("extended", []):
+                print(f"init from: {e}", flush=True)
             other = sorted(k for k in info["skipped"] if not k.startswith("setup.") and not scen_ok(k))
             print(f"init from {info['path']} ({info['name']}, iteration {info['iteration']}): "
                   f"{len(info['loaded'])} tensors loaded; skipped {sorted(info['skipped'])}; "

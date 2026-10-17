@@ -308,7 +308,7 @@ class Agent(nn.Module):
         ck = torch.load(path, map_location="cpu", weights_only=False)
         src = ck["agent"]
         own = self.state_dict()
-        loaded, skipped = [], {}
+        loaded, skipped, extended = [], {}, []
         sd = {}
         reinit = None
         acfg = ck.get("agent_cfg") or {}
@@ -322,6 +322,15 @@ class Agent(nn.Module):
                 skipped[k] = reinit
             elif k not in own:
                 skipped[k] = "not in the agent"
+            elif (k.endswith("rel_bias") and own[k].shape[:-1] == v.shape[:-1]
+                  and own[k].shape[-1] != v.shape[-1]):
+                # Other window length: keep the learned distances, extend with the
+                # oldest one (or truncate), so the policy starts out as before
+                w = own[k].shape[-1]
+                sd[k] = (torch.cat([v, v[..., -1:].expand(*v.shape[:-1], w - v.shape[-1])], -1)
+                         if w > v.shape[-1] else v[..., :w].clone())
+                loaded.append(k)
+                extended.append(f"{k}: window {v.shape[-1]} -> {w}, extended with distance {v.shape[-1] - 1}")
             elif tuple(own[k].shape) != tuple(v.shape):
                 skipped[k] = f"shape {tuple(v.shape)} != {tuple(own[k].shape)}"
             else:
@@ -332,7 +341,8 @@ class Agent(nn.Module):
         return {"path": os.path.abspath(path), "name": ck.get("name"),
                 "iteration": ck.get("iteration"), "env_steps": ck.get("env_steps"),
                 "encoder_info": ck.get("encoder_info"), "vnorm": ck.get("vnorm"),
-                "loaded": loaded, "skipped": skipped, "missing": missing, "scen_reinit": reinit}
+                "loaded": loaded, "skipped": skipped, "missing": missing, "scen_reinit": reinit,
+                "extended": extended}
 
     def compile(self, **kw):
         """torch.compile the encoder and the core (used by every call path). The
