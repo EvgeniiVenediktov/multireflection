@@ -2,7 +2,7 @@
 interactive_policy_trial.py - Interactive simulator and policy viewer (stage 2 agent)
 
 Run from rl/ (WSLg: TkAgg, the only interactive backend installed here; no Qt):
-    uv run python interactive_policy_trial.py                          # newest runs/ppo/*/best*.pt
+    uv run python interactive_policy_trial.py                          # newest runs/ppo/*/*best*.pt
     uv run python interactive_policy_trial.py --ckpt runs/ppo/<run>/best.pt
     uv run python interactive_policy_trial.py --no-ckpt                # simulator only
     uv run python interactive_policy_trial.py --selftest               # headless (Agg)
@@ -128,9 +128,9 @@ from scenarios import DEFAULT_ATLAS, AtlasConfig, load_atlas
 
 RL_DIR = os.path.dirname(os.path.abspath(__file__))
 def newest_best(root: str = os.path.join(RL_DIR, "runs", "ppo")) -> str:
-    """The most recently written best*.pt under runs/ppo/<run>/ (copies from the cluster keep
+    """The most recently written *best*.pt (r<N>-<tag>_best*.pt) under runs/ppo/<run>/ (copies from the cluster keep
     the cluster's write time with rsync -a), "" if there is none."""
-    paths = glob.glob(os.path.join(root, "*", "best*.pt"))
+    paths = glob.glob(os.path.join(root, "*", "*best*.pt"))
     return max(paths, key=os.path.getmtime) if paths else ""
 
 
@@ -2285,7 +2285,7 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
             return len(head_spec(c.get("agent_cfg") or {})[0])
 
         others = sorted(os.path.abspath(q) for q in glob.glob(
-            os.path.join(RL_DIR, "runs", "ppo", "*", "best*.pt")) if os.path.abspath(q) != a_path)
+            os.path.join(RL_DIR, "runs", "ppo", "*", "*best*.pt")) if os.path.abspath(q) != a_path)
         n_a = n_head(a_path)
         b_path = next((q for q in others if n_head(q) != n_a), others[0] if others else path5)
 
@@ -2368,7 +2368,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "the console shows the atlas and log paths at start and the checkpoint details\n"
             "(path, run name, act mode, scenario head, training range) on every load"))
     ap.add_argument("--ckpt", default=d.ckpt,
-                    help="ppo.py checkpoint (default: the newest runs/ppo/*/best*.pt)")
+                    help="ppo.py checkpoint (default: the newest runs/ppo/*/*best*.pt)")
     ap.add_argument("--no-ckpt", action="store_true", help="Simulator only")
     ap.add_argument("--atlas", default=d.atlas, help="Scenario atlas (scenarios.py)")
     ap.add_argument("--device", default=d.device)
