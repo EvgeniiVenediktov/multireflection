@@ -8,7 +8,8 @@ Run from rl/:  uv run python tests/test_sim.py
     2. trapped beam: runs to the cap (128) or the intensity cutoff (456)
     3. full M2 scan, +-2 deg at 0.01 deg (401 x 401), cap 456: triton vs torch
     4. random 13-DOF states (all stop reasons), cap 456: triton vs torch
-    5. output invariants (padding, alternation, local frame vs world hits, store_world)
+    5. output invariants (padding, alternation, local frame vs world hits, store_world,
+       miss point of missed rays past the rim)
     6. the old env self-test (herriott_env.py) still runs
 """
 
@@ -40,6 +41,7 @@ from herriott_sim import (  # noqa: E402
     STOP_CAP,
     STOP_HOLE,
     STOP_INTENSITY,
+    STOP_MISSED,
     STOP_NAMES,
     HerriottSim,
 )
@@ -85,6 +87,8 @@ def compare(name: str, ref: dict, out: dict) -> torch.Tensor:
     stop_same = bool((ref["stop_reason"] == out["stop_reason"])[eq].all())
     mirror_same = bool((ref["hit_mirror"] == out["hit_mirror"])[eq].all())
     local_abs = (ref["hit_local_xy"][eq] - out["hit_local_xy"][eq]).abs().max().item()
+    miss_same = bool((ref["miss_mirror"] == out["miss_mirror"])[eq].all())
+    miss_abs = (ref["miss_local_xy"][eq] - out["miss_local_xy"][eq]).abs().max().item()
     world_abs = (ref["hit_sequence"][eq] - out["hit_sequence"][eq]).abs().max().item()
     inten_rel = (
         ((ref["intensity"] - out["intensity"]).abs() / ref["intensity"])[eq].max().item()
@@ -99,6 +103,8 @@ def compare(name: str, ref: dict, out: dict) -> torch.Tensor:
           f"stop_reason identical {stop_same}, hit_mirror identical {mirror_same}")
     print(f"                         hit_local_xy max |diff| {local_abs:.2e} mm, "
           f"world xyz max |diff| {world_abs:.2e} mm, intensity rel err max {inten_rel:.2e}")
+    print(f"                         miss_mirror identical {miss_same}, "
+          f"miss_local_xy max |diff| {miss_abs:.2e} mm")
     print(f"  path bit-identical:    {100 * bit_exact:.4f} %")
 
     assert frac >= MIN_COUNT_AGREE, f"{name}: hit_counts agree on {frac:.5f}"
@@ -106,6 +112,8 @@ def compare(name: str, ref: dict, out: dict) -> torch.Tensor:
     assert stop_same, f"{name}: stop_reason differs"
     assert mirror_same, f"{name}: hit_mirror differs"
     assert local_abs < MAX_LOCAL_ABS, f"{name}: hit_local_xy diff {local_abs}"
+    assert miss_same, f"{name}: miss_mirror differs"
+    assert miss_abs < MAX_LOCAL_ABS, f"{name}: miss_local_xy diff {miss_abs}"
     return ~eq
 
 
@@ -125,6 +133,14 @@ def check_invariants(name: str, sim: HerriottSim, state: torch.Tensor, out: dict
     assert bool(((hm > 0) == stored).all()), "hit_mirror padding"
     assert bool((out["hit_local_xy"][~stored] == 0).all()), "hit_local_xy padding"
     assert bool((out["hit_sequence"][~stored] == 0).all()), "hit_sequence padding"
+    # Miss point: missed rays only, past the rim of the mirror they were heading to
+    mm = out["miss_mirror"].long()
+    assert out["miss_mirror"].dtype == torch.int8
+    assert not bool(((mm > 0) & (out["stop_reason"] != STOP_MISSED)).any()), "miss_mirror"
+    assert bool((out["miss_local_xy"][mm == 0] == 0).all()), "miss_local_xy padding"
+    ap = torch.where(mm == 1, sim.m1_aperture, sim.m2_aperture)
+    r_miss = out["miss_local_xy"].norm(dim=-1)
+    assert bool((r_miss >= ap - 1e-4)[mm > 0].all()), "miss point inside the aperture"
     same_twice = (hm[:, 1:] == hm[:, :-1]) & stored[:, 1:]
     assert not bool(same_twice.any()), "same mirror twice in a row"
 

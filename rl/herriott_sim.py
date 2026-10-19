@@ -268,6 +268,13 @@ class HerriottSim:
         return out if len(out) > 1 else valid
 
     @staticmethod
+    def _in_slab(hit: torch.Tensor, position: torch.Tensor, normal: torch.Tensor,
+                 sag: float) -> torch.Tensor:
+        """The cap-slab part of _check_aperture (same arithmetic), any radius."""
+        dot_normal = ((hit - position) * normal).sum(dim=-1)
+        return (dot_normal >= 0) & (dot_normal < sag + 1)
+
+    @staticmethod
     def _front_side(
         hit: torch.Tensor,
         directions: torch.Tensor,
@@ -297,8 +304,9 @@ class HerriottSim:
                 "triton" for CUDA states, "torch" otherwise
             store_world: also return the world-frame hit_sequence (otherwise
                 hit_sequence is None)
-            store_hits: also return hit_mirror / hit_local_xy (otherwise None; the
-                triton backend then skips the per-hit stores, for large scans)
+            store_hits: also return hit_mirror / hit_local_xy / miss_mirror /
+                miss_local_xy (otherwise None; the triton backend then skips the
+                per-hit stores, for large scans)
 
         Returns:
             dict with (N = sim_cfg.max_bounces):
@@ -315,6 +323,12 @@ class HerriottSim:
                 - exited_hole: (B,) bool, stop_reason == STOP_HOLE: the ray ended
                   by leaving through the M1 hole (reached it from the
                   reflective side)
+                - miss_mirror: (B,) int8, for a ray that ended STOP_MISSED the
+                  mirror it was heading to (1 or 2) when it crosses that mirror's
+                  sphere on the front side within the cap slab of the aperture test
+                  (outside the aperture: past the rim), else 0
+                - miss_local_xy: (B, 2) that crossing in the mirror's local
+                  (lx, ly) (0 where miss_mirror is 0)
         """
         assert (
             state.shape[1] == STATE_DIM
@@ -329,7 +343,8 @@ class HerriottSim:
         if backend == "torch":
             out = self._simulate_torch(state, store_world=store_world)
             if not store_hits:
-                out["hit_mirror"] = out["hit_local_xy"] = None
+                for k in ("hit_mirror", "hit_local_xy", "miss_mirror", "miss_local_xy"):
+                    out[k] = None
             return out
         raise ValueError(f"Unknown backend {backend!r}, expected one of {BACKENDS}")
 
@@ -407,6 +422,8 @@ class HerriottSim:
         stop_reason = torch.full(
             (B,), STOP_CAP, dtype=torch.int8, device=self.device
         )
+        miss_mirror = torch.zeros(B, dtype=torch.int8, device=self.device)
+        miss_local_xy = torch.zeros(B, 2, device=self.device, dtype=self.dtype)
         inf = torch.tensor(float("inf"), device=self.device)
 
         for bounce in range(N):
@@ -420,6 +437,7 @@ class HerriottSim:
             t2_near, v2_near, t2_far, v2_far = self._ray_sphere_intersect(
                 origins, directions, m2_center, self.m2_cfg.roc
             )
+            roots = (v1_near, v1_far, v2_near, v2_far)  # Before the aperture tests
 
             # Compute hit points for all four candidates
             hit1_near = origins + t1_near.unsqueeze(-1) * directions
@@ -553,6 +571,26 @@ class HerriottSim:
             ).to(torch.int8)
             stop_reason = torch.where(stopping, reason, stop_reason)
 
+            # A missed ray: where it crosses the sphere of the mirror it was heading
+            # to (front side, cap slab, past the rim); the near root if it qualifies
+            r1_near, r1_far, r2_near, r2_far = roots
+            c1_near = r1_near & f1_near & self._in_slab(hit1_near, m1_pos, m1_normal, self.m1_sag)
+            c1_far = r1_far & f1_far & self._in_slab(hit1_far, m1_pos, m1_normal, self.m1_sag)
+            c2_near = r2_near & f2_near & self._in_slab(hit2_near, m2_pos, m2_normal, self.m2_sag)
+            c2_far = r2_far & f2_far & self._in_slab(hit2_far, m2_pos, m2_normal, self.m2_sag)
+            to_m2 = last_hit_mirror != 2
+            crossed = torch.where(to_m2, c2_near | c2_far, c1_near | c1_far)
+            missed = stopping & (reason == STOP_MISSED) & crossed
+            lxy_miss = torch.where(
+                to_m2.unsqueeze(-1),
+                torch.where(c2_near.unsqueeze(-1), lxy2_near, lxy2_far),
+                torch.where(c1_near.unsqueeze(-1), lxy1_near, lxy1_far),
+            )
+            miss_mirror = torch.where(
+                missed, torch.where(to_m2, 2, 1).to(torch.int8), miss_mirror
+            )
+            miss_local_xy = torch.where(missed.unsqueeze(-1), lxy_miss, miss_local_xy)
+
             active = active & any_hit
             if not active.any():
                 break
@@ -612,6 +650,8 @@ class HerriottSim:
             "intensity": intensity,
             "stop_reason": stop_reason,
             "exited_hole": exited_hole,
+            "miss_mirror": miss_mirror,
+            "miss_local_xy": miss_local_xy,
         }
 
 

@@ -21,7 +21,7 @@ Design:
     - per-bounce outputs are masked stores (active lanes, column `bounce`) into
       zero-filled tensors allocated once by the wrapper; world xyz only with
       STORE_WORLD, mirror id and local xy only with STORE_HITS; per-ray outputs are
-      stored once after the loop
+      stored once after the loop (the miss point of a missed ray only with STORE_HITS)
     - no host syncs, no intermediate global tensors
     - same formulas as the reference with its rounding reproduced: IEEE sqrt / div /
       sin / cos, no FMA contraction (enable_fp_fusion=False), torch's einsum and size-3
@@ -122,9 +122,10 @@ def _candidate(
     aperture, sag_p1, hole_r, hole_y,
     HAS_HOLE: tl.constexpr,
 ):
-    """Hit point, local (lx, ly), aperture / hole / front-side tests of one root.
+    """Hit point, local (lx, ly), aperture / hole / front-side / cap-slab tests of one
+    root.
 
-    As HerriottSim._check_aperture and _front_side.
+    As HerriottSim._check_aperture, _front_side and _in_slab.
     """
     hx = ox + t * dx
     hy = oy + t * dy
@@ -136,7 +137,8 @@ def _candidate(
     ly = (rx * yax + rz * yaz) + ry * yay
     r = tl.sqrt_rn(lx * lx + ly * ly)
     dn = (rx * nx + rz * nz) + ry * ny
-    ap = (r < aperture) & (dn >= 0.0) & (dn < sag_p1)
+    slab = (dn >= 0.0) & (dn < sag_p1)
+    ap = (r < aperture) & slab
     if HAS_HOLE:
         hly = ly - hole_y
         hd = tl.sqrt_rn(lx * lx + hly * hly)
@@ -145,7 +147,7 @@ def _candidate(
     else:
         in_hole = ap & (ap == 0)
     front = ((dx * (cx - hx) + dz * (cz - hz)) + dy * (cy - hy)) < 0.0
-    return hx, hy, hz, lx, ly, ap, in_hole, front
+    return hx, hy, hz, lx, ly, ap, in_hole, front, slab
 
 
 # ── Kernel ──────────────────────────────────────────────────────────────────
@@ -155,7 +157,7 @@ def _candidate(
 def _trace_kernel(
     state_ptr,
     counts_ptr, path_ptr, inten_ptr, stop_ptr, exited_ptr, final_ptr,
-    mirror_ptr, local_ptr, world_ptr,
+    mirror_ptr, local_ptr, world_ptr, miss_mirror_ptr, miss_local_ptr,
     B, cap,
     m1_rr, m1_roc, m1_inv_roc, m1_ap, m1_sag_p1, m1_hole_r, m1_hole_y, m1_refl,
     m2_rr, m2_roc, m2_inv_roc, m2_ap, m2_sag_p1, m2_refl,
@@ -238,6 +240,9 @@ def _trace_kernel(
     fx = tl.zeros([BLOCK], dtype=tl.float32)
     fy = tl.zeros([BLOCK], dtype=tl.float32)
     fz = tl.zeros([BLOCK], dtype=tl.float32)
+    miss_m = tl.zeros([BLOCK], dtype=tl.int32)
+    miss_x = tl.zeros([BLOCK], dtype=tl.float32)
+    miss_y = tl.zeros([BLOCK], dtype=tl.float32)
     hit_base = row * cap
 
     bounce = 0
@@ -247,24 +252,28 @@ def _trace_kernel(
         a = (dx * dx + dz * dz) + dy * dy
         t1n, v1n, t1f, v1f = _sphere_roots(ox, oy, oz, dx, dy, dz, c1x, c1y, c1z, m1_rr, a)
         t2n, v2n, t2f, v2f = _sphere_roots(ox, oy, oz, dx, dy, dz, c2x, c2y, c2z, m2_rr, a)
+        r1n = v1n  # Before the aperture tests (miss point)
+        r1f = v1f
+        r2n = v2n
+        r2f = v2f
 
         # Candidate hits, local coordinates, aperture / hole / front-side tests
-        h1nx, h1ny, h1nz, l1nx, l1ny, ap1n, hole1n, f1n = _candidate(
+        h1nx, h1ny, h1nz, l1nx, l1ny, ap1n, hole1n, f1n, s1n = _candidate(
             t1n, ox, oy, oz, dx, dy, dz,
             p1x, p1y, p1z, a00, zero, a20, a01, a11, a21, n1x, n1y, n1z, c1x, c1y, c1z,
             m1_ap, m1_sag_p1, m1_hole_r, m1_hole_y, True,
         )
-        h1fx, h1fy, h1fz, l1fx, l1fy, ap1f, hole1f, f1f = _candidate(
+        h1fx, h1fy, h1fz, l1fx, l1fy, ap1f, hole1f, f1f, s1f = _candidate(
             t1f, ox, oy, oz, dx, dy, dz,
             p1x, p1y, p1z, a00, zero, a20, a01, a11, a21, n1x, n1y, n1z, c1x, c1y, c1z,
             m1_ap, m1_sag_p1, m1_hole_r, m1_hole_y, True,
         )
-        h2nx, h2ny, h2nz, l2nx, l2ny, ap2n, hole2n, f2n = _candidate(
+        h2nx, h2ny, h2nz, l2nx, l2ny, ap2n, hole2n, f2n, s2n = _candidate(
             t2n, ox, oy, oz, dx, dy, dz,
             p2x, p2y, p2z, b00, zero, b20, b01, b11, b21, n2x, n2y, n2z, c2x, c2y, c2z,
             m2_ap, m2_sag_p1, 0.0, 0.0, False,
         )
-        h2fx, h2fy, h2fz, l2fx, l2fy, ap2f, hole2f, f2f = _candidate(
+        h2fx, h2fy, h2fz, l2fx, l2fy, ap2f, hole2f, f2f, s2f = _candidate(
             t2f, ox, oy, oz, dx, dy, dz,
             p2x, p2y, p2z, b00, zero, b20, b01, b11, b21, n2x, n2y, n2z, c2x, c2y, c2z,
             m2_ap, m2_sag_p1, 0.0, 0.0, False,
@@ -340,6 +349,22 @@ def _trace_kernel(
             exit_now, _K_HOLE, tl.where(t_block < _INF, _K_BLOCKED, _K_MISSED)
         )
         stop = tl.where(stopping, reason, stop)
+
+        # A missed ray: where it crosses the sphere of the mirror it was heading to
+        # (front side, cap slab, past the rim); the near root if it qualifies
+        if STORE_HITS:
+            c1n = r1n & f1n & s1n
+            c1f = r1f & f1f & s1f
+            c2n = r2n & f2n & s2n
+            c2f = r2f & f2f & s2f
+            to2 = last != 2
+            crossed = tl.where(to2, c2n | c2f, c1n | c1f)
+            missed = stopping & (reason == _K_MISSED) & crossed
+            mx = tl.where(to2, tl.where(c2n, l2nx, l2fx), tl.where(c1n, l1nx, l1fx))
+            my = tl.where(to2, tl.where(c2n, l2ny, l2fy), tl.where(c1n, l1ny, l1fy))
+            miss_m = tl.where(missed, tl.where(to2, 2, 1), miss_m)
+            miss_x = tl.where(missed, mx, miss_x)
+            miss_y = tl.where(missed, my, miss_y)
         active = active & any_hit
 
         # Selected hit
@@ -398,6 +423,10 @@ def _trace_kernel(
     tl.store(final_ptr + row * 3, fx, mask=lane)
     tl.store(final_ptr + row * 3 + 1, fy, mask=lane)
     tl.store(final_ptr + row * 3 + 2, fz, mask=lane)
+    if STORE_HITS:
+        tl.store(miss_mirror_ptr + row, miss_m.to(tl.int8), mask=lane)
+        tl.store(miss_local_ptr + row * 2, miss_x, mask=lane)
+        tl.store(miss_local_ptr + row * 2 + 1, miss_y, mask=lane)
 
 
 # ── Python wrapper ──────────────────────────────────────────────────────────
@@ -439,9 +468,10 @@ def simulate_triton(
     store_hits: bool = True,
 ) -> dict:
     """Trace (B, 13) states with the fused kernel; same dict as the torch backend.
-    store_hits False: no per-hit outputs (hit_mirror / hit_local_xy None, the stores are
-    compiled out and the (B, N) buffers are not allocated); the per-ray outputs are
-    unchanged (large scans: the zero-fill of the hit buffers dominates otherwise)."""
+    store_hits False: no per-hit outputs (hit_mirror / hit_local_xy / miss_mirror /
+    miss_local_xy None, the stores are compiled out and the (B, N) buffers are not
+    allocated); the per-ray outputs are unchanged (large scans: the zero-fill of the hit
+    buffers dominates otherwise)."""
     assert state.is_cuda, "triton backend needs a CUDA state"
     assert state.shape[1] == STATE_DIM, f"Expected state dim {STATE_DIM}"
     state = state.to(torch.float32).contiguous()
@@ -460,6 +490,8 @@ def simulate_triton(
     hn = (B, N) if store_hits else (1, 1)
     hit_mirror = torch.zeros(*hn, dtype=torch.int8, device=dev)
     hit_local = torch.zeros(*hn, 2, dtype=torch.float32, device=dev)
+    miss_mirror = torch.empty(hn[0], dtype=torch.int8, device=dev)
+    miss_local = torch.empty(hn[0], 2, dtype=torch.float32, device=dev)
     hit_world = (
         torch.zeros(B, N, 3, dtype=torch.float32, device=dev) if store_world else None
     )
@@ -469,6 +501,7 @@ def simulate_triton(
             state,
             counts, path, intensity, stop, exited, final,
             hit_mirror, hit_local, hit_world if store_world else hit_local,
+            miss_mirror, miss_local,
             B, N,
             *_mirror_args(sim),
             STATE_STRIDE=STATE_DIM,
@@ -489,4 +522,6 @@ def simulate_triton(
         "intensity": intensity,
         "stop_reason": stop,
         "exited_hole": exited,
+        "miss_mirror": miss_mirror if store_hits else None,
+        "miss_local_xy": miss_local if store_hits else None,
     }
