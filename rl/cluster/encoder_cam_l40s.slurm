@@ -10,16 +10,20 @@
 # stem copied to 3 channels at 1/3; heads and model config from INIT (the D7 continuous
 # encoder that r2-r6 descend from); frames of SCENARIOS = 16,384 continuous scenarios
 # (separation SEP_RANGE 20-400 mm, laser LASER_RANGE -8..8 deg, offset radius 1.5 mm) plus
-# the four named setups; STEPS 16000 at batch 256, peak lr 3e-4, warmup 300, cosine to
-# 1 %; W&B project rl-encoder. Run name e.g.
-#     cnn_w160_lr0.0003_b256_16k_s0_ft-r6_cont20-400x16384_cam
+# the four named setups; batch 256, peak lr 3e-4, warmup 300; trained to convergence
+# (CONVERGE=1, default: pretrain_encoder.py --converge, the lr drops on validation-loss
+# plateaus and the run stops after the last one; STEPS 400000 is only a cap, reaching it
+# fails the job with exit code 3 so an afterok chain never starts from an unconverged
+# encoder). CONVERGE=0: fixed cosine schedule over STEPS (to 1 %). W&B project rl-encoder.
+# Run name e.g.
+#     cnn_w160_lr0.0003_b256_400k_s0_ft-r6_cont20-400x16384_cam
 #
 # Outputs: /ix1/kchen/evv/multireflection/rl_runs/encoder/<jobid>/<run name>/
 #     {model.pt, config.json, train.csv, val.csv}   (val.csv: camera set + clean set)
 # and a copy of model.pt next to the job dirs: .../rl_runs/encoder/<run name>.pt
 #
 # Settings from the environment: INIT, INIT_AGENT, INIT_AGENT_TAG, SCENARIOS, SEP_RANGE,
-# LASER_RANGE, LASER_OFFSET_RADIUS, STEPS, LR, WARMUP, BATCH, SEED, WANDB (default --wandb;
+# LASER_RANGE, LASER_OFFSET_RADIUS, STEPS, CONVERGE, LR, WARMUP, BATCH, SEED, WANDB (default --wandb;
 # WANDB= switches W&B off), EXTRA_ARGS (appended to pretrain_encoder.py)
 #
 # Monitor:  squeue -M gpu -u $USER      |  crc-job-stats <jobid>
@@ -33,7 +37,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -50,7 +54,8 @@ SCENARIOS="${SCENARIOS:-16384}"
 SEP_RANGE="${SEP_RANGE-20 400}"
 LASER_RANGE="${LASER_RANGE:--8 8}"
 LASER_OFFSET_RADIUS="${LASER_OFFSET_RADIUS:-1.5}"
-STEPS="${STEPS:-16000}"
+CONVERGE="${CONVERGE:-1}"
+STEPS="${STEPS:-400000}"
 LR="${LR:-3e-4}"
 WARMUP="${WARMUP:-300}"
 BATCH="${BATCH:-256}"
@@ -69,6 +74,7 @@ export WANDB_DIR="$RUN_DIR"
 
 TRAIN_ARGS=(--camera --arch cnn --steps "$STEPS" --lr "$LR" --warmup "$WARMUP" --batch "$BATCH"
             --seed "$SEED" --setups all --scenarios "$SCENARIOS" --runs-dir "$RUN_DIR")
+[ "$CONVERGE" = "1" ] && TRAIN_ARGS+=(--converge)
 if [ -n "$SEP_RANGE" ] && [ "$SCENARIOS" -gt 0 ]; then
     TRAIN_ARGS+=(--sep-range $SEP_RANGE --laser-range $LASER_RANGE
                  --laser-offset-radius "$LASER_OFFSET_RADIUS")

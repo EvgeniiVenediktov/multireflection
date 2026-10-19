@@ -46,6 +46,15 @@ ppo.py checkpoint (the policy's encoder; --init then gives the heads and the con
 Validation on a fixed camera set (val/) and on the same states rendered without any
 effect (val_clean/). Run name marker _cam; with --init-agent _ft-<--init-agent-tag>.
 
+Convergence: --converge trains until the validation loss (augmented set in camera mode)
+plateaus, --steps is only a cap: after the warmup the lr stays at its peak; after
+--patience validations without a relative improvement of --plateau-tol over the best it
+is multiplied by --plateau-factor; after --max-reductions reductions the next plateau
+stops the run (converged). Reaching the cap first is a failure: exit code 3, so a Slurm
+afterok chain does not start from an unconverged encoder. Without --converge (fixed
+cosine schedule) the run ends with a check of the last quarter: a validation-loss drop of
+more than 2 % there is reported as not converged (config.json convergence, exit code 0).
+
 Loss = w_map L_map + w_count L_count + w_ell L_ell:
     L_map    peak-weighted MSE on the square-root spot map,
              mean over pixels of (1 + PEAK_WEIGHT sqrt(t)) (p - sqrt(t))^2
@@ -303,6 +312,15 @@ def parse_args() -> argparse.Namespace:
                     help="Short name of that run for the run name, e.g. r6")
     ap.add_argument("--render-chunk", type=int, default=256,
                     help="Camera mode: frames per render call")
+    ap.add_argument("--converge", action="store_true",
+                    help="Train until the validation loss plateaus; --steps is the cap (exit 3 if reached)")
+    ap.add_argument("--patience", type=int, default=6,
+                    help="--converge: validations without improvement before a plateau")
+    ap.add_argument("--plateau-tol", type=float, default=0.005,
+                    help="--converge: relative val-loss improvement that counts")
+    ap.add_argument("--plateau-factor", type=float, default=0.3, help="--converge: lr factor on a plateau")
+    ap.add_argument("--max-reductions", type=int, default=3,
+                    help="--converge: lr reductions; the next plateau stops the run")
     ap.add_argument("--runs-dir", default=RUNS_DIR, help="Parent of the run directory")
     ap.add_argument("--wandb", action="store_true", help="Log to W&B (project rl-encoder)")
     return ap.parse_args()
@@ -320,11 +338,14 @@ def cont_ranges_of(args: argparse.Namespace):
 
 def run_name(args: argparse.Namespace, cfg: EncoderConfig, init_name: str = "") -> str:
     """Display / directory name from the key config, built at start:
-    <model>_w<width>_lr<lr>_b<batch>_<steps>_s<seed>[_ft-<origin>][_<data>][_cam][_<tag>],
+    <model>_w<width>_lr<lr>_b<batch>_<steps>_s<seed>[_ft-<origin>][_<data>][_cam][_<tag>]
+    (<steps>: conv<cap> with --converge),
     data grid<N>, <ranges tag>x<N> (continuous) or set4; _ft-<origin> with --init
     (_ft-<--init-agent-tag> with --init-agent); _cam in camera mode."""
     k = args.steps / 1000
     steps = f"{k:g}k" if args.steps >= 1000 else str(args.steps)
+    if getattr(args, "converge", False):
+        steps = "conv" + steps  # The cap; the run stops at the plateau
     name = f"{model_name(cfg)}_w{cfg.width if cfg.arch == 'vit' else cfg.cnn_widths[-1]}" \
            f"_lr{args.lr:g}_b{args.batch}_{steps}_s{args.seed}"
     if getattr(args, "init_agent", ""):  # Optional: callers may pass a partial Namespace
@@ -441,7 +462,13 @@ def main():
               f"{agent_info['tensors']} tensors", flush=True)
     fwd = model if args.no_compile else torch.compile(model)
     opt = torch.optim.AdamW(param_groups(model, args.wd), lr=args.lr, betas=(0.9, 0.95), fused=True)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_factor(s, args.warmup, args.steps))
+    conv = {"mult": 1.0, "best": math.inf, "bad": 0, "reductions": 0, "converged": False}
+    if args.converge:  # Warmup, then the peak lr times the plateau reductions
+        sched = torch.optim.lr_scheduler.LambdaLR(
+            opt, lambda s: min(1.0, (s + 1) / args.warmup) * conv["mult"])
+    else:
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_factor(s, args.warmup, args.steps))
+    val_hist = []  # (step, val loss)
     n_enc, n_heads = count_params(model.encoder), count_params(model.heads)
     info = {"name": name, "args": vars(args), "encoder": asdict(cfg),
             "params_encoder": n_enc, "params_heads": n_heads,
@@ -533,17 +560,52 @@ def main():
                         "data": data_info, "init": init_info,
                         "camera": asdict(cam.ranges) if cam is not None else None},
                        os.path.join(run_dir, "model.pt"))
+            val_hist.append((step, v["total"]))
+            if args.converge:
+                if v["total"] < conv["best"] * (1.0 - args.plateau_tol):
+                    conv["best"], conv["bad"] = v["total"], 0
+                else:
+                    conv["bad"] += 1
+                if conv["bad"] >= args.patience:
+                    if conv["reductions"] >= args.max_reductions:
+                        conv["converged"] = True
+                        print(f"converged at step {step}: no {100 * args.plateau_tol:g} % val-loss "
+                              f"improvement in {args.patience} validations after "
+                              f"{conv['reductions']} lr reductions", flush=True)
+                        break
+                    conv["mult"] *= args.plateau_factor
+                    conv["reductions"] += 1
+                    conv["bad"] = 0
+                    print(f"step {step}: val-loss plateau, lr x {args.plateau_factor:g} (reduction "
+                          f"{conv['reductions']} of {args.max_reductions})", flush=True)
 
     elapsed = time.time() - t0
+    if args.converge:
+        converged = conv["converged"]
+        verdict = {"mode": "plateau", "converged": converged, "lr_reductions": conv["reductions"],
+                   "best_val_loss": conv["best"], "steps": val_hist[-1][0] if val_hist else 0}
+    else:  # Fixed schedule: the val-loss drop over the last quarter of the steps
+        q = [x for s_, x in val_hist if s_ >= 0.75 * args.steps]
+        drop = (q[0] - q[-1]) / q[0] if len(q) > 1 and q[0] > 0 else 0.0
+        converged = drop <= 0.02
+        verdict = {"mode": "fixed", "converged": converged, "last_quarter_drop": drop}
     info.update(train_time_s=round(elapsed, 1), skipped_steps=skipped,
-                peak_mem_gb=round(torch.cuda.max_memory_allocated() / 2**30, 2))
+                peak_mem_gb=round(torch.cuda.max_memory_allocated() / 2**30, 2), convergence=verdict)
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(info, f, indent=1)
     train_f.close()
     val_f.close()
     if wb is not None:
         wb.finish()
-    print(f"done in {elapsed / 60:.1f} min, peak {info['peak_mem_gb']} GB")
+    print(f"done in {elapsed / 60:.1f} min, peak {info['peak_mem_gb']} GB; convergence {verdict}",
+          flush=True)
+    if not converged:
+        print("NOT CONVERGED: " + ("the step cap was reached before the validation loss plateaued"
+                                   if args.converge else
+                                   f"val loss fell {100 * verdict['last_quarter_drop']:.1f} % over the "
+                                   f"last quarter"), flush=True)
+        if args.converge:
+            raise SystemExit(3)
 
 
 if __name__ == "__main__":
