@@ -1,8 +1,9 @@
 """
 encoders.py - Frame encoders and single-frame heads (PLAN phase 5, Level 1)
 
-Both encoders map a (B, 1, 64, 64) uint8 image to an embedding z (B, 256); every head
-reads z only (z is the bottleneck the policy will see).
+Both encoders map a (B, C, 64, 64) uint8 image (C = EncoderConfig.in_ch: 1 for the sim
+renders, 3 for camera renders) to an embedding z (B, 256); every head reads z only (z is
+the bottleneck the policy will see).
 
     CNNEncoder   conv stem, pre-activation GroupNorm residual stages down to 8 x 8,
                  spatial-softmax keypoints (expected x, y per keypoint channel)
@@ -37,6 +38,7 @@ class EncoderConfig:
     arch: str = "cnn"  # cnn | vit
     z_dim: int = 256
     img_res: int = 64
+    in_ch: int = 1  # Input channels: 1 sim render, 3 camera render (mono copied x 3)
 
     # ── CNN ──
     cnn_widths: Tuple[int, ...] = (32, 64, 128, 160)  # Stem, then one stage per entry after
@@ -63,7 +65,7 @@ def count_params(m: nn.Module) -> int:
 
 
 def to_input(img: torch.Tensor) -> torch.Tensor:
-    """uint8 (B, 1, H, W) -> float in [0, 1]."""
+    """uint8 (B, C, H, W) -> float in [0, 1]."""
     return img.float() * (1.0 / 255.0)
 
 
@@ -114,7 +116,7 @@ class CNNEncoder(nn.Module):
         super().__init__()
         w, g = cfg.cnn_widths, cfg.gn_groups
         assert len(w) == len(cfg.cnn_blocks) + 1
-        self.stem = nn.Conv2d(1, w[0], 3, padding=1)
+        self.stem = nn.Conv2d(cfg.in_ch, w[0], 3, padding=1)
         stages = []
         for i, nb in enumerate(cfg.cnn_blocks):
             layers = [nn.GroupNorm(g, w[i]), nn.SiLU(), nn.Conv2d(w[i], w[i + 1], 3, stride=2, padding=1)]
@@ -195,7 +197,7 @@ class ViTEncoder(nn.Module):
         super().__init__()
         p, d = cfg.patch, cfg.width
         g = cfg.img_res // p
-        self.embed = nn.Conv2d(1, d, p, stride=p)
+        self.embed = nn.Conv2d(cfg.in_ch, d, p, stride=p)
         self.register_buffer("pos", sincos_2d(g, g, d)[None])
         self.blocks = nn.ModuleList(Block(d, cfg.heads, cfg.mlp_ratio) for _ in range(cfg.depth))
         self.norm = nn.LayerNorm(d)

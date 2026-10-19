@@ -35,6 +35,17 @@ outputs equal the source's before the first step; fresh optimizer. Defaults then
 while 8k steps of new-range frames (half the source run's 16k) adapt it. Run name
 _ft-<origin>, origin = the source run's data marker (e.g. _ft-grid16384_cont20-400x16384).
 
+Camera mode (--camera): 3-channel inputs from render_camera.CameraRenderer (its
+CameraRanges augmentation config: per-effect probabilities and ranges; the edge scatter
+uses the sim's miss point) instead of the 1-channel randomized renders; targets in the
+camera frame (CameraRenderer.targets: spot map of every M2 spot inside the field, count
+of all M2 spots), no ellipse. The stem takes 3 channels (EncoderConfig.in_ch); a
+1-channel stem from --init / --init-agent is copied to the 3 channels at 1/3, so a gray
+image copied x 3 gives the source's output. --init-agent PATH takes the encoder from a
+ppo.py checkpoint (the policy's encoder; --init then gives the heads and the config).
+Validation on a fixed camera set (val/) and on the same states rendered without any
+effect (val_clean/). Run name marker _cam; with --init-agent _ft-<--init-agent-tag>.
+
 Loss = w_map L_map + w_count L_count + w_ell L_ell:
     L_map    peak-weighted MSE on the square-root spot map,
              mean over pixels of (1 + PEAK_WEIGHT sqrt(t)) (p - sqrt(t))^2
@@ -55,7 +66,7 @@ import math
 import os
 import re
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Dict
 
 import torch
@@ -64,6 +75,7 @@ import torch.nn.functional as F
 from encoders import EncoderConfig, FrameModel, count_params, model_name
 from frame_data import DataConfig, FrameData
 from geometry import SETUPS
+from render_camera import CameraRenderer, chunks
 
 RL_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(RL_DIR, "runs", "encoder")
@@ -87,11 +99,14 @@ def frame_loss(
     p = out["map"].float()
     l_map = ((1.0 + PEAK_WEIGHT * s) * (p - s) ** 2).mean()
     l_count = F.cross_entropy(out["count"].float(), batch["count"])
-    m = batch["ellipse_mask"].float()
-    e = F.smooth_l1_loss(
-        out["ellipse"].float(), batch["ellipse"] / ELL_SCALE_MM, beta=0.02, reduction="none"
-    ).mean(1)
-    l_ell = (e * m).sum() / m.sum().clamp_min(1.0)
+    if "ellipse" in batch:
+        m = batch["ellipse_mask"].float()
+        e = F.smooth_l1_loss(
+            out["ellipse"].float(), batch["ellipse"] / ELL_SCALE_MM, beta=0.02, reduction="none"
+        ).mean(1)
+        l_ell = (e * m).sum() / m.sum().clamp_min(1.0)
+    else:  # Camera mode: no ellipse target
+        l_ell = torch.zeros((), device=p.device)
     total = w_map * l_map + w_count * l_count + w_ell * l_ell
     return {"total": total, "map": l_map, "count": l_count, "ellipse": l_ell}
 
@@ -152,6 +167,33 @@ def init_model(model: FrameModel, ck: Dict[str, Any], path: str = "") -> Dict[st
             "step": ck.get("step"), "loaded": len(loaded), "skipped": skipped, "missing": missing}
 
 
+def expand_stem(sd: Dict[str, torch.Tensor], in_ch: int) -> Dict[str, torch.Tensor]:
+    """State dict with a 1-channel stem / patch embedding copied to in_ch channels at
+    1 / in_ch (a gray image copied x in_ch then gives the 1-channel output)."""
+    out = dict(sd)
+    for k in ("encoder.stem.weight", "encoder.embed.weight", "stem.weight", "embed.weight"):
+        if k in out and out[k].shape[1] == 1 and in_ch > 1:
+            out[k] = out[k].repeat(1, in_ch, 1, 1) / in_ch
+    return out
+
+
+def init_agent_encoder(model: FrameModel, path: str) -> Dict[str, Any]:
+    """Encoder weights of a ppo.py checkpoint (the policy's encoder) into model.encoder,
+    stem expanded to the model's channels; returns the info (path, run name, iteration,
+    env steps)."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    enc = ck["agent_cfg"]["encoder"]
+    own = asdict(model.cfg)
+    for k in ("arch", "z_dim", "img_res", "cnn_widths", "cnn_blocks", "n_keypoints",
+              "gn_groups", "mlp_hidden"):
+        v = tuple(enc[k]) if isinstance(enc[k], list) else enc[k]
+        assert v == own[k], f"--init-agent encoder {k}: {v} != {own[k]}"
+    sd = {k[len("encoder."):]: v for k, v in ck["agent"].items() if k.startswith("encoder.")}
+    model.encoder.load_state_dict(expand_stem(sd, model.cfg.in_ch))
+    return {"path": os.path.abspath(path), "name": ck.get("name"), "iteration": ck.get("iteration"),
+            "env_steps": ck.get("env_steps"), "tensors": len(sd)}
+
+
 def init_origin(name: str) -> str:
     """Data marker of a source run name (after _s<seed>_, '_' -> '-'), e.g. grid16384,
     set4; meas for a measured-cell run."""
@@ -159,19 +201,46 @@ def init_origin(name: str) -> str:
     return m.group(1).replace("_", "-") if m else "meas"
 
 
+# ── Camera mode data ────────────────────────────────────────────────────────
+
+
+def camera_sim(data: FrameData, gen: torch.Generator, n: int) -> Dict[str, torch.Tensor]:
+    """Sim outputs (with the per-hit outputs and the miss point) of n fresh FrameData
+    states: setups, tilts, physical jitter."""
+    setup = data.sample_setups(n, gen)
+    st = data.states(data.sample_tilts(n, gen, setup=setup), gen, setup=setup)
+    return data.sim.simulate(st, store_world=False)
+
+
+def camera_frames(cam: CameraRenderer, out: Dict[str, torch.Tensor], p: Dict[str, torch.Tensor],
+                  gen: torch.Generator, chunk: int) -> Dict[str, torch.Tensor]:
+    """CameraRenderer images (n, 3, H, W) uint8 and camera-frame targets (spot_map,
+    count) of the sim outputs out under the parameters p, in chunks of chunk frames."""
+    hm, lxy = out["hit_mirror"], out["hit_local_xy"]
+    miss = (out["miss_mirror"], out["miss_local_xy"], out["intensity"])
+    parts: Dict[str, list] = {"image": [], "spot_map": [], "count": []}
+    for s in chunks(hm.shape[0], chunk):
+        ps = {k: v[s] for k, v in p.items()}
+        parts["image"].append(cam.render(hm[s], lxy[s], ps, gen, tuple(t[s] for t in miss)))
+        for k, v in cam.targets(hm[s], lxy[s], ps).items():
+            parts[k].append(v)
+    return {k: torch.cat(v) for k, v in parts.items()}
+
+
 # ── Validation ──────────────────────────────────────────────────────────────
 
 
 @torch.no_grad()
-def validate(model: FrameModel, val: Dict[str, torch.Tensor], bs: int = 256) -> Dict[str, float]:
+def validate(model: FrameModel, val: Dict[str, torch.Tensor], bs: int = 256,
+             image_key: str = "image_id") -> Dict[str, float]:
     """Mean losses and count accuracy on the fixed validation set (in-distribution)."""
     model.eval()
-    n = val["image_id"].shape[0]
+    n = val[image_key].shape[0]
     sums = {"total": 0.0, "map": 0.0, "count": 0.0, "ellipse": 0.0, "count_acc": 0.0}
     for i in range(0, n, bs):
         b = {k: v[i:i + bs] for k, v in val.items() if torch.is_tensor(v)}
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = model(b["image_id"])
+            out = model(b[image_key])
         losses = frame_loss(out, b)
         k = b["count"].shape[0] / n
         for key in ("total", "map", "count", "ellipse"):
@@ -226,6 +295,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--val-n", type=int, default=1024)
     ap.add_argument("--tag", default="", help="Suffix for the run name")
+    ap.add_argument("--camera", action="store_true",
+                    help="Camera mode: 3-channel CameraRenderer inputs, camera-frame targets")
+    ap.add_argument("--init-agent", default="",
+                    help="Encoder from this ppo.py checkpoint (the policy's encoder)")
+    ap.add_argument("--init-agent-tag", default="agent",
+                    help="Short name of that run for the run name, e.g. r6")
+    ap.add_argument("--render-chunk", type=int, default=256,
+                    help="Camera mode: frames per render call")
     ap.add_argument("--runs-dir", default=RUNS_DIR, help="Parent of the run directory")
     ap.add_argument("--wandb", action="store_true", help="Log to W&B (project rl-encoder)")
     return ap.parse_args()
@@ -243,13 +320,16 @@ def cont_ranges_of(args: argparse.Namespace):
 
 def run_name(args: argparse.Namespace, cfg: EncoderConfig, init_name: str = "") -> str:
     """Display / directory name from the key config, built at start:
-    <model>_w<width>_lr<lr>_b<batch>_<steps>_s<seed>[_ft-<origin>][_<data>][_<tag>], data
-    grid<N>, <ranges tag>x<N> (continuous) or set4; _ft-<origin> with --init."""
+    <model>_w<width>_lr<lr>_b<batch>_<steps>_s<seed>[_ft-<origin>][_<data>][_cam][_<tag>],
+    data grid<N>, <ranges tag>x<N> (continuous) or set4; _ft-<origin> with --init
+    (_ft-<--init-agent-tag> with --init-agent); _cam in camera mode."""
     k = args.steps / 1000
     steps = f"{k:g}k" if args.steps >= 1000 else str(args.steps)
     name = f"{model_name(cfg)}_w{cfg.width if cfg.arch == 'vit' else cfg.cnn_widths[-1]}" \
            f"_lr{args.lr:g}_b{args.batch}_{steps}_s{args.seed}"
-    if args.init:
+    if args.init_agent:
+        name += f"_ft-{args.init_agent_tag}"
+    elif args.init:
         name += f"_ft-{init_origin(init_name)}"
     rng = cont_ranges_of(args)
     if rng is not None:
@@ -258,6 +338,8 @@ def run_name(args: argparse.Namespace, cfg: EncoderConfig, init_name: str = "") 
         name += f"_grid{args.scenarios}"
     elif args.setups == "all":
         name += f"_set{len(SETUPS)}"
+    if args.camera:
+        name += "_cam"
     return name + (f"_{args.tag}" if args.tag else "")
 
 
@@ -281,7 +363,9 @@ def main():
         args.arch = cfg.arch
     else:
         cfg = EncoderConfig(arch=args.arch, patch=args.patch)
-    ft = ck_init is not None
+    if args.camera:
+        cfg = replace(cfg, in_ch=3)
+    ft = ck_init is not None or bool(args.init_agent)
     if args.lr is None:
         args.lr = (3e-4 if ft else 1e-3) if args.arch == "cnn" else (1.5e-4 if ft else 5e-4)
     if args.steps is None:
@@ -294,8 +378,6 @@ def main():
 
     data_info: Dict[str, Any] = {}
     if args.scenarios > 0:
-        from dataclasses import replace
-
         rng = cont_ranges_of(args)
         if rng is not None:
             from scenarios import sample_valid_scenarios, scenario_geometry
@@ -328,16 +410,35 @@ def main():
         data = FrameData(data_config(args.setups, args.batch), dev)
     gen = torch.Generator(device=dev)
     gen.manual_seed(1_000_003 * (args.seed + 1))
-    val = data.eval_set(args.val_n, VAL_SEED)
+    cam = val_clean = None
+    if args.camera:
+        cam = CameraRenderer(data.base)
+        if not args.no_compile:
+            cam.compile()
+        gen_v = torch.Generator(device=dev)
+        gen_v.manual_seed(VAL_SEED)
+        out_v = camera_sim(data, gen_v, args.val_n)
+        val = camera_frames(cam, out_v, cam.sample_params(args.val_n, gen_v), gen_v, args.render_chunk)
+        val_clean = camera_frames(cam, out_v, cam.neutral_params(args.val_n), gen_v, args.render_chunk)
+        del out_v
+    else:
+        val = data.eval_set(args.val_n, VAL_SEED)
 
     model = FrameModel(cfg).to(dev)
     init_info = None
-    if ft:
-        init_info = init_model(model, ck_init, args.init)
+    if ck_init is not None:
+        init_info = init_model(model, {**ck_init, "model": expand_stem(ck_init["model"], cfg.in_ch)},
+                               args.init)
         print(f"init from {init_info['path']} ({init_info['name']}, step {init_info['step']}): "
               f"{init_info['loaded']} tensors loaded; skipped {sorted(init_info['skipped'])}; "
               f"missing {init_info['missing']}", flush=True)
         del ck_init
+    if args.init_agent:
+        agent_info = init_agent_encoder(model, args.init_agent)
+        init_info = {**(init_info or {}), "agent": agent_info}
+        print(f"encoder from {agent_info['path']} ({agent_info['name']}, iteration "
+              f"{agent_info['iteration']}, {agent_info['env_steps']} env steps): "
+              f"{agent_info['tensors']} tensors", flush=True)
     fwd = model if args.no_compile else torch.compile(model)
     opt = torch.optim.AdamW(param_groups(model, args.wd), lr=args.lr, betas=(0.9, 0.95), fused=True)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_factor(s, args.warmup, args.steps))
@@ -348,7 +449,7 @@ def main():
                      "n_cells": int(data.cells.shape[0]),
                      "setups": [g.name for g in data.setups],
                      "n_cells_per_setup": data.cell_count.tolist(), **data_info},
-            "init": init_info}
+            "init": init_info, "camera": asdict(cam.ranges) if cam is not None else None}
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(info, f, indent=1)
     print(f"{name}: encoder {n_enc / 1e6:.2f} M params, heads {n_heads / 1e6:.2f} M -> {run_dir}")
@@ -365,7 +466,10 @@ def main():
     vw = csv.writer(val_f)
     tw.writerow(["step", "time_s", "lr", "loss", "map", "count", "ellipse", "grad_norm",
                  "grad_norm_max", "skipped"])
-    vw.writerow(["step", "time_s", "loss", "map", "count", "ellipse", "count_acc"])
+    VAL_KEYS = ("total", "map", "count", "ellipse", "count_acc")
+    vw.writerow(["step", "time_s", "loss", "map", "count", "ellipse", "count_acc"]
+                + (["clean_" + k for k in ("loss", "map", "count", "ellipse", "count_acc")]
+                   if cam is not None else []))
 
     acc = {k: torch.zeros((), device=dev) for k in ("total", "map", "count", "ellipse", "gn")}
     gn_max = torch.zeros((), device=dev)
@@ -373,7 +477,11 @@ def main():
     t0 = time.time()
     model.train()
     for step in range(1, args.steps + 1):
-        batch = data.batch(gen)
+        if cam is not None:
+            batch = camera_frames(cam, camera_sim(data, gen, args.batch),
+                                  cam.sample_params(args.batch, gen), gen, args.render_chunk)
+        else:
+            batch = data.batch(gen)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=not args.no_amp):
             out = fwd(batch["image"])
         losses = frame_loss(out, batch, args.w_map, args.w_count, args.w_ell)
@@ -404,18 +512,26 @@ def main():
                 acc[k].zero_()
             gn_max.zero_()
         if step % args.val_every == 0 or step == args.steps:
-            v = validate(model, val)
+            key = "image" if cam is not None else "image_id"
+            v = validate(model, val, image_key=key)
+            vc = validate(model, val_clean, image_key=key) if val_clean is not None else None
             el = time.time() - t0
-            vw.writerow([step, round(el, 1)] + [v[k] for k in ("total", "map", "count", "ellipse", "count_acc")])
+            vw.writerow([step, round(el, 1)] + [v[k] for k in VAL_KEYS]
+                        + ([vc[k] for k in VAL_KEYS] if vc is not None else []))
             val_f.flush()
             if wb is not None:
                 wb.log({f"val/{k}": x for k, x in v.items()}, step=step)
+                if vc is not None:
+                    wb.log({f"val_clean/{k}": x for k, x in vc.items()}, step=step)
+            clean = (f"  clean: map {vc['map']:.4f} count acc {vc['count_acc']:.3f}"
+                     if vc is not None else "")
             print(f"step {step:6d} {el / 60:5.1f} min  val loss {v['total']:.4f} map {v['map']:.4f} "
-                  f"count {v['count']:.3f} (acc {v['count_acc']:.3f}) ell {v['ellipse']:.4f}  "
+                  f"count {v['count']:.3f} (acc {v['count_acc']:.3f}) ell {v['ellipse']:.4f}{clean}  "
                   f"skipped {skipped}", flush=True)
             torch.save({"cfg": asdict(cfg), "model": model.state_dict(), "step": step,
                         "name": name, "data_setups": [g.name for g in data.setups],
-                        "data": data_info, "init": init_info},
+                        "data": data_info, "init": init_info,
+                        "camera": asdict(cam.ranges) if cam is not None else None},
                        os.path.join(run_dir, "model.pt"))
 
     elapsed = time.time() - t0

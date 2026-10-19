@@ -281,9 +281,10 @@ class Agent(nn.Module):
         ck = torch.load(path, map_location="cpu", weights_only=False)
         cfg = ck["cfg"]
         mine = asdict(self.cfg.encoder)
-        for k in ("arch", "z_dim", "img_res", "cnn_widths", "cnn_blocks", "n_keypoints",
-                  "gn_groups", "mlp_hidden"):
-            v = tuple(cfg[k]) if isinstance(cfg[k], list) else cfg[k]
+        for k in ("arch", "z_dim", "img_res", "in_ch", "cnn_widths", "cnn_blocks",
+                  "n_keypoints", "gn_groups", "mlp_hidden"):
+            v = cfg.get(k, getattr(EncoderConfig, k))  # Older checkpoints: no in_ch (1)
+            v = tuple(v) if isinstance(v, list) else v
             assert v == mine[k], f"encoder {k}: checkpoint {v} != agent {mine[k]}"
         sd = {k[len("encoder."):]: v for k, v in ck["model"].items() if k.startswith("encoder.")}
         self.encoder.load_state_dict(sd)

@@ -35,19 +35,24 @@ COUNTS = (1, 3, 6, 10, 16, 24, 34, 50)  # Wanted spot counts, nearest available
 EDGE_COLS = (2, 4, 6)  # Prefer an edge-scatter source of weight >= EDGE_WEIGHT
 EDGE_WEIGHT = 0.1
 
-# (title, groups taken from the sampled parameters, range overrides, fixed values)
+# (title, groups taken from the sampled parameters, range overrides, fixed values); the
+# overrides switch the row's effects on (p = 1) so every column shows them
+POSE_ON = {"rotation_p": 1.0, "shift_p": 1.0, "scale_p": 1.0, "perspective_p": 1.0}
 ROWS = (
-    ("pose: rotation +-20 deg,\nshift, scale, perspective", ("pose",), {}, {"face": 0.08}),
+    ("pose: rotation +-20 deg,\nshift, scale, perspective", ("pose",), POSE_ON, {"face": 0.08}),
     ("color camera: R / G / B laser,\ncrosstalk, tint, white bal.", ("color",),
-     {"color_p": 1.0}, {"face": 0.1}),
-    ("lit / dark face: rings, grain,\nedge glow, gradient", ("face", "light"), {}, {}),
+     {"color_p": 1.0, "tint_p": 1.0, "wb_p": 1.0}, {"face": 0.1}),
+    ("lit / dark face: rings, grain,\nedge glow, gradient", ("face", "light"),
+     {"rings_p": 1.0, "grain_p": 1.0, "rim_p": 1.0, "gradient_p": 1.0, "vignetting_p": 1.0}, {}),
     ("marks: engraving,\nscratches, dust", ("face", "marks"),
-     {"face_p": 0.8, "engrave_p": 1.0}, {}),
-    ("edge scatter: beam on the\nM2 rim (dark face)", ("scatter",), {}, {"face": 0.02}),
-    ("spots: size, aspect,\nspeckle, laser power", ("spots",), {}, {}),
+     {"face_p": 0.8, "engrave_p": 1.0, "scratch_p": 1.0, "dust_p": 1.0}, {}),
+    ("edge scatter: beam on the\nM2 rim (dark face)", ("scatter",), {"scatter_p": 1.0}, {"face": 0.02}),
+    ("spots: size, aspect,\nspeckle, laser power", ("spots",),
+     {"sigma_p": 1.0, "aspect_p": 1.0, "speckle_p": 1.0, "laser_p": 1.0}, {}),
     ("sensor: exposure, gamma,\nnoise, PRNU, rows, hot px", ("sensor",),
-     {"read_noise": (0.01, 0.04)}, {"face": 0.05}),
-    ("all factors", tuple(GROUPS), {}, {}),
+     {k: 1.0 for k in ("exposure_p", "gamma_p", "black_p", "read_noise_p", "shot_noise_p",
+                       "prnu_p", "row_noise_p", "hot_p")}, {"face": 0.05}),
+    ("all factors (training\ndistribution)", tuple(GROUPS), {}, {}),
     ("all factors + labels\n(visible spots, count)", tuple(GROUPS), {}, {}),
 )
 
@@ -102,7 +107,7 @@ def main():
     rows = [("current env render\n(clean, mono)", clean.expand(-1, 3, -1, -1), None)]
     for title, groups, over, fixed in ROWS:
         p = cam.neutral_params(N_COL)
-        s = cam.sample_params(N_COL, replace(CameraRanges(), **over), gen)
+        s = cam.sample_params(N_COL, gen, replace(CameraRanges(), clean_p=0.0 if over else 0.1, **over))
         for g in groups:
             p.update({k: s[k] for k in GROUPS[g]})
         for k, val in fixed.items():

@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from encoders import N_COUNT, EncoderConfig, FrameModel
 from frame_data import DataConfig, FrameData
 from geometry import SETUPS
-from render_camera import CameraRanges, CameraRenderer
+from render_camera import CameraRenderer
 
 
 def timed(fn, warmup: int, reps: int):
@@ -84,11 +84,7 @@ def main():
     cam = CameraRenderer(fd.base)
     cams = {"eager": cam}
     if not args.no_compile:
-        cc = CameraRenderer(fd.base)
-        for name in ("_spot_layer", "_scatter_layer", "_face_layer"):
-            setattr(cc, name, torch.compile(getattr(cc, name), dynamic=False))
-        cams["compiled"] = cc
-    pix = fd.base.pitch  # 1 px in mm: the spot-map target width
+        cams["compiled"] = CameraRenderer(fd.base).compile()
     rows = []
 
     def add(name, B, fn, C=None):
@@ -116,17 +112,10 @@ def main():
         rp = fd.renderer.sample_params(B, fd.cfg.ranges, gen)
         add("current: RandomRenderer 1ch", B, lambda: fd.renderer(hm, lxy, rp, gen))
 
-        add("camera: sample_params", B, lambda: cam.sample_params(B, CameraRanges(), gen))
-        p = cam.sample_params(B, CameraRanges(), gen)
+        add("camera: sample_params", B, lambda: cam.sample_params(B, gen))
+        p = cam.sample_params(B, gen)
         add("camera: labels", B, lambda: cam.labels(hm, lxy, p))
-        pt = {**cam.neutral_params(B), "warp": p["warp"], "scale": p["scale"],
-              "sigma": torch.full((B,), pix, device=dev)}
-
-        def map_target():
-            uv, w, valid = cam.spots_camera(hm, lxy, pt)
-            return cam._spot_layer(uv, w * valid, pt)
-
-        add("camera: map target (1 px spots)", B, map_target)
+        add("camera: targets (map + count)", B, lambda: cam.targets(hm, lxy, p))
         for C in args.chunks:
             if C > B:
                 continue

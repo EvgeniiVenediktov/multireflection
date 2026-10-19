@@ -215,6 +215,7 @@ class FrameData:
         d["setup"] = setup if setup is not None else torch.zeros(
             states.shape[0], dtype=torch.long, device=states.device)
         d["_hits"] = (out["hit_mirror"], out["hit_local_xy"])
+        d["_miss"] = (out["miss_mirror"], out["miss_local_xy"], out["intensity"])  # CameraRenderer
         return d
 
     def render(self, d: Dict[str, torch.Tensor], mode: str, gen: torch.Generator) -> Dict[str, torch.Tensor]:
@@ -246,6 +247,7 @@ class FrameData:
     def _render_modes(self, d: Dict[str, torch.Tensor], seed: int, chunk: int) -> Dict[str, torch.Tensor]:
         """Images of d in all MODES (seeded), rendered in chunks; drops the raw hits."""
         hm, lxy = d.pop("_hits")
+        d.pop("_miss", None)
         n = hm.shape[0]
         for k, mode in enumerate(MODES):
             gen = torch.Generator(device=self.device)

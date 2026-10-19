@@ -1,11 +1,11 @@
 """
-render_camera.py - Camera-frame renderer for real-camera inputs (prototype)
+render_camera.py - Camera-frame renderer for real-camera inputs
 
 CameraRenderer renders the M2 hits of the sim as a 3-channel camera image (n, 3, H, W)
 uint8 through a randomized pose / mirror-face / edge-scatter / light / color / sensor
-model. Unlike render_random.py the labels live in the camera frame: the spots where the
-camera sees them (pixel positions, count). The camera pose is not a target; it is
-left to the history (the dynamics of the actions) to resolve.
+model. Unlike render_random.py the targets live in the camera frame: the spots where the
+camera sees them (spot map, pixel positions) and the M2 spot count. The camera pose is
+not a target; it is left to the history (the dynamics of the actions) to resolve.
 
 Coordinates: canonical normalized (X, Y) = (lx, -ly) / R (the mirror is the unit
 disk, y down, as the SpotRenderer raster), camera normalized (u, v) in [-1, 1]
@@ -34,9 +34,13 @@ Sensor: gain (base gain x exposure x white balance), response 1 - exp(-g I) (as
 SpotRenderer), gamma, pixel gain non-uniformity, black level, shot + read noise, row
 noise, hot pixels, clip, uint8. Mono cameras: one channel replicated x 3.
 
-Parameters are a dict of per-sample tensors (GROUPS lists the keys per factor); they
-hold everything that stays fixed for an episode (pose, textures, dust, hot pixels).
-Per-frame randomness (noise, speckle) is drawn in render().
+Augmentation (CameraRanges): every effect is on with its probability <effect>_p, drawn
+per sample; when on its parameters are drawn from its ranges, when off it takes its
+neutral value (neutral_params); a share clean_p of the samples has every effect off.
+Parameters are a dict of per-sample tensors (GROUPS lists the keys per factor) holding
+what stays fixed for an episode (pose, textures, dust, hot pixels, whether the edge
+scatters). Drawn per frame in render(): the edge-scatter look (strength, size, flatness:
+the beam's position on the rim moves), speckle and the sensor noise.
 """
 
 import math
@@ -48,7 +52,7 @@ import torch
 import torch.nn.functional as F
 
 from env import SpotRenderer
-from render_random import _log_uniform, _signed, pose_warp
+from render_random import _log_uniform, _signed, _uniform, pose_warp
 from targets import M2_ID, m2_spots
 
 N_RING = 3
@@ -69,7 +73,7 @@ Miss = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]  # Sim miss_mirror, miss_
 GROUPS: Dict[str, Tuple[str, ...]] = {
     "pose": ("warp", "warp_inv", "scale"),
     "spots": ("laser", "sigma", "aspect", "angle", "speckle"),
-    "scatter": ("scatter_amp", "scatter_size", "scatter_pow"),
+    "scatter": ("scatter_on",),
     "color": ("mono", "laser_rgb", "ambient_rgb", "wb"),
     "face": ("face", "ring_r", "ring_w", "ring_a", "grain", "grain_tex", "rim", "rim_w",
              "rim_harm", "surround"),
@@ -81,70 +85,101 @@ GROUPS: Dict[str, Tuple[str, ...]] = {
 }
 
 
-# ── Ranges ──────────────────────────────────────────────────────────────────
+# ── Augmentation config ─────────────────────────────────────────────────────
 
 
 @dataclass
 class CameraRanges:
-    """Per-sample ranges, uniform unless noted; 'random sign' = magnitude range.
-    Intensities are in SpotRenderer units (first-spot peak 1 at unit laser)."""
+    """Per effect: probability <effect>_p of being on, and the ranges of its parameters
+    when on (uniform unless noted; 'random sign' = magnitude range). Off = the neutral
+    value. Intensities in SpotRenderer units (first-spot peak 1 at unit laser),
+    brightness on the 0-1 output scale, R = mirror radius."""
+
+    clean_p: float = 0.1  # Every effect off
 
     # ── Pose ──
+    rotation_p: float = 0.5
     rotation: Tuple[float, float] = (0.0, 20.0)  # deg, random sign
-    shift: Tuple[float, float] = (0.0, 0.15)  # Normalized (field half-width 1), random sign
+    shift_p: float = 0.5
+    shift: Tuple[float, float] = (0.0, 0.15)  # Per axis, field half-widths (0.15 = 4.8 px), random sign
+    scale_p: float = 0.5
     scale: Tuple[float, float] = (0.8, 1.08)  # Mirror diameter / field width, log-uniform
-    corner: float = 0.04  # Perspective: max corner displacement, fraction of the field
+    perspective_p: float = 0.5
+    corner: float = 0.04  # Max corner displacement per axis, fraction of the field
 
     # ── Spots ──
+    sigma_p: float = 0.8
+    sigma: Tuple[float, float] = (0.2, 0.6)  # mm (off: SpotRenderer sigma, 0.5 mm)
+    aspect_p: float = 0.5
+    aspect: Tuple[float, float] = (1.0, 1.3)  # Random orientation
+    speckle_p: float = 0.5
+    speckle: Tuple[float, float] = (0.0, 0.3)  # Log-normal std of the per-spot peak, redrawn per frame
+    laser_p: float = 0.8
     laser: Tuple[float, float] = (0.4, 6.0)  # First-spot peak, log-uniform
-    sigma: Tuple[float, float] = (0.3, 1.0)  # mm
-    aspect: Tuple[float, float] = (1.0, 1.3)
-    speckle: Tuple[float, float] = (0.0, 0.3)  # Log-normal std of the per-spot peak
-
-    # ── Edge scatter ──
+    scatter_p: float = 0.8  # Edge scatter (when a beam is on the M2 rim); look redrawn per frame
     scatter_amp: Tuple[float, float] = (1.0, 20.0)  # Blob peak / beam intensity, log-uniform
-    scatter_size: Tuple[float, float] = (0.15, 0.45)  # Mirror radii
+    scatter_size: Tuple[float, float] = (0.15, 0.45)  # R
     scatter_pow: Tuple[float, float] = (2.0, 5.0)  # Super-Gaussian exponent (flat top)
 
     # ── Camera type and color ──
-    color_p: float = 0.5  # Color cameras; the rest mono (one channel replicated)
+    color_p: float = 0.5  # Color camera (red / green / blue laser equally likely); off: mono x 3
     crosstalk: Tuple[float, float] = (0.0, 0.25)  # Laser signal in the two other channels
+    mono_qe_p: float = 0.7  # Mono only
     mono_qe: Tuple[float, float] = (0.3, 1.0)  # Mono response at the laser line
+    tint_p: float = 0.5  # Color only
     tint: float = 0.15  # Ambient color, per-channel log-normal std
+    wb_p: float = 0.5  # Color only
     wb: Tuple[float, float] = (0.8, 1.25)  # White balance per channel, log-uniform
 
     # ── Mirror face ──
-    face_p: float = 0.6  # Lit faces; the rest dark (face up to dark_face)
+    face_p: float = 0.6  # Lit face; off: dark, brightness uniform 0 - dark_face
     face: Tuple[float, float] = (0.05, 0.7)  # Brightness after the sensor (any exposure)
     dark_face: float = 0.03
-    ring_r: Tuple[float, float] = (0.55, 0.97)  # Radial ring centres, mirror radii
-    ring_w: Tuple[float, float] = (0.02, 0.1)
-    ring_a: Tuple[float, float] = (-0.4, 0.6)  # Relative to the face level
-    grain: Tuple[float, float] = (0.0, 0.3)  # Fractal texture std, relative
-    rim: Tuple[float, float] = (0.0, 0.4)  # Edge glow
-    rim_w: Tuple[float, float] = (0.02, 0.08)  # Mirror radii
+    rings_p: float = 0.7  # 1 - N_RING rings, relative to the face level (lit face)
+    ring_r: Tuple[float, float] = (0.55, 0.97)  # Centres, R
+    ring_w: Tuple[float, float] = (0.02, 0.1)  # R
+    ring_a: Tuple[float, float] = (-0.4, 0.6)
+    grain_p: float = 0.5
+    grain: Tuple[float, float] = (0.0, 0.3)  # Fractal texture std, relative to the face
+    rim_p: float = 0.5  # Edge glow, uneven around the rim
+    rim: Tuple[float, float] = (0.0, 0.4)
+    rim_w: Tuple[float, float] = (0.02, 0.08)  # R
+    surround_p: float = 0.2
     surround: Tuple[float, float] = (0.0, 0.08)  # Outside the mirror
 
     # ── Marks ──
-    engrave_p: float = 0.5
-    engrave_amp: Tuple[float, float] = (-0.5, 0.3)  # Relative to the face level
+    engrave_p: float = 0.5  # Text bank, relative to the face level (lit face)
+    engrave_amp: Tuple[float, float] = (-0.5, 0.3)
+    scratch_p: float = 0.3  # 1 - N_SCRATCH scratches
     scratch_amp: Tuple[float, float] = (0.0, 0.6)  # Random sign, x max(face, 0.1)
-    scratch_len: Tuple[float, float] = (0.03, 0.2)  # Half-length, mirror radii
-    dust_amp: Tuple[float, float] = (0.0, 1.0)  # Random sign (bright 3 : 1), x max(face, 0.05)
-    dust_s: Tuple[float, float] = (0.01, 0.03)  # Mirror radii
+    scratch_len: Tuple[float, float] = (0.03, 0.2)  # Half-length, R
+    dust_p: float = 0.4  # 1 - N_DUST specks
+    dust_amp: Tuple[float, float] = (0.0, 1.0)  # Bright 3 : dark 1, x max(face, 0.05)
+    dust_s: Tuple[float, float] = (0.01, 0.03)  # R
 
     # ── Light ──
-    gradient: Tuple[float, float] = (0.0, 0.3)
-    vignetting: Tuple[float, float] = (0.0, 0.4)
+    gradient_p: float = 0.5
+    gradient: Tuple[float, float] = (0.0, 0.3)  # Slope across the field, random direction
+    vignetting_p: float = 0.5
+    vignetting: Tuple[float, float] = (0.0, 0.4)  # Darker at the corners
 
     # ── Sensor ──
+    exposure_p: float = 0.7
     exposure: Tuple[float, float] = (0.4, 2.5)  # Log-uniform
+    gamma_p: float = 0.5
     gamma: Tuple[float, float] = (0.7, 1.4)
+    black_p: float = 0.5
     black: Tuple[float, float] = (0.0, 0.08)
-    read_noise: Tuple[float, float] = (0.0, 0.03)
-    shot_noise: Tuple[float, float] = (0.0, 3e-3)
-    prnu: Tuple[float, float] = (0.0, 0.03)
+    read_noise_p: float = 0.7
+    read_noise: Tuple[float, float] = (0.0, 0.03)  # std, redrawn per frame
+    shot_noise_p: float = 0.5
+    shot_noise: Tuple[float, float] = (0.0, 3e-3)  # Variance per unit signal
+    prnu_p: float = 0.3
+    prnu: Tuple[float, float] = (0.0, 0.03)  # Fixed-pattern pixel gain std
+    row_noise_p: float = 0.2
     row_noise: Tuple[float, float] = (0.0, 0.01)
+    hot_p: float = 0.3  # 1 - N_HOT hot pixels
+    hot: Tuple[float, float] = (0.4, 1.0)  # Brightness
 
 
 # ── Engraving bank and textures ─────────────────────────────────────────────
@@ -199,23 +234,31 @@ def _canonical(lxy: torch.Tensor, radius: float) -> torch.Tensor:
     return torch.stack((lxy[..., 0], -lxy[..., 1]), -1) / radius
 
 
+def chunks(n: int, size: int):
+    """Slices of [0, n) of at most size."""
+    return [slice(i, min(n, i + size)) for i in range(0, n, size)]
+
+
 # ── Renderer ────────────────────────────────────────────────────────────────
 
 
 class CameraRenderer:
     """Camera-frame renderer, see the module docstring.
 
-    sample_params(n, ranges, gen) -> per-episode parameters
-    neutral_params(n)             -> everything off: mono, mirror filling the field, no
-                                     noise, no edge scatter (close to SpotRenderer)
+    sample_params(n, gen)          -> per-episode parameters (self.ranges, or ranges=)
+    neutral_params(n)              -> every effect off: mono, mirror filling the field,
+                                      no noise, no edge scatter (close to SpotRenderer)
     render(hit_mirror, hit_local_xy, params, gen, miss) -> (n, 3, H, W) uint8
-    labels(hit_mirror, hit_local_xy, params)            -> camera-frame spots and count
+    targets(hit_mirror, hit_local_xy, params)           -> camera-frame spot map, count
+    labels(hit_mirror, hit_local_xy, params)            -> camera-frame spot positions
     miss = (miss_mirror, miss_local_xy, intensity) of the sim output, or None (no miss
-    point: edge scatter from the stored hits only).
+    point: edge scatter from the stored hits only). compile() fuses the per-pixel layers
+    (torch.compile); renders are then best done in fixed-size chunks (chunks()).
     """
 
-    def __init__(self, base: SpotRenderer, seed: int = 0):
+    def __init__(self, base: SpotRenderer, ranges: Optional[CameraRanges] = None, seed: int = 0):
         self.base = b = base
+        self.ranges = ranges or CameraRanges()
         self.device = dev = b.xs.device
         self.res = res = b.res
         self.n_spots = (b.hit_intensity.shape[0] + 1) // 2  # M2 hits: even bounce indices
@@ -223,6 +266,11 @@ class CameraRenderer:
         gv, gu = torch.meshgrid(self.px, self.px, indexing="ij")
         self.cam_uv = torch.stack((gu, gv), -1)  # (H, W, 2), camera normalized
         self.text = engraving_bank(N_TEXT, TEXT_RES, seed).to(dev)
+
+    def compile(self):
+        for name in ("_spot_layer", "_scatter_layer", "_face_layer"):
+            setattr(self, name, torch.compile(getattr(self, name), dynamic=False))
+        return self
 
     # ── Parameters ──
 
@@ -233,8 +281,7 @@ class CameraRenderer:
         return {
             "warp": I, "warp_inv": I.clone(), "scale": o.clone(),
             "laser": o.clone(), "sigma": o * b.sigma, "aspect": o.clone(), "angle": z.clone(),
-            "speckle": z.clone(),
-            "scatter_amp": z.clone(), "scatter_size": o * 0.3, "scatter_pow": o * 2.0,
+            "speckle": z.clone(), "scatter_on": z.clone(),
             "mono": o.clone(), "laser_rgb": torch.ones(n, 3, device=dev),
             "ambient_rgb": torch.ones(n, 3, device=dev), "wb": torch.ones(n, 3, device=dev),
             "face": z.clone(), "ring_r": torch.full((n, N_RING), 0.8, device=dev),
@@ -261,73 +308,93 @@ class CameraRenderer:
             "hot_val": torch.zeros(n, N_HOT, device=dev),
         }
 
-    def sample_params(self, n: int, r: CameraRanges, gen: torch.Generator) -> CameraParams:
-        dev = self.device
+    def sample_params(self, n: int, gen: torch.Generator,
+                      ranges: Optional[CameraRanges] = None) -> CameraParams:
+        r, dev = ranges or self.ranges, self.device
         U = lambda lo_hi, *shape: lo_hi[0] + (lo_hi[1] - lo_hi[0]) * torch.rand(
             n, *shape, generator=gen, device=dev)
+        LU = lambda lo_hi, *shape: torch.exp(U((math.log(lo_hi[0]), math.log(lo_hi[1])), *shape))
         rand = lambda *shape: torch.rand(n, *shape, generator=gen, device=dev)
         sign = lambda *shape: torch.randint(0, 2, (n, *shape), generator=gen, device=dev) * 2.0 - 1.0
-        upto = lambda m: torch.arange(m, device=dev)[None] < torch.randint(
-            0, m + 1, (n, 1), generator=gen, device=dev)  # (n, m): first k active, k uniform 0..m
+        some = lambda m: torch.arange(m, device=dev)[None] < torch.randint(
+            1, m + 1, (n, 1), generator=gen, device=dev)  # (n, m): first k active, k uniform 1..m
+
+        def on(prob: float, like: torch.Tensor) -> torch.Tensor:
+            """(n, 1, ...) bool, True with probability prob, broadcastable to like."""
+            return (rand() < prob).view(n, *([1] * (like.dim() - 1)))
+
+        def pick(prob: float, value: torch.Tensor, off) -> torch.Tensor:
+            return torch.where(on(prob, value), value, off)
 
         def disk(*shape):  # Uniform points in the unit disk, (n, *shape, 2)
             rr, a = torch.sqrt(rand(*shape)), 2 * math.pi * rand(*shape)
             return torch.stack((rr * torch.cos(a), rr * torch.sin(a)), -1)
 
-        rot = _signed(n, r.rotation, gen, dev)
-        shift = torch.stack((_signed(n, r.shift, gen, dev), _signed(n, r.shift, gen, dev)), 1)
-        scale = _log_uniform(n, r.scale, gen, dev)
-        corner = 2.0 * r.corner * (2.0 * rand(4, 2) - 1.0)
+        rot = pick(r.rotation_p, _signed(n, r.rotation, gen, dev), 0.0)
+        shift = pick(r.shift_p, torch.stack((_signed(n, r.shift, gen, dev),
+                                             _signed(n, r.shift, gen, dev)), 1), 0.0)
+        scale = pick(r.scale_p, _log_uniform(n, r.scale, gen, dev), 1.0)
+        corner = pick(r.perspective_p, 2.0 * r.corner * (2.0 * rand(4, 2) - 1.0), 0.0)
         warp_inv = pose_warp(rot, shift, scale, corner)
 
-        mono = (rand() >= r.color_p).float()
+        mono = rand() >= r.color_p
         color = torch.randint(0, 3, (n,), generator=gen, device=dev)
-        laser_rgb = torch.where(F.one_hot(color, 3).bool(), 1.0, U(r.crosstalk, 3))
-        qe = U(r.mono_qe)[:, None].expand(n, 3)
+        rgb = torch.where(F.one_hot(color, 3).bool(), 1.0, U(r.crosstalk, 3))
+        qe = pick(r.mono_qe_p, U(r.mono_qe), 1.0)[:, None].expand(n, 3)
         tint = torch.exp(r.tint * torch.randn(n, 3, generator=gen, device=dev))
-        tint = tint / tint.prod(1, keepdim=True) ** (1 / 3)
-        m = mono[:, None] > 0.5
-        lit = rand() < r.face_p
-        hot_on = upto(N_HOT) & (rand(1) < 0.5)
-        return {
+        tint = pick(r.tint_p, tint / tint.prod(1, keepdim=True) ** (1 / 3), 1.0)
+        m = mono[:, None]
+        n_ring = some(N_RING)
+
+        p = {
             "warp": torch.linalg.inv(warp_inv.double()).float(), "warp_inv": warp_inv,
             "scale": scale,
-            "laser": _log_uniform(n, r.laser, gen, dev), "sigma": U(r.sigma), "aspect": U(r.aspect),
-            "angle": math.pi * rand(), "speckle": U(r.speckle),
-            "scatter_amp": _log_uniform(n, r.scatter_amp, gen, dev),
-            "scatter_size": U(r.scatter_size), "scatter_pow": U(r.scatter_pow),
-            "mono": mono, "laser_rgb": torch.where(m, qe, laser_rgb),
+            "laser": pick(r.laser_p, _log_uniform(n, r.laser, gen, dev), 1.0),
+            "sigma": pick(r.sigma_p, U(r.sigma), self.base.sigma),
+            "aspect": pick(r.aspect_p, U(r.aspect), 1.0), "angle": math.pi * rand(),
+            "speckle": pick(r.speckle_p, U(r.speckle), 0.0),
+            "scatter_on": (rand() < r.scatter_p).float(),
+            "mono": mono.float(), "laser_rgb": torch.where(m, qe, rgb),
             "ambient_rgb": torch.where(m, 1.0, tint),
-            "wb": torch.where(m, 1.0, torch.exp(U((math.log(r.wb[0]), math.log(r.wb[1])), 3))),
-            "face": torch.where(lit, U(r.face), r.dark_face * rand()),
+            "wb": torch.where(m, 1.0, pick(r.wb_p, LU(r.wb, 3), 1.0)),
+            "face": pick(r.face_p, U(r.face), r.dark_face * rand()),
             "ring_r": U(r.ring_r, N_RING), "ring_w": U(r.ring_w, N_RING),
-            "ring_a": U(r.ring_a, N_RING), "grain": U(r.grain),
+            "ring_a": pick(r.rings_p, U(r.ring_a, N_RING) * n_ring, 0.0),
+            "grain": pick(r.grain_p, U(r.grain), 0.0),
             "grain_tex": fractal_noise(n, TEX_RES, gen, dev),
-            "rim": U(r.rim), "rim_w": U(r.rim_w),
+            "rim": pick(r.rim_p, U(r.rim), 0.0), "rim_w": U(r.rim_w),
             "rim_harm": torch.stack((rand(N_HARM) * 0.8 / torch.arange(1, N_HARM + 1, device=dev),
                                      2 * math.pi * rand(N_HARM)), -1),
-            "surround": U(r.surround),
+            "surround": pick(r.surround_p, U(r.surround), 0.0),
             "engrave_idx": torch.randint(0, N_TEXT, (n,), generator=gen, device=dev),
-            "engrave_amp": torch.where(rand() < r.engrave_p, U(r.engrave_amp), 0.0),
+            "engrave_amp": pick(r.engrave_p, U(r.engrave_amp), 0.0),
             "scratch_c": 0.95 * disk(N_SCRATCH), "scratch_dir": math.pi * rand(N_SCRATCH),
             "scratch_len": U(r.scratch_len, N_SCRATCH), "scratch_w": U((0.006, 0.015), N_SCRATCH),
-            "scratch_amp": sign(N_SCRATCH) * U(r.scratch_amp, N_SCRATCH) * upto(N_SCRATCH),
+            "scratch_amp": pick(r.scratch_p, sign(N_SCRATCH) * U(r.scratch_amp, N_SCRATCH)
+                                * some(N_SCRATCH), 0.0),
             "dust_c": 0.97 * disk(N_DUST), "dust_s": U(r.dust_s, N_DUST),
-            "dust_amp": torch.where(rand(N_DUST) < 0.75, 1.0, -1.0) * U(r.dust_amp, N_DUST)
-                        * upto(N_DUST),
-            "gradient": U(r.gradient)[:, None] * F.normalize(torch.randn(
-                n, 2, generator=gen, device=dev), dim=1),
-            "vignetting": U(r.vignetting),
-            "exposure": _log_uniform(n, r.exposure, gen, dev), "gamma": U(r.gamma),
-            "black": U(r.black), "read_noise": U(r.read_noise), "shot_noise": U(r.shot_noise),
-            "prnu": U(r.prnu),
+            "dust_amp": pick(r.dust_p, torch.where(rand(N_DUST) < 0.75, 1.0, -1.0)
+                             * U(r.dust_amp, N_DUST) * some(N_DUST), 0.0),
+            "gradient": pick(r.gradient_p, U(r.gradient)[:, None] * F.normalize(torch.randn(
+                n, 2, generator=gen, device=dev), dim=1), 0.0),
+            "vignetting": pick(r.vignetting_p, U(r.vignetting), 0.0),
+            "exposure": pick(r.exposure_p, _log_uniform(n, r.exposure, gen, dev), 1.0),
+            "gamma": pick(r.gamma_p, U(r.gamma), 1.0),
+            "black": pick(r.black_p, U(r.black), 0.0),
+            "read_noise": pick(r.read_noise_p, U(r.read_noise), 0.0),
+            "shot_noise": pick(r.shot_noise_p, U(r.shot_noise), 0.0),
+            "prnu": pick(r.prnu_p, U(r.prnu), 0.0),
             "prnu_map": torch.randn(n, 1, self.res, self.res, generator=gen, device=dev),
-            "row_noise": U(r.row_noise),
+            "row_noise": pick(r.row_noise_p, U(r.row_noise), 0.0),
             "hot_idx": torch.randint(0, self.res**2, (n, N_HOT), generator=gen, device=dev),
-            "hot_val": U((0.4, 1.0), N_HOT) * hot_on,
+            "hot_val": pick(r.hot_p, U(r.hot, N_HOT) * some(N_HOT), 0.0),
         }
+        clean = rand() < r.clean_p
+        neutral = self.neutral_params(n)
+        return {k: torch.where(clean.view(n, *([1] * (v.dim() - 1))), neutral[k], v)
+                for k, v in p.items()}
 
-    # ── Geometry ──
+    # ── Geometry and targets ──
 
     def spots_camera(self, hit_mirror: torch.Tensor, hit_local_xy: torch.Tensor,
                      p: CameraParams) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -357,12 +424,25 @@ class CameraRenderer:
 
     def labels(self, hit_mirror: torch.Tensor, hit_local_xy: torch.Tensor,
                p: CameraParams) -> Dict[str, torch.Tensor]:
-        """Camera-frame targets: spot centres in pixels (n, K, 2) as (col, row), peak
-        reflectivity^k (n, K), visible (n, K) (an M2 hit inside the field), count (n,)."""
+        """Camera-frame spot centres in pixels (n, K, 2) as (col, row), peak reflectivity^k
+        (n, K), visible (n, K) (an M2 hit inside the field), count (n,) of the visible."""
         uv, w, valid = self.spots_camera(hit_mirror, hit_local_xy, p)
         px = (uv + 1.0) * self.res / 2 - 0.5
         vis = valid & (uv.abs() <= 1.0).all(-1)
         return {"pos_px": px, "peak": w, "visible": vis, "count": vis.sum(1)}
+
+    def targets(self, hit_mirror: torch.Tensor, hit_local_xy: torch.Tensor, p: CameraParams,
+                map_sigma_px: float = 1.0) -> Dict[str, torch.Tensor]:
+        """Training targets in the camera frame: spot_map (n, 1, H, W) float32, a Gaussian
+        of map_sigma_px at every M2 spot (also those the image does not show; the field
+        clips those outside it), peak reflectivity^k, overlaps summed (as
+        targets.TargetBuilder in the mirror frame); count (n,) int64, all M2 spots."""
+        uv, w, valid = self.spots_camera(hit_mirror, hit_local_xy, p)
+        n = uv.shape[0]
+        q = {"scale": p["scale"], "sigma": map_sigma_px * self.base.pitch / p["scale"],
+             "aspect": torch.ones(n, device=self.device), "angle": torch.zeros(n, device=self.device)}
+        spot_map = self._spot_layer(uv, w * valid, q)[:, None]
+        return {"spot_map": spot_map, "count": valid.sum(1)}
 
     # ── Layers ──
 
@@ -379,14 +459,13 @@ class CameraRenderer:
         val = torch.exp(-0.5 * (v(A) * dx * dx + 2 * v(B) * dx * dy + v(C) * dy * dy))
         return (w[:, :, None, None] * val).sum(1)
 
-    def _scatter_layer(self, src: torch.Tensor, weight: torch.Tensor,
-                       p: CameraParams) -> torch.Tensor:
-        """(n, H, W): flat-top blobs at the canonical rim points src (n, S, 2)."""
+    def _scatter_layer(self, q: torch.Tensor, weight: torch.Tensor, size: torch.Tensor,
+                       power: torch.Tensor) -> torch.Tensor:
+        """(n, H, W): flat-top blobs at camera points q (n, S, 2), peaks weight (n, S),
+        radius size (n,) in camera normalized units, super-Gaussian exponent power (n,)."""
         v = lambda t: t[:, None, None, None]
-        q = _apply(p["warp"], src)
         d = (self.cam_uv[None, None] - q[:, :, None, None]).norm(dim=-1)  # (n, S, H, W)
-        blob = torch.exp(-(d / v(p["scatter_size"] * p["scale"])) ** v(p["scatter_pow"]))
-        return v(p["scatter_amp"])[:, 0] * (weight[:, :, None, None] * blob).sum(1)
+        return (weight[:, :, None, None] * torch.exp(-(d / v(size)) ** v(power))).sum(1)
 
     def _face_layer(self, XY: torch.Tensor, p: CameraParams) -> torch.Tensor:
         """(n, H, W) mirror-face intensity at canonical points XY (n, H, W, 2)."""
@@ -433,23 +512,30 @@ class CameraRenderer:
     def render(self, hit_mirror: torch.Tensor, hit_local_xy: torch.Tensor, p: CameraParams,
                gen: torch.Generator, miss: Optional[Miss] = None) -> torch.Tensor:
         """(n, 3, H, W) uint8."""
-        n, res, dev = hit_mirror.shape[0], self.res, self.device
+        n, res, dev, r = hit_mirror.shape[0], self.res, self.device, self.ranges
         v3 = lambda t: t[:, :, None, None]  # (n, 3) -> (n, 3, 1, 1)
         v1 = lambda t: t[:, None, None, None]  # (n,) -> (n, 1, 1, 1)
 
         # Canonical point under each camera pixel, mirror mask (anti-aliased edge)
         XY = _apply(p["warp_inv"], self.cam_uv.expand(n, res, res, 2))
-        r = XY.norm(dim=-1)
+        rad = XY.norm(dim=-1)
         px_c = 2.0 / res / p["scale"]
-        mask = ((1.0 - r) / px_c[:, None, None] + 0.5).clamp(0.0, 1.0)
+        mask = ((1.0 - rad) / px_c[:, None, None] + 0.5).clamp(0.0, 1.0)
 
         g0 = self.base.gain * p["exposure"]
         p = {**p, "face": -torch.log1p(-p["face"].clamp(max=0.99)) / g0}  # Brightness -> I
         uv, w, _ = self.spots_camera(hit_mirror, hit_local_xy, p)
         w = w * torch.exp(p["speckle"][:, None] * torch.randn(w.shape, generator=gen, device=dev))
+
+        # Edge scatter: on per episode, its look per frame (the beam moves on the rim)
         src, weight = self.scatter_sources(hit_mirror, hit_local_xy, miss, p)
+        amp = p["scatter_on"] * _log_uniform(n, r.scatter_amp, gen, dev)
+        size = _uniform(n, r.scatter_size, gen, dev)
+        power = _uniform(n, r.scatter_pow, gen, dev)
+        cam_src = _apply(p["warp"], src)
         laser = v1(p["laser"])[:, 0] * mask * (
-            self._spot_layer(uv, w, p) + self._scatter_layer(src, weight, p))
+            self._spot_layer(uv, w, p)
+            + self._scatter_layer(cam_src, weight * amp[:, None], size * p["scale"], power))
 
         uvc = self.cam_uv[None]
         illum = (1.0 + (uvc * p["gradient"][:, None, None]).sum(-1)) \
