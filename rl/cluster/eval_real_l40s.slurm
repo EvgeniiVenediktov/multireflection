@@ -39,7 +39,7 @@ AXIS_MAP="${AXIS_MAP:-all}"
 module purge
 cd "$PROJECT_DIR/rl"
 mkdir -p "$OUT"
-echo "job ${SLURM_JOB_ID:-none} on $(hostname), $(date); ckpt $CKPT; encoder ${ENCODER:-(the checkpoint's)}"
+echo "job ${SLURM_JOB_ID:-none} on $(hostname), $(date); ckpt $CKPT; encoder ${ENCODER:-from the checkpoint}"
 ENC_ARGS=()
 [ -n "$ENCODER" ] && ENC_ARGS=(--encoder "$ENCODER")
 srun --cpus-per-task="${SLURM_CPUS_PER_TASK:-4}" "$VENV_PY" -u eval_real.py eval --ckpt "$CKPT" \
