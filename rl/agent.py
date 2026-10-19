@@ -104,7 +104,7 @@ class Ring(NamedTuple):
     z: torch.Tensor  # (B, K, Dz) float32 frame embeddings
     a: torch.Tensor  # (B, K, 2) float32 applied action that led to each frame
     valid: torch.Tensor  # (B, K) bool, same episode as the newest entry
-    frame: torch.Tensor  # (B, K, 1, H, W) uint8 (re-encoding when the encoder trains)
+    frame: torch.Tensor  # (B, K, C, H, W) uint8 (re-encoding when the encoder trains)
 
 
 # ── Action distribution (factorized categorical) ────────────────────────────
@@ -360,12 +360,13 @@ class Agent(nn.Module):
         return torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cfg.amp)
 
     def init_ring(self, B: int, device: torch.device) -> Ring:
-        K, dz, r = self.cfg.window, self.cfg.encoder.z_dim, self.cfg.encoder.img_res
+        e = self.cfg.encoder
+        K, dz, r = self.cfg.window, e.z_dim, e.img_res
         return Ring(
             z=torch.zeros(B, K, dz, device=device),
             a=torch.zeros(B, K, 2, device=device),
             valid=torch.zeros(B, K, dtype=torch.bool, device=device),
-            frame=torch.zeros(B, K, 1, r, r, dtype=torch.uint8, device=device),
+            frame=torch.zeros(B, K, e.in_ch, r, r, dtype=torch.uint8, device=device),
         )
 
     # ── Pieces ──

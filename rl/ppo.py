@@ -119,6 +119,20 @@ Cluster: cluster/ppo_l40s.slurm.
                and, for the four-setup set, eval/ (the keys of run 4398136) and
                eval_samp/. Per split: FLAT_METRICS (stop_low: share of episodes ended
                by not move below 0.9 P_ref, stop_low_path_frac: their mean P / P_ref)
+    camera     --camera: the env renders 3-channel camera images (render_camera.CameraRenderer,
+               augmentation parameters per env and episode, --camera-set overrides of
+               render_camera.CameraRanges as field=value[,...], tuples as lo:hi, e.g.
+               rotation_p=0); the encoder takes 3 channels (EncoderConfig.in_ch; a 1-channel
+               encoder in --init-from is skipped by shape, --encoder-init gives the 3-channel
+               one). Eval envs: --camera-eval clean (default: every effect off, comparable
+               with SpotRenderer evals) or train (the training ranges); the camera generator
+               is reseeded at every eval (the same augmentation each time). Run-name marker
+               _cam (-norot with rotation_p=0)
+    freeze     --freeze-policy: only the encoder trains (token, core and every head keep the
+               init weights; needs --no-encoder-freeze); marker _fp. --stop-at-best V: the
+               run stops after the eval where the best-metric value reaches V and exits 0;
+               a run that ends (steps, signal) below V exits with code 3, so a Slurm
+               afterok dependency starts only after the target was reached
     fine-tune  (pool runs, all off by default) --near-best-frac F --near-best-radius RMIN
                RMAX: a share F of the good-scenario episodes starts at the slot's best
                tilt plus a ring offset, r uniform in [RMIN, RMAX] deg, angle uniform,
@@ -135,7 +149,8 @@ Cluster: cluster/ppo_l40s.slurm.
                the grid scenarios, stratified good / impossible, never drawn in
                training (scenarios.holdout_mask, removed from the sampler's segments)
     logging    train.csv / eval.csv in the run dir; W&B (project herriott-rl) unless
-               --no-wandb, display name built at start from the config
+               --no-wandb, display name built at start from the config, --wandb-tags (comma
+               list) set at start
     checkpoint latest.pt (every --ckpt-minutes and at exit), best.pt (best deterministic
                % of the oracle: on the cont set with the pool, the full set with the
                atlas, else on the set of the run; --best-metric region: the region-bin
@@ -156,14 +171,16 @@ import math
 import os
 import re
 import signal
+import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from agent import Agent, AgentConfig, Ring, entropy, greedy, log_prob, param_groups, sample
+from encoders import EncoderConfig
 from env import AlignEnv, EnvConfig
 from evaluation import BLIND_MAX_BOUNCES, eval_initial_tilts, eval_setups, evaluate, split_metrics
 from geometry import SETUPS, CellGeometry
@@ -237,6 +254,11 @@ class PPOConfig:
     encoder_train_until: float = 1.0  # Encoder frozen from env_steps >= this x total_env_steps; 1 = never
     amp: bool = True
     compile: bool = True
+    camera: bool = False  # 3-channel camera renders (render_camera), encoder in_ch 3
+    camera_set: str = ""  # CameraRanges overrides "field=value,..." (tuples lo:hi)
+    camera_eval: str = "clean"  # Eval renders: clean (every effect off) | train
+    freeze_policy: bool = False  # Train the encoder only (needs --no-encoder-freeze)
+    stop_at_best: float = 0.0  # > 0: stop when the best-metric value reaches it (else exit 3)
 
     # ── PPO ──
     gamma: float = 0.99
@@ -278,6 +300,7 @@ class PPOConfig:
     ckpt_minutes: float = 15.0
     wandb: bool = True
     wandb_project: str = "herriott-rl"
+    wandb_tags: str = ""  # Comma list of W&B tags set at start (e.g. the r<N>-<short> name)
     name_tag: str = ""
 
 
@@ -295,7 +318,31 @@ def env_config(c: PPOConfig, num_envs: int, auto_reset: bool, seed: int,
         num_envs=num_envs, seed=seed, setups=geoms, path_ref=c.path_ref, max_steps=c.max_steps,
         step_cost=c.step_cost, auto_reset=auto_reset, init_center=tuple(c.init_center),
         init_radius=c.init_radius, img_res=c.img_res, history_len=0,
+        camera=camera_ranges(c, training=auto_reset),  # Training env: auto-reset; evals: not
     )
+
+
+def parse_camera_set(spec: str) -> Dict[str, Any]:
+    """--camera-set "field=value,..." -> CameraRanges keyword arguments (lo:hi -> tuple)."""
+    out: Dict[str, Any] = {}
+    for e in (x.strip() for x in spec.split(",")):
+        if e:
+            k, v = e.split("=")
+            out[k.strip()] = tuple(float(x) for x in v.split(":")) if ":" in v else float(v)
+    return out
+
+
+def camera_ranges(c: PPOConfig, training: bool):
+    """render_camera.CameraRanges of the training env (--camera-set applied) or of the eval
+    envs (--camera-eval clean: every effect off; train: the training ranges); None without
+    --camera."""
+    if not c.camera:
+        return None
+    from render_camera import CameraRanges
+
+    r = CameraRanges(**parse_camera_set(c.camera_set))
+    assert c.camera_eval in ("clean", "train"), f"--camera-eval {c.camera_eval!r}"
+    return r if training or c.camera_eval == "train" else replace(r, clean_p=1.0)
 
 
 def pool_mode(c: PPOConfig) -> bool:
@@ -318,7 +365,8 @@ def agent_config(c: PPOConfig, n_bins: int) -> AgentConfig:
         kw["scen_lo"], kw["scen_hi"] = cont_ranges_of(c).head_range()
     return AgentConfig(window=c.history_len, d_model=c.d_model, n_layers=c.n_layers,
                        n_heads=c.n_heads, mlp_ratio=c.mlp_ratio, n_bins=n_bins, amp=c.amp,
-                       enc_chunk=c.enc_chunk, enc_checkpoint=c.enc_checkpoint, **kw)
+                       enc_chunk=c.enc_chunk, enc_checkpoint=c.enc_checkpoint,
+                       encoder=EncoderConfig(in_ch=3 if c.camera else 1), **kw)
 
 
 # ── Schedules ───────────────────────────────────────────────────────────────
@@ -430,11 +478,11 @@ class Rollout:
     """Preallocated per-iteration buffers (B envs, C = K - 1 context + T steps)."""
 
     def __init__(self, B: int, T: int, K: int, dz: int, res: int, n_slots: int,
-                 device: torch.device, n_scen: int = 3):
+                 device: torch.device, n_scen: int = 3, ch: int = 1):
         L = K - 1 + T
         z = lambda *s, **kw: torch.zeros(*s, device=device, **kw)
         self.B, self.T, self.K, self.C, self.S = B, T, K, K - 1, n_slots
-        self.frames = z(B, L, 1, res, res, dtype=torch.uint8)
+        self.frames = z(B, L, ch, res, res, dtype=torch.uint8)
         self.z = z(B, L, dz)
         self.a_in = z(B, L, 2)
         self.real = z(B, L, dtype=torch.bool)
@@ -449,7 +497,7 @@ class Rollout:
         self.tilt = z(B, T, 2)
         self.scen = z(B, T, n_scen)  # Scenario parameters in scenario-head units
         self.slot_t = z(B, n_slots, dtype=torch.long)  # Truncation step per slot, -1 = none
-        self.slot_frame = z(B, n_slots, 1, res, res, dtype=torch.uint8)
+        self.slot_frame = z(B, n_slots, ch, res, res, dtype=torch.uint8)
         self.slot_a = z(B, n_slots, 2)
         self.v_final = z(B, T)
         self.v_last = z(B)
@@ -899,6 +947,8 @@ def run_eval(agent: Agent, es: EvalSet, eval_seed: int, sampled: bool,
         gen = torch.Generator(device=es.env.device)
         gen.manual_seed(eval_seed * 1_000_003 + 4099)  # Same noise at every eval
     pol = EvalPolicy(agent, gen, es.tilts.shape[0] if per_episode else 0)
+    if es.env.cam is not None:
+        es.env.reseed_camera(eval_seed * 1_000_003 + 31)  # Same augmentation at every eval
     ep, met = evaluate(es.env, pol, es.tilts, es.oracle["target_path_mm"], es.oracle["ret"],
                        init_setups=es.setups)
     pre = es.prefix_samp if sampled else es.prefix
@@ -1030,6 +1080,12 @@ class Trainer:
             self.encoder_info = self.agent.load_encoder(c.encoder_init)
             if c.init_from:
                 print(f"encoder replaced by {c.encoder_init} after init-from", flush=True)
+        if c.freeze_policy:  # Encoder only: token, core and heads keep their weights
+            assert not c.encoder_freeze or c.unfreeze_at >= 0, "--freeze-policy needs --no-encoder-freeze"
+            for k, p in self.agent.named_parameters():
+                if not k.startswith("encoder."):
+                    p.requires_grad_(False)
+            print("policy frozen: only the encoder trains", flush=True)
         if c.compile:
             self.agent.compile()
         self.opt = torch.optim.AdamW(
@@ -1048,7 +1104,7 @@ class Trainer:
         self.next_first = torch.ones(B, dtype=torch.bool, device=dev)
         self.n_slots = math.ceil(c.rollout_len / c.max_steps)
         self.buf = Rollout(B, c.rollout_len, K, self.agent.cfg.encoder.z_dim, c.img_res,
-                           self.n_slots, dev, self.agent.n_scen)
+                           self.n_slots, dev, self.agent.n_scen, self.agent.cfg.encoder.in_ch)
         self.iteration = 0
         self.env_steps = 0
         self.best_eval = -math.inf
@@ -1437,7 +1493,8 @@ class Trainer:
                   + ("trains until the end" if stop is None else
                      f"frozen from iteration {stop} ({stop * steps_per_iter} env steps >= "
                      f"{c.encoder_train_until:g} x {c.total_env_steps})"), flush=True)
-        while self.env_steps < c.total_env_steps and self.stop_signal is None:
+        reached = lambda: c.stop_at_best > 0 and self.best_eval >= c.stop_at_best  # noqa: E731
+        while self.env_steps < c.total_env_steps and self.stop_signal is None and not reached():
             it = self.iteration
             if it > 0 and self.encoder_trains() != self.encoder_trains(it - 1):
                 if self.encoder_trains():
@@ -1522,9 +1579,14 @@ class Trainer:
                 last_ckpt = time.time()
         self.save("latest.pt")
         log.close()
-        why = f"signal {self.stop_signal}" if self.stop_signal is not None else "done"
+        why = (f"signal {self.stop_signal}" if self.stop_signal is not None else
+               f"--stop-at-best {c.stop_at_best:g} reached" if reached() else "done")
         print(f"stopped ({why}) at iteration {self.iteration}, {self.env_steps} env steps; "
               f"latest.pt written", flush=True)
+        if c.stop_at_best > 0 and not reached():
+            print(f"--stop-at-best {c.stop_at_best:g} not reached (best {self.best_eval:.2f}): "
+                  f"exit code 3", flush=True)
+            sys.exit(3)
 
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -1554,10 +1616,11 @@ class Logger:
             import wandb
 
             self.wandb_id = wandb_id or uuid.uuid4().hex[:12]  # Kept in the checkpoint
+            tags = [t.strip() for t in config.get("wandb_tags", "").split(",") if t.strip()]
             self.wb = wandb.init(project=project, name=name, id=self.wandb_id, resume="allow",
                                  config={**config, "encoder_info": encoder_info,
                                          "init_info": init_short},
-                                 dir=os.environ.get("WANDB_DIR", run_dir))
+                                 tags=tags or None, dir=os.environ.get("WANDB_DIR", run_dir))
         with open(os.path.join(run_dir, "config.json"), "w") as f:
             json.dump({"name": name, "config": config, "encoder_info": encoder_info,
                        "init_info": init_short}, f, indent=1)
@@ -1644,13 +1707,15 @@ def encoder_origin(encoder_info: Optional[dict]) -> str:
             enc += f"-pregrid{m.group(1)}"
         else:
             enc += f"-pre{encoder_info.get('n_setups', 1)}"
+        if nm.endswith("_cam") or "_cam_" in nm:
+            enc += "-cam"  # Camera-mode encoder (pretrain_encoder.py --camera)
     return enc
 
 
 def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     """Display / directory name from the config, built at start:
     ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_ee<N>][_eu<F>][_pr<F>][_nb<F>[r<lo>-<hi>]]
-    [_rmix][_bm<metric>][_<tag>]_<jobid>;
+    [_rmix][_bm<metric>][_cam[-norot][-evtrain]][_fp][_stop<V>][_<tag>]_<jobid>;
     <enc>: encoder_origin; <scen>: <ranges>-plr / -unif with the pool (ContRanges.tag,
     e.g. cont20-400-plr), full-plr / full-unif with the atlas (prioritized / uniform
     good draws), or set<S>, with -ho<pct>[s<seed>] when grid scenarios are held out
@@ -1690,6 +1755,13 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
         name += "_rmix"
     if c.best_metric != "cont":
         name += f"_bm{c.best_metric}"
+    if c.camera:
+        rot = parse_camera_set(c.camera_set).get("rotation_p")
+        name += "_cam" + ("-norot" if rot == 0 else "") + ("-evtrain" if c.camera_eval == "train" else "")
+    if c.freeze_policy:
+        name += "_fp"
+    if c.stop_at_best > 0:
+        name += f"_stop{c.stop_at_best:g}"
     if c.name_tag:
         name += f"_{c.name_tag}"
     return name + "_" + os.environ.get("SLURM_JOB_ID", "local")
@@ -1701,7 +1773,8 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
 RESUME_OVERRIDES = ("total_env_steps", "eval_every", "ckpt_minutes", "wandb", "wandb_project",
                     "unfreeze_at", "encoder_lr_scale", "compile", "target_kl", "eval_sampled",
                     "enc_checkpoint", "eval_sets", "eval_tables", "encoder_epochs",
-                    "encoder_train_until", "near_best_frac", "near_best_radius", "best_metric")
+                    "encoder_train_until", "near_best_frac", "near_best_radius", "best_metric",
+                    "stop_at_best")
 PATH_FIELDS = ("encoder_init", "init_from", "atlas", "eval_tables")
 TUPLE_FIELDS = tuple(f.name for f in fields(PPOConfig) if isinstance(getattr(PPOConfig(), f.name), tuple))
 LEGACY_DEFAULTS = {"scenarios": "atlas"}  # Checkpoints from before the field: the grid atlas

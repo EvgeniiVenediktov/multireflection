@@ -327,7 +327,7 @@ def run_name(args: argparse.Namespace, cfg: EncoderConfig, init_name: str = "") 
     steps = f"{k:g}k" if args.steps >= 1000 else str(args.steps)
     name = f"{model_name(cfg)}_w{cfg.width if cfg.arch == 'vit' else cfg.cnn_widths[-1]}" \
            f"_lr{args.lr:g}_b{args.batch}_{steps}_s{args.seed}"
-    if args.init_agent:
+    if getattr(args, "init_agent", ""):  # Optional: callers may pass a partial Namespace
         name += f"_ft-{args.init_agent_tag}"
     elif args.init:
         name += f"_ft-{init_origin(init_name)}"
@@ -338,7 +338,7 @@ def run_name(args: argparse.Namespace, cfg: EncoderConfig, init_name: str = "") 
         name += f"_grid{args.scenarios}"
     elif args.setups == "all":
         name += f"_set{len(SETUPS)}"
-    if args.camera:
+    if getattr(args, "camera", False):
         name += "_cam"
     return name + (f"_{args.tag}" if args.tag else "")
 
@@ -372,7 +372,7 @@ def main():
         args.steps = 8000 if ft else 6000
     if args.warmup is None:
         args.warmup = 100 if ft else 300
-    name = run_name(args, cfg, ck_init.get("name", "") if ft else "")
+    name = run_name(args, cfg, ck_init.get("name", "") if ck_init is not None else "")
     run_dir = os.path.join(args.runs_dir, name)
     os.makedirs(run_dir, exist_ok=True)
 

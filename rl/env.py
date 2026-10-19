@@ -63,10 +63,19 @@ B independent episodes, all state on the device, no host syncs in step() / reset
                such rows exit at once (packing live rows first was measured: no gain,
                the step is render bound); all rows are still rendered (fixed shapes)
 
+    camera     EnvConfig.camera (a render_camera.CameraRanges) switches the images to
+               render_camera.CameraRenderer: 3 channels, augmentation parameters drawn
+               per env and episode at its reset (cam_params, from the env's camera
+               generator cam_gen; reseed_camera(seed) restarts it, e.g. per evaluation),
+               per-frame noise and edge-scatter look, the sim's miss point for the edge
+               scatter; rendered in chunks of camera_chunk rows (compiled layers).
+               render_tilts() stays SpotRenderer
+
 Observation (dict, see AlignEnv.observe):
-    image    (B, 1, H, W) uint8   camera image of the M2 face (SpotRenderer)
+    image    (B, C, H, W) uint8   camera image of the M2 face (SpotRenderer, C = 1; with
+                                  EnvConfig.camera CameraRenderer, C = 3)
     action   (B, 2) float32       applied action that led to the frame (0 at reset)
-    images   (B, K, 1, H, W) uint8, actions (B, K, 2), mask (B, K) bool
+    images   (B, K, C, H, W) uint8, actions (B, K, 2), mask (B, K) bool
                                   history stack (HistoryStack), oldest first
 """
 
@@ -135,6 +144,8 @@ class EnvConfig:
     gain: float = 1.6  # 1 - exp(-gain * I): a unit spot (k = 0) peaks at 0.80
     oversample: int = 0  # Splat grid oversampling; 0 = auto (sigma >= 2.5 grid px)
     history_len: int = 8  # Frames K in the history stack; 0 = no stack
+    camera: Optional[object] = None  # render_camera.CameraRanges: 3-channel camera renders
+    camera_chunk: int = 512  # Rows per CameraRenderer call
 
 
 @dataclass
@@ -526,6 +537,14 @@ class AlignEnv:
             c.max_bounces, c.oversample, dev,
         )
         self.img_shape = (1, c.img_res, c.img_res)
+        self.cam = None
+        if c.camera is not None:
+            from render_camera import CameraRenderer  # (imports env: SpotRenderer)
+
+            self.cam = CameraRenderer(self.renderer, c.camera, seed=c.seed).compile()
+            self.cam_gen = torch.Generator(device=dev)
+            self.reseed_camera(c.seed * 1_000_003 + 17)
+            self.img_shape = (3, c.img_res, c.img_res)
 
         # ── Reward scale per setup ──
         self._box: Optional[Dict[str, torch.Tensor]] = None  # box_stats, computed once
@@ -579,6 +598,8 @@ class AlignEnv:
         self.ep_return = torch.zeros(B, device=dev)
         self.ep_moves = torch.zeros(B, dtype=torch.long, device=dev)
         self.path0 = torch.zeros(B, device=dev)  # Path at episode start
+        if self.cam is not None:  # Augmentation parameters of each env's episode
+            self.cam_params = self.cam.sample_params(B, self.cam_gen)
         if pool is not None:  # The episode's scenario, copied from its pool slot at the draw
             self.scen_params = self.setup_params[0].expand(B, -1).clone()
             self.scen_ref = torch.ones(B, device=dev)
@@ -758,8 +779,32 @@ class AlignEnv:
             s = torch.where(live[:, None], s, self._dead)
         return self.sim.simulate(s, store_world=False)
 
-    def _render(self, out: dict) -> torch.Tensor:
-        return self.renderer(out["hit_mirror"], out["hit_local_xy"])
+    def _render(self, out: dict, cam_params: Optional[Dict[str, torch.Tensor]] = None
+                ) -> torch.Tensor:
+        """Images of the sim rows: SpotRenderer, or with the camera CameraRenderer under
+        cam_params (one row each; default the envs' current episode parameters)."""
+        if self.cam is None:
+            return self.renderer(out["hit_mirror"], out["hit_local_xy"])
+        from render_camera import chunks
+
+        p = self.cam_params if cam_params is None else cam_params
+        hm, lxy = out["hit_mirror"], out["hit_local_xy"]
+        miss = (out["miss_mirror"], out["miss_local_xy"], out["intensity"])
+        return torch.cat([
+            self.cam.render(hm[s], lxy[s], {k: v[s] for k, v in p.items()}, self.cam_gen,
+                            tuple(t[s] for t in miss))
+            for s in chunks(hm.shape[0], self.cfg.camera_chunk)])
+
+    def reseed_camera(self, seed: int):
+        """Restart the camera generator (augmentation parameters and per-frame noise)."""
+        self.cam_gen.manual_seed(seed)
+
+    @staticmethod
+    def _cam_where(mask: torch.Tensor, new: Dict[str, torch.Tensor],
+                   old: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Per env: new camera parameters where mask (B,), old elsewhere."""
+        return {k: torch.where(mask.view(-1, *([1] * (v.dim() - 1))), new[k], v)
+                for k, v in old.items()}
 
     def render_tilts(
         self, tilts: torch.Tensor, setup: Optional[torch.Tensor] = None
@@ -869,6 +914,9 @@ class AlignEnv:
             out = self._simulate(tilt, setup, live=mask, params=self.scen_params)
         else:
             out = self._simulate(tilt, setup, live=mask)
+        if self.cam is not None:
+            self.cam_params = self._cam_where(mask, self.cam.sample_params(B, self.cam_gen),
+                                              self.cam_params)
         img = self._render(out)
 
         self.tilt = tilt
@@ -949,7 +997,11 @@ class AlignEnv:
             )
         else:
             out = self._simulate(new, setup, live=move, params=self.scen_params if pool else None)
-        img = self._render(out)
+        cam_new = cam_rows = None
+        if self.cam is not None and auto:  # Reset rows: the next episode's parameters
+            cam_new = self.cam.sample_params(B, self.cam_gen)
+            cam_rows = {k: torch.cat((v, cam_new[k])) for k, v in self.cam_params.items()}
+        img = self._render(out, cam_rows)
         path_all = out["total_path_length"]
         count_all = out["hit_counts"]
         stop_all = out["stop_reason"]
@@ -1021,6 +1073,8 @@ class AlignEnv:
             self.ep_return = torch.where(done, 0.0, ep_return)
             self.ep_moves = torch.where(done, 0, ep_moves)
             self.path0 = torch.where(done, self.path, self.path0)
+            if cam_new is not None:
+                self.cam_params = self._cam_where(done, cam_new, self.cam_params)
             if self.history is not None:
                 self.history.push(self.image, self.prev_action, done)
         else:
