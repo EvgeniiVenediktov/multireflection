@@ -42,3 +42,21 @@ PPO with the policy frozen). Same starts as the baseline (start: 27.8 % of the e
 | -y,-x | 20.6 % | 26.4 % | 22.6 % | 10.5 % | 13.2 % | 42.0 % | 91.9 % | 89.8 % | 9.1 | 19.9 |
 
 Files: r7b_it2650.json, r7b_it2650_final_frames.png (start / end frames under map y,-x).
+
+## Summary: episodes ending on >= 16 spots (start: 27.8 %), all runs so far
+
+r8 = everything trainable (job 4459206, init from r7b it1050), best.pt at its stop
+(it2673, eval job 4462822); r7b it2950 = r7b best at 386.7M steps (local eval).
+
+| axis map | r6 it7630 | r7b it2650 | r7b it2950 | r8 best |
+|---|---|---|---|---|
+| x,y | 23.1 % | 42.4 % | 40.9 % | 41.3 % |
+| x,-y | 19.3 % | 43.8 % | 40.7 % | 46.8 % |
+| -x,y | 26.6 % | 31.9 % | 36.8 % | 75.2 % |
+| -x,-y | 23.1 % | 37.7 % | 41.0 % | 59.1 % |
+| y,x | 23.8 % | 41.0 % | 37.0 % | 58.4 % |
+| y,-x | 29.3 % | 44.5 % | 46.8 % | 64.6 % |
+| -y,x | 19.1 % | 39.6 % | 39.9 % | 70.6 % |
+| -y,-x | 20.6 % | 26.4 % | 27.2 % | 32.1 % |
+| mean over maps | 23.1 % | 38.4 % | 38.8 % | 56.0 % |
+| mean end in bright band | 20.9 % | 8.3 % | 10.6 % | 6.4 % |
