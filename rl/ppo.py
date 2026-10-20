@@ -128,8 +128,14 @@ Cluster: cluster/ppo_l40s.slurm.
                with SpotRenderer evals) or train (the training ranges); the camera generator
                is reseeded at every eval (the same augmentation each time). Run-name marker
                _cam (-norot with rotation_p=0)
+    log path   --log-path-head: an extra head on the absolute path of the current frame,
+               (log P - LOGP_MID) / LOGP_SCALE (agent.py), MSE x --logp-coef next to the
+               P / P_ref path head; with --freeze-policy it trains with the encoder (a new
+               head, not part of the policy); evals add head_logpath_rel_err (mean
+               |P_hat - P| / P) and head_logpath_log_mae; marker _logp
     freeze     --freeze-policy: only the encoder trains (token, core and every head keep the
-               init weights; needs --no-encoder-freeze); marker _fp. --stop-at-best V: the
+               init weights, except a new --log-path-head; needs --no-encoder-freeze);
+               marker _fp. --stop-at-best V: the
                run stops after the eval where the best-metric value reaches V and exits 0;
                a run that ends (steps, signal) below V exits with code 3, so a Slurm
                afterok dependency starts only after the target was reached
@@ -179,7 +185,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from agent import Agent, AgentConfig, Ring, entropy, greedy, log_prob, param_groups, sample
+from agent import (Agent, AgentConfig, Ring, entropy, greedy, log_prob, logp_denorm, logp_norm,
+                   param_groups, sample)
 from encoders import EncoderConfig
 from env import AlignEnv, EnvConfig
 from evaluation import BLIND_MAX_BOUNCES, eval_initial_tilts, eval_setups, evaluate, split_metrics
@@ -276,6 +283,8 @@ class PPOConfig:
     ent_coef_min: float = 1e-4
     ent_coef_max: float = 0.1
     path_coef: float = 0.5
+    log_path_head: bool = False  # Extra head on log P (mm), see the docstring
+    logp_coef: float = 0.5
     tilt_coef: float = 0.1
     scen_coef: float = 0.1
     lr: float = 3e-4  # Peak
@@ -366,7 +375,8 @@ def agent_config(c: PPOConfig, n_bins: int) -> AgentConfig:
     return AgentConfig(window=c.history_len, d_model=c.d_model, n_layers=c.n_layers,
                        n_heads=c.n_heads, mlp_ratio=c.mlp_ratio, n_bins=n_bins, amp=c.amp,
                        enc_chunk=c.enc_chunk, enc_checkpoint=c.enc_checkpoint,
-                       encoder=EncoderConfig(in_ch=3 if c.camera else 1), **kw)
+                       encoder=EncoderConfig(in_ch=3 if c.camera else 1),
+                       log_path_head=c.log_path_head, **kw)
 
 
 # ── Schedules ───────────────────────────────────────────────────────────────
@@ -494,6 +504,7 @@ class Rollout:
         self.term = z(B, T, dtype=torch.bool)
         self.trunc = z(B, T, dtype=torch.bool)
         self.path = z(B, T)  # Labels of the frame at each step
+        self.lpath = z(B, T)  # log_path head units (agent.logp_norm)
         self.tilt = z(B, T, 2)
         self.scen = z(B, T, n_scen)  # Scenario parameters in scenario-head units
         self.slot_t = z(B, n_slots, dtype=torch.long)  # Truncation step per slot, -1 = none
@@ -558,6 +569,11 @@ class EvalPolicy:
                                            device=m.device)
             self.ep_sums.index_add_(0, info["episode"].clamp(min=0),
                                     torch.stack(vals, 1).double())
+        if "log_path" in out:  # Absolute-path head: relative and log errors over active steps
+            p = info["path_mm"].clamp_min(1.0)
+            ph = logp_denorm(out["log_path"].float())
+            self._acc("lpath_rel", (ph - p).abs() / p * m)
+            self._acc("lpath_logerr", (torch.log(ph) - torch.log(p)).abs() * m)
         act = greedy(out["logits"]) if self.gen is None else sample(out["logits"], self.gen)
         return act, state
 
@@ -581,6 +597,10 @@ class EvalPolicy:
                         f"head_tilt_std_deg{tag}": g("tilt_std_deg") / n})
             for j, k in enumerate(self.SCEN_KEYS):  # NaN for parameters the head lacks
                 out[f"head_{k}{tag}"] = g(k) / n if j < self.agent.n_scen else math.nan
+        if mask is None and "lpath_rel" in self.sums:  # All active steps (no per-episode sums)
+            n = max(float(self.sums["n"]), 1.0)
+            out["head_logpath_rel_err"] = float(self.sums["lpath_rel"]) / n
+            out["head_logpath_log_mae"] = float(self.sums["lpath_logerr"]) / n
         return out
 
 
@@ -1083,9 +1103,10 @@ class Trainer:
         if c.freeze_policy:  # Encoder only: token, core and heads keep their weights
             assert not c.encoder_freeze or c.unfreeze_at >= 0, "--freeze-policy needs --no-encoder-freeze"
             for k, p in self.agent.named_parameters():
-                if not k.startswith("encoder."):
+                if not k.startswith(("encoder.", "log_path.")):
                     p.requires_grad_(False)
-            print("policy frozen: only the encoder trains", flush=True)
+            print("policy frozen: only the encoder" + (" and the log-path head" if c.log_path_head else "")
+                  + " train", flush=True)
         if c.compile:
             self.agent.compile()
         self.opt = torch.optim.AdamW(
@@ -1206,6 +1227,7 @@ class Trainer:
             b.logp[:, t] = log_prob(out["logits"], action)
             b.values[:, t] = self.vnorm.denormalize(out["value"])
             b.path[:, t] = lab["path_norm"]
+            b.lpath[:, t] = logp_norm(lab["path_mm"])
             b.tilt[:, t] = lab["tilt"]
             b.scen[:, t] = ag.scen_norm(lab["scenario_params"])
             self.ring = ring
@@ -1285,8 +1307,8 @@ class Trainer:
         Bm = B // c.minibatches
         assert Bm * c.minibatches == B, "num_envs must be divisible by minibatches"
         params = [p for p in ag.parameters() if p.requires_grad]
-        keys = ("loss", "pg", "vf", "ent", "path", "tilt", "scen", "kl", "clipfrac", "gn",
-                "ent_coef", "ratio_dev")
+        keys = ("loss", "pg", "vf", "ent", "path", "lpath", "tilt", "scen", "kl", "clipfrac",
+                "gn", "ent_coef", "ratio_dev")
         acc = {k: torch.zeros((), device=self.device) for k in keys}
         n_mb = 0
         epochs = enc_epochs = 0
@@ -1313,6 +1335,8 @@ class Trainer:
                 vf = ((out["value"] - ret_n[idx]) ** 2).mean()
                 ent = entropy(out["logits"]).mean()
                 l_path = ((out["path"] - b.path[idx]) ** 2).mean()
+                l_lpath = (((out["log_path"] - b.lpath[idx]) ** 2).mean() if "log_path" in out
+                           else torch.zeros((), device=self.device))
                 tt = b.tilt[idx] / ag.cfg.tilt_scale
                 lv = out["tilt_logvar"]
                 l_tilt = (0.5 * (lv + (tt - out["tilt_mu"]) ** 2 * torch.exp(-lv))).mean()
@@ -1320,7 +1344,7 @@ class Trainer:
                 l_scen = (0.5 * (lvs + (b.scen[idx] - out["scen_mu"]) ** 2 * torch.exp(-lvs))).mean()
                 alpha = self.log_alpha.exp() if c.ent_adaptive else c.ent_coef
                 loss = (pg + c.vf_coef * vf - alpha * ent + c.path_coef * l_path
-                        + c.tilt_coef * l_tilt + c.scen_coef * l_scen)
+                        + c.logp_coef * l_lpath + c.tilt_coef * l_tilt + c.scen_coef * l_scen)
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
                 gn = torch.nn.utils.clip_grad_norm_(params, c.max_grad_norm)
@@ -1333,7 +1357,7 @@ class Trainer:
                     if epoch == 0 and i == 0:
                         acc["ratio_dev"] += (ratio - 1).abs().max()
                     for k, v in (("loss", loss), ("pg", pg), ("vf", vf), ("ent", ent),
-                                 ("path", l_path), ("tilt", l_tilt), ("scen", l_scen),
+                                 ("path", l_path), ("lpath", l_lpath), ("tilt", l_tilt), ("scen", l_scen),
                                  ("kl", kl), ("gn", gn)):
                         acc[k] += v.detach().float()
                     acc["ent_coef"] += torch.as_tensor(alpha, dtype=torch.float32,
@@ -1532,7 +1556,7 @@ class Trainer:
                         "reward_mean": float(st["reward"]) / steps_per_iter,
                         "slot_overflow": float(st["slot_overflow"])})
             for k, v in us.items():
-                if k in ("loss", "pg", "vf", "ent", "path", "tilt", "scen"):
+                if k in ("loss", "pg", "vf", "ent", "path", "lpath", "tilt", "scen"):
                     row[f"loss/{k}"] = float(v)
                 elif k in ("ent_target", "ent_coef", "ent_coef_now"):
                     row[f"ent/{k.replace('ent_', '')}"] = float(v)
@@ -1758,6 +1782,8 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     if c.camera:
         rot = parse_camera_set(c.camera_set).get("rotation_p")
         name += "_cam" + ("-norot" if rot == 0 else "") + ("-evtrain" if c.camera_eval == "train" else "")
+    if c.log_path_head:
+        name += "_logp"
     if c.freeze_policy:
         name += "_fp"
     if c.stop_at_best > 0:

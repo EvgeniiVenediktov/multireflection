@@ -21,6 +21,8 @@ agent.py - Policy network: frame encoder, causal transformer over the last K ste
                        (joint (0, 0) = not move); last layer scaled to ~0 (uniform start)
                value   in the trainer's normalized units (ppo.ValueNorm)
                path    P_t / P_ref of the current frame (path head, P6)
+               log_path  (AgentConfig.log_path_head) the absolute path of the current frame,
+                       (log P_t - LOGP_MID) / LOGP_SCALE, P in mm floored at 1 mm
                tilt    current controlled tilt / tilt_scale: mean and log-variance (2 + 2)
                scenario  (separation, laser pitch, laser yaw[, laser dx, laser dy]), each
                        mapped to [-1, 1] over the training range (scen_lo, scen_hi; 3
@@ -83,6 +85,7 @@ class AgentConfig:
     channels_last: bool = True  # Encoder weights and inputs in NHWC (tensor-core convs)
     enc_chunk: int = 1024  # Images per checkpointed chunk when the encoder trains
     enc_checkpoint: bool = True  # False: keep the encoder activations (no recompute)
+    log_path_head: bool = False  # Head on the absolute path: (log P - LOGP_MID) / LOGP_SCALE
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
 
     def to_dict(self) -> dict:
@@ -108,6 +111,20 @@ class Ring(NamedTuple):
 
 
 # ── Action distribution (factorized categorical) ────────────────────────────
+
+
+LOGP_MID = 7.0  # log(mm) at the centre of the path range (~1.1 m)
+LOGP_SCALE = 2.0  # log units per normalized unit (paths ~20 mm .. ~50 m -> about -2 .. +2)
+
+
+def logp_norm(path_mm: torch.Tensor) -> torch.Tensor:
+    """Absolute path (mm) -> log_path head units."""
+    return (torch.log(path_mm.clamp_min(1.0)) - LOGP_MID) / LOGP_SCALE
+
+
+def logp_denorm(x: torch.Tensor) -> torch.Tensor:
+    """log_path head output -> absolute path (mm)."""
+    return torch.exp(x * LOGP_SCALE + LOGP_MID)
 
 
 def log_prob(logits: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -250,6 +267,8 @@ class Agent(nn.Module):
         assert len(c.scen_lo) == len(c.scen_hi) and len(c.scen_lo) in (3, 5), "scenario range"
         self.n_scen = len(c.scen_lo)
         self.scenario = _mlp(c.d_model, hid, 2 * self.n_scen)
+        if c.log_path_head:
+            self.log_path = _mlp(c.d_model, hid, 1)
         lo = torch.tensor(c.scen_lo, dtype=torch.float32)
         hi = torch.tensor(c.scen_hi, dtype=torch.float32)
         self.register_buffer("scen_mid", (hi + lo) / 2, persistent=False)
@@ -409,6 +428,7 @@ class Agent(nn.Module):
             "tilt_logvar": t[..., 2:].clamp(c.logvar_min, c.logvar_max),
             "scen_mu": sc[..., :self.n_scen],
             "scen_logvar": sc[..., self.n_scen:].clamp(c.logvar_min, c.logvar_max),
+            **({"log_path": self.log_path(h).squeeze(-1)} if c.log_path_head else {}),
         }
 
     def scen_norm(self, params: torch.Tensor) -> torch.Tensor:
