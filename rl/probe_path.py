@@ -7,11 +7,14 @@ record per step the core output h of the current frame (the input of the heads),
 existing path head's output (P / P_ref) and the labels of that frame: path P (mm), P_ref,
 bounces. Train / val / test splits are separate rollout segments (new episodes).
 
-Two new heads with the path head's shape (MLP d_model -> head_hidden -> outputs) are
-trained on h alone, on the same frames:
+New heads with the path head's shape (MLP d_model -> head_hidden -> outputs) are trained
+on h alone, on the same frames (--heads, comma list):
     logP          log P (P in mm, floored at 1 mm), MSE on the standardized target
     logP+bounces  the same plus a bounce-count classifier (0 .. the env's bounce cap,
                   cross-entropy x --w-bounces) from the same hidden layer
+    <name>_w      the same with per-frame loss weights 1 / (number of bins x the train
+                  share of the frame's bounce bin), mean 1: every bounce bin (BINS) carries
+                  the same total weight (rare high-bounce frames count more)
 AdamW; the learning rate drops on validation plateaus (validation loss of the head's own
 objective) and the training stops after the last one (train to convergence); exit code 3
 if a head reaches --max-epochs first. On the test split the heads are compared with the
@@ -69,19 +72,36 @@ def target(path_mm: torch.Tensor) -> torch.Tensor:
     return torch.log(path_mm.clamp_min(1.0))
 
 
+def bin_index(bounces: torch.Tensor) -> torch.Tensor:
+    """(N,) index into BINS."""
+    idx = torch.zeros_like(bounces, dtype=torch.long)
+    for i, (lo, hi) in enumerate(BINS):
+        idx = torch.where((bounces >= lo) & (bounces <= hi), i, idx)
+    return idx
+
+
+def bin_weights(train_bounces: torch.Tensor):
+    """Per-bin loss weights 1 / (number of non-empty bins x train share), mean 1 on train."""
+    share = torch.bincount(bin_index(train_bounces), minlength=len(BINS)).double()
+    share = share / share.sum()
+    k = int((share > 0).sum())
+    return torch.where(share > 0, 1.0 / (k * share.clamp_min(1e-12)), 0.0).float()
+
+
 def head_loss(out: torch.Tensor, y_std: torch.Tensor, bounces: Optional[torch.Tensor],
-              w_bounces: float) -> torch.Tensor:
-    """MSE on the standardized log P (output 0) [+ w_bounces x CE on the bounce logits]."""
-    loss = F.mse_loss(out[:, 0], y_std)
+              w_bounces: float, w: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """MSE on the standardized log P (output 0) [+ w_bounces x CE on the bounce logits],
+    per-frame weights w (None: uniform)."""
+    per = (out[:, 0] - y_std) ** 2
     if bounces is not None:
-        loss = loss + w_bounces * F.cross_entropy(out[:, 1:], bounces)
-    return loss
+        per = per + w_bounces * F.cross_entropy(out[:, 1:], bounces, reduction="none")
+    return (per * w).mean() if w is not None else per.mean()
 
 
 def train_head(agent_cfg, tr: Dict[str, torch.Tensor], va: Dict[str, torch.Tensor], dev,
-               n_cls: int, w_bounces: float, args, log=print):
+               n_cls: int, w_bounces: float, args, log=print, weighted: bool = False):
     """New head on h: log P (n_cls = 0) or log P + bounce logits (n_cls classes), trained
-    until the validation loss plateaus."""
+    until the validation loss plateaus; weighted: per-frame bounce-bin weights."""
     from agent import _mlp
 
     head = _mlp(agent_cfg.d_model, agent_cfg.head_hidden, 1 + n_cls).to(dev)
@@ -90,6 +110,10 @@ def train_head(agent_cfg, tr: Dict[str, torch.Tensor], va: Dict[str, torch.Tenso
     mu, sd = yt.mean(), yt.std().clamp_min(1e-6)  # Standardized target
     cls = lambda d: d["bounces"].long().clamp(0, n_cls - 1) if n_cls else None  # noqa: E731
     bt, bv = cls(tr), cls(va)
+    wt = wv = None
+    if weighted:
+        wb = bin_weights(tr["bounces"])
+        wt, wv = wb[bin_index(tr["bounces"])], wb[bin_index(va["bounces"])]
     best, bad, n_red, state, converged = math.inf, 0, 0, None, False
     gen = torch.Generator(device=dev)
     gen.manual_seed(0)
@@ -99,13 +123,14 @@ def train_head(agent_cfg, tr: Dict[str, torch.Tensor], va: Dict[str, torch.Tenso
         for i in range(0, perm.shape[0], args.batch):
             idx = perm[i:i + args.batch]
             loss = head_loss(head(tr["h"][idx]), (yt[idx] - mu) / sd,
-                             bt[idx] if bt is not None else None, w_bounces)
+                             bt[idx] if bt is not None else None, w_bounces,
+                             wt[idx] if wt is not None else None)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
         head.eval()
         with torch.no_grad():
-            vl = head_loss(head(va["h"]), (yv - mu) / sd, bv, w_bounces).item()
+            vl = head_loss(head(va["h"]), (yv - mu) / sd, bv, w_bounces, wv).item()
         if vl < best * (1 - 1e-3):
             best, bad = vl, 0
             state = {k: v.clone() for k, v in head.state_dict().items()}
@@ -168,25 +193,27 @@ def compare(heads: Dict[str, tuple], te: Dict[str, torch.Tensor], mu_train: floa
     return out
 
 
-def tables(res: Dict[str, Dict]) -> str:
-    rows = ["### Path (relative error of the absolute path; MAE in P_ref units)", "",
-            "| frames | n | logP: median | logP+bounces: median | old head: median | logP: mean | "
-            "logP+bounces: mean | old head: mean | logP: MAE P_ref | logP+bounces: MAE P_ref | "
-            "old head: MAE P_ref | constant: median |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|"]
-    for name, r in res.items():
-        a, b, o, c = r["logP"], r["logP+bounces"], r["old_path_head"], r["constant"]
-        rows.append(f"| {name} | {a['n']} | {100 * a['rel_err_median']:.1f} % | {100 * b['rel_err_median']:.1f} % | "
-                    f"{100 * o['rel_err_median']:.1f} % | {100 * a['rel_err_mean']:.1f} % | "
-                    f"{100 * b['rel_err_mean']:.1f} % | {100 * o['rel_err_mean']:.1f} % | "
-                    f"{a['mae_pref_units']:.3f} | {b['mae_pref_units']:.3f} | {o['mae_pref_units']:.3f} | "
-                    f"{100 * c['rel_err_median']:.1f} % |")
-    rows += ["", "### Bounce count (logP+bounces head)", "",
-             "| frames | exact | within 2 | MAE (bounces) |", "|---|---|---|---|"]
-    for name, r in res.items():
-        bm = r.get("logP+bounces/bounces")
-        if bm:
-            rows.append(f"| {name} | {100 * bm['acc']:.1f} % | {100 * bm['acc_within2']:.1f} % | {bm['mae']:.2f} |")
+def tables(res: Dict[str, Dict], heads) -> str:
+    cols = list(heads) + ["old_path_head"]
+    rows = []
+    for metric, title, fmt in (("rel_err_median", "median relative error of the absolute path", "{:.1f} %"),
+                               ("rel_err_mean", "mean relative error of the absolute path", "{:.1f} %"),
+                               ("mae_pref_units", "MAE in P_ref units", "{:.3f}")):
+        rows += [f"### Path: {title}", "", "| frames | n | " + " | ".join(cols) + " |",
+                 "|---|---|" + "---|" * len(cols)]
+        for name, r in res.items():
+            vals = [r[c][metric] * (100 if "%" in fmt else 1) for c in cols]
+            rows.append(f"| {name} | {r[cols[0]]['n']} | " + " | ".join(fmt.format(v) for v in vals) + " |")
+        rows.append("")
+    for h in heads:
+        if not any(f"{h}/bounces" in r for r in res.values()):
+            continue
+        rows += [f"### Bounce count ({h})", "", "| frames | exact | within 2 | MAE (bounces) |", "|---|---|---|---|"]
+        for name, r in res.items():
+            bm = r.get(f"{h}/bounces")
+            if bm:
+                rows.append(f"| {name} | {100 * bm['acc']:.1f} % | {100 * bm['acc_within2']:.1f} % | {bm['mae']:.2f} |")
+        rows.append("")
     return "\n".join(rows)
 
 
@@ -200,6 +227,8 @@ def main():
     ap.add_argument("--pool-size", type=int, default=0, help="0: the run's (smaller: smoke tests)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--w-bounces", type=float, default=0.1, help="Bounce cross-entropy weight")
+    ap.add_argument("--heads", default="logP,logP+bounces",
+                    help="Comma list of logP, logP+bounces, logP_w, logP+bounces_w")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--patience", type=int, default=5)
     ap.add_argument("--factor", type=float, default=0.3)
@@ -232,12 +261,15 @@ def main():
     print(f"frames: train {tr['h'].shape[0]}, val {va['h'].shape[0]}, test {te['h'].shape[0]}", flush=True)
     n_cls = trainer.env.cfg.max_bounces + 1
     heads, info = {}, {}
-    for name, nc in (("logP", 0), ("logP+bounces", n_cls)):
+    for name in (x.strip() for x in args.heads.split(",") if x.strip()):
+        base = name[:-2] if name.endswith("_w") else name
+        assert base in ("logP", "logP+bounces"), f"--heads: unknown {name!r}"
         print(f"== head {name}", flush=True)
-        head, norm, inf = train_head(trainer.agent.cfg, tr, va, dev, nc, args.w_bounces, args,
-                                     log=lambda s: print(s, flush=True))
+        head, norm, inf = train_head(trainer.agent.cfg, tr, va, dev, n_cls if base == "logP+bounces" else 0,
+                                     args.w_bounces, args, log=lambda s: print(s, flush=True),
+                                     weighted=name.endswith("_w"))
         heads[name], info[name] = (head, norm), inf
-    res = compare(heads, te, float(heads["logP"][1][0]))
+    res = compare(heads, te, float(next(iter(heads.values()))[1][0]))
     out = {"ckpt": os.path.abspath(args.ckpt), "iteration": ck["iteration"], "env_steps": ck["env_steps"],
            "frames": {"train": int(tr["h"].shape[0]), "val": int(va["h"].shape[0]), "test": int(te["h"].shape[0])},
            "w_bounces": args.w_bounces, "bounce_classes": n_cls, "training": info, "test": res}
@@ -246,7 +278,9 @@ def main():
     md = (f"# Path probe: {os.path.basename(os.path.dirname(os.path.abspath(args.ckpt)))} "
           f"iteration {ck['iteration']}\n\nNew heads on the frozen core features vs the existing path head "
           f"(P / P_ref x true P_ref) on {out['frames']['test']} test frames ({out['frames']['train']} train). "
-          f"Training: {info}.\n\n" + tables(res) + "\n")
+          f"Training: {info}. Bounce-bin loss weights (_w heads): "
+          f"{dict(zip([f'{lo}-{hi}' for lo, hi in BINS], [round(x, 2) for x in bin_weights(tr['bounces']).tolist()]))}"
+          f".\n\n" + tables(res, heads) + "\n")
     with open(os.path.join(args.out, "probe_path.md"), "w") as f:
         f.write(md)
     torch.save({k: {"head": h.state_dict(), "mu": float(n[0]), "sd": float(n[1])} for k, (h, n) in heads.items()},
