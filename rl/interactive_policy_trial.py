@@ -18,8 +18,10 @@ Panels
                (P_max), the tilt-head estimate (mean +- 1 std) and, once the episode
                ended, the oracle's target. Below: the scenario and the last episode vs its
                oracle
-    camera     the 64 px uint8 image the agent receives (env.SpotRenderer), step, bounce
-               count, path, stop reason, episode state
+    camera     the 64 px uint8 image the agent receives, in the render style (sim:
+               env.SpotRenderer; camera clean / camera train: render_camera.CameraRenderer)
+               and the agent's input channels (RGB for 3, gray for 1), step, bounce
+               count, path, stop reason, input (style, channels), episode state
     beam       x-z and y-z side views (z / separation) of the ray between the mirrors
                (dashed: the leaving ray), both mirror faces with the hit points (local x / y,
                color = bounce index)
@@ -44,9 +46,33 @@ Controls and keys
     mouse      landscape: click or drag sets the start tilt (new episode, mount resolution
                0.01 deg); laser-offset disk: click or drag sets laser dx / dy (kept inside the
                hole); sliders: separation (0.5 mm steps), laser pitch / yaw, M2 pitch / yaw
-               (start tilt; work without a policy); checkpoint path box (Enter loads)
-    buttons    named setups (measured, sep116, sep144, sep169: their separation, laser tilt
-               and measured offset; the start moves to the setup's nominal tilt), random
+               (start tilt; work without a policy); value box right of each slider: click,
+               type a number, Enter applies it (clipped to the slider range, snapped to its
+               step), Escape or a click elsewhere cancels; checkpoint path box (Enter loads)
+    buttons    list / prev / next (right of the checkpoint box) over runs/ppo/*/*best*.pt
+               (sorted by run and file name, rescanned on every click so newly copied files
+               appear): list opens a menu of them (a section per run directory, the loaded
+               one marked; a native Tk menu, TkAgg only), prev / next take the previous /
+               next file (from the loaded checkpoint, else the first / last); the file is
+               loaded as from the box, which then shows its path; render: sim /
+               camera clean / camera train (cycles; the env is rebuilt and a new episode
+               starts at the start tilt): sim = env.SpotRenderer (1 channel, runs r2-r6),
+               camera clean = render_camera.CameraRenderer with every effect off
+               (CameraRanges(clean_p=1), 3 channels, the camera runs' evals), camera train
+               = the run's training augmentation (ppo.camera_ranges(training=True); a run
+               without --camera: CameraRanges() with rotation_p 0), parameters drawn per
+               episode (pose, color camera, lit face, marks, edge scatter, sensor noise:
+               each new episode a new look). A loaded checkpoint starts in camera clean if
+               it trained with --camera, else in sim. The image reaches the agent with its
+               encoder's in_ch channels: 1 -> 3 copies the gray image (as the 3-channel
+               encoders were trained to take it), 3 -> 1 takes the channel mean (rounded);
+               the camera panel shows that image
+               named setups (measured, sep116, sep144, sep169: their separation, laser tilt
+               and measured offset; the start moves to the setup's nominal tilt), ROC 200 /
+               150 mm (mirror radius of curvature, both mirrors; 200: the measured cell, the
+               atlas and every run; 150: the simulator of March 2026): a switch rescans the
+               scenario and starts a new episode at the start tilt, at 150 P_max comes from
+               the scan and every scenario is EXTRAPOLATION, random
                good (separation 20-400 mm), random short (20-49 mm), random long (201-400
                mm): laser angles uniform in -8..+8 deg, offset uniform in the hole disk, only
                valid scenarios, the first good one of up to 64 candidates (else the valid one
@@ -57,8 +83,9 @@ Controls and keys
                { / }: -/+5 mm
 Decision log (one pair of files per session in runs/viewer_logs/, gitignored; --no-log):
     <session>_steps.csv     a row per agent step: the scenario (incl. laser_dx_mm /
-                            laser_dy_mm), tilt before / after, the action (ladder
-                            step and applied delta, deg; not_move), P(not move), the
+                            laser_dy_mm, roc_mm), render style, tilt before / after, the
+                            action (ladder step and applied delta, deg; not_move), P(not
+                            move), the
                             probability of the taken step and the top 3 steps per axis,
                             the full per-axis distributions (p_pitch_<units>, p_yaw_...),
                             value, path head vs the true path (m, P / P_ref), tilt head
@@ -67,8 +94,9 @@ Decision log (one pair of files per session in runs/viewer_logs/, gitignored; --
                             laser_dy_mm>, nan where the head has no value) vs the scenario,
                             reward, return so far, stop reason, done flags
     <session>_episodes.csv  a row per played episode (stopped, truncated, or abandoned by
-                            a new start / scenario / checkpoint): scenario (incl.
-                            laser_dx_mm / laser_dy_mm), P_max, valid / invalid_reason,
+                            a new start / scenario / checkpoint / ROC / render style):
+                            scenario (incl. laser_dx_mm / laser_dy_mm, roc_mm), render
+                            style, P_max, valid / invalid_reason,
                             in_training_range (0: extrapolation) / range_note, start,
                             steps, moves, final tilt and path, P / P_max, return, and the
                             oracle of that scenario and start (baselines.plan_oracle):
@@ -77,7 +105,8 @@ Decision log (one pair of files per session in runs/viewer_logs/, gitignored; --
     printed as one line, and the last one is shown under the scenario text
 Agent state: as ppo.Trainer.rollout at batch 1. AlignEnv in scenario mode with one scenario
 (P_ref = max(P_max, P_floor), the atlas rule), no auto-reset, history_len 0, the run's
-max_steps / step_cost / image size (ppo.env_config). agent.act() on each new frame with the
+max_steps / step_cost / image size (ppo.env_config), the camera of the render style.
+agent.act() on each new frame (Session.agent_image: its encoder's channels) with the
 applied action that led to it (zero at the episode start) and the episode-start flag; the
 Ring holds the last K = 16 (embedding, action) tokens. Action = per-axis argmax
 (agent.greedy) or Gumbel-max sample (agent.sample); the episode ends on (0, 0) or after
@@ -90,9 +119,12 @@ and captured only when the scenario or a setting changes, "frame" (the rest) on 
 update. Panel texts are FastText (FreeType line bitmaps cached per line; matplotlib 3.11
 rasterizes Text glyph by glyph in Python, the main cost before), labels are static. Slider
 and button redraw hooks are off, and the checkpoint box does not redraw the whole figure
-on every click (matplotlib's TextBox does). Slider and map-drag recomputes are throttled
-(one per throttle_ms, the last value always applied, flushed on mouse release); a
-coalesced slider event only redraws its slider. Run steps on a canvas timer.
+on every click (matplotlib's TextBox does); a slider value box redraws only its slider; a
+checkpoint picked with list / prev / next costs one full draw (the box is in the
+background).
+Slider and map-drag recomputes are throttled (one per throttle_ms, the last value always
+applied, flushed on mouse release); a coalesced slider event only redraws its slider. Run
+steps on a canvas timer.
 GPU: simulation, rendering and the agent stay on the device; agent.act() replays a CUDA
 graph (GraphAct: bit-identical, ~1.4 ms instead of 5-10 ms of kernel launches). One
 device-to-host copy per frame; a scenario change adds the copy of the scan (and AlignEnv's
@@ -123,14 +155,23 @@ from find_setups import box_grid, candidate_states
 from geometry import SETUPS, CellGeometry, setup_by_name
 from herriott_sim import (DEVICE, S_LASER_DX, S_LASER_DY, STOP_BLOCKED, STOP_HOLE, STOP_MISSED,
                           STOP_NAMES, HerriottSim)
-from ppo import PPOConfig, ValueNorm, agent_config, env_config
+from ppo import PPOConfig, ValueNorm, agent_config, camera_ranges, env_config
 from scenarios import DEFAULT_ATLAS, AtlasConfig, load_atlas
 
 RL_DIR = os.path.dirname(os.path.abspath(__file__))
-def newest_best(root: str = os.path.join(RL_DIR, "runs", "ppo")) -> str:
+CKPT_ROOT = os.path.join(RL_DIR, "runs", "ppo")
+
+
+def best_checkpoints(root: str = CKPT_ROOT) -> List[str]:
+    """Every *best*.pt (r<N>-<tag>_best*.pt) under runs/ppo/<run>/, absolute paths sorted by
+    run and file name (the checkpoint picker)."""
+    return sorted(os.path.abspath(p) for p in glob.glob(os.path.join(root, "*", "*best*.pt")))
+
+
+def newest_best(root: str = CKPT_ROOT) -> str:
     """The most recently written *best*.pt (r<N>-<tag>_best*.pt) under runs/ppo/<run>/ (copies from the cluster keep
     the cluster's write time with rsync -a), "" if there is none."""
-    paths = glob.glob(os.path.join(root, "*", "*best*.pt"))
+    paths = best_checkpoints(root)
     return max(paths, key=os.path.getmtime) if paths else ""
 
 
@@ -167,7 +208,7 @@ CBAR_RECT = _px(582, 525, 12, 490)
 SCEN_TXT_RECT = _px(30, 380, 590, 38)
 LAST_TXT_RECT = _px(30, 352, 590, 22)
 CAM_RECT = _px(690, 730, 300, 300)
-CAM_TXT_RECT = _px(655, 588, 520, 130)
+CAM_TXT_RECT = _px(655, 570, 520, 148)
 FACE_RECTS = (_px(670, 265, 235, 235), _px(925, 265, 235, 235))
 HIT_CBAR_RECT = _px(1170, 280, 9, 200)
 SIDE_RECTS = (_px(1265, 925, 595, 105), _px(1265, 768, 595, 105))
@@ -191,6 +232,8 @@ FS_HEAD = 11.5  # Control group headers
 # from the M1 hole centre anywhere in the hole disk (the training space of the runs after
 # 4407578, which trained on 50-200 mm, 0-8 deg and the measured offsets) ──
 SEP_RANGE = (20.0, 400.0)  # mm (slider step 0.5 mm; keys [ ] and { })
+ROCS = (200.0, 150.0)  # mm, mirror ROC button (200: measured cell; 150: March 2026 sim)
+RENDER_STYLES = ("sim", "camera clean", "camera train")  # Render button (env images)
 ANGLE_RANGE = (-8.0, 8.0)  # deg, laser pitch and yaw
 SHORT_SEPS = (20.0, 49.0)  # "random short"
 LONG_SEPS = (201.0, 400.0)  # "random long"
@@ -316,7 +359,7 @@ class Frame:
     path_mm: float
     bounces: int
     stop: int  # herriott_sim STOP_*
-    image: np.ndarray  # (H, W) uint8, the agent's input
+    image: np.ndarray  # (H, W) gray or (H, W, 3) RGB uint8, the agent's input
     applied: np.ndarray  # (2,) deg, applied delta that led to the frame (0 at the start)
     hits: np.ndarray  # (n, 3) world hit points
     hit_mirror: np.ndarray  # (n,) 1 = M1, 2 = M2
@@ -460,8 +503,9 @@ class GraphAct:
 
     def __init__(self, agent: Agent, device: torch.device):
         self.agent = agent
-        r = agent.cfg.encoder.img_res
-        self.image = torch.zeros(1, 1, r, r, dtype=torch.uint8, device=device)
+        e = agent.cfg.encoder
+        self.image = torch.zeros(1, e.in_ch, e.img_res, e.img_res, dtype=torch.uint8,
+                                 device=device)
         self.prev = torch.zeros(1, 2, device=device)
         self.first = torch.ones(1, dtype=torch.bool, device=device)
         self.ring = agent.init_ring(1, device)
@@ -549,6 +593,7 @@ class Session:
         self.ladder_units = np.asarray(self.ecfg.step_ladder, dtype=np.int64)
         self.ladder = self.ladder_units * self.ecfg.step_unit  # deg
         self.hole_r = self.geom.m1_hole_radius
+        self.roc0 = self.geom.roc  # Measured cell: the atlas and every run
         self._center = (self.W // 2) * self.W + self.W // 2  # Grid cell of zero M2 tilt
         # Training range of the loaded checkpoint (without one: the new scenario space)
         self.train_ranges: Dict[str, object] = {
@@ -572,6 +617,7 @@ class Session:
 
         # ── Agent ──
         self.pcfg = PPOConfig()  # Env settings of the loaded run (defaults without one)
+        self.render_style = "sim"  # RENDER_STYLES; a loaded checkpoint sets its own
         self.agent: Optional[Agent] = None
         self._act_fn = None  # agent.act or its GraphAct
         self.vnorm: Optional[ValueNorm] = None
@@ -617,7 +663,8 @@ class Session:
         """Agent of a ppo.py checkpoint (best.pt / latest.pt): its AgentConfig, every tensor
         whose name and shape match (Agent.init_from; an old setup head is skipped, a
         missing scenario head stays untrained and is hidden), the value norm and the run's
-        PPOConfig (env settings). Restarts the episode at the start tilt."""
+        PPOConfig (env settings; render style camera clean for a --camera run, else sim).
+        Restarts the episode at the start tilt."""
         path = os.path.abspath(path)
         ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
         with torch.inference_mode():
@@ -638,6 +685,7 @@ class Session:
         info = agent.init_from(path)
         agent.to(self.device).eval().requires_grad_(False)
         self.agent, self.vnorm, self.pcfg = agent, vn, pcfg
+        self.render_style = "camera clean" if pcfg.camera else "sim"
         self.ckpt_path = path
         try:  # Outputs of the scenario head of this agent.py: mean and log-variance per value
             n_out = agent.scenario[-1].out_features // 2
@@ -671,7 +719,8 @@ class Session:
         self.ckpt_msg = self.ckpt_line
         details = [f"checkpoint {path}",
                    f"  run {info.get('name')}, iteration {it}, {steps / 1e6:.1f} M env steps; "
-                   f"act {mode}", f"  {head}", f"  training range: {self.range_text()}"]
+                   f"act {mode}; input {acfg.encoder.in_ch} ch, render {self.render_style}",
+                   f"  {head}", f"  training range: {self.range_text()}"]
         if info["skipped"]:
             details.append(f"  skipped tensors: {sorted(info['skipped'])}")
         self.log("\n".join(details))
@@ -695,11 +744,11 @@ class Session:
         return tuple(v)
 
     def atlas_index(self, params) -> int:
-        """Atlas row of the scenario (grid point or named setup, measured offset only), -1
-        if none."""
+        """Atlas row of the scenario (grid point or named setup, measured offset and ROC
+        only), -1 if none."""
         sep, lp, ly, dx, dy = self.full_params(params)
         if self.atlas is None or abs(dx - self.geom.laser_dx) > 1e-6 or \
-                abs(dy - self.geom.laser_dy) > 1e-6:
+                abs(dy - self.geom.laser_dy) > 1e-6 or self.geom.roc != self.roc0:
             return -1
         d = np.abs(self._atlas_params - np.array([sep, lp, ly])[None]).max(1)
         i = int(d.argmin())
@@ -758,6 +807,8 @@ class Session:
                 viol.append("fixed offset")
         elif math.hypot(dx, dy) > self.hole_r + e:
             viol.append("offset in the hole")
+        if self.geom.roc != self.roc0:
+            viol.append(f"ROC {self.roc0:g} mm")
         return not viol, ", ".join(viol)
 
     @torch.inference_mode()
@@ -835,12 +886,65 @@ class Session:
             scan_ms=1000 * (time.perf_counter() - t0))
         return self.scenario
 
+    def set_roc(self, roc: float):
+        """Mirror ROC of both mirrors (scan, env, beam view); an open episode is logged
+        first, the caller re-applies the scenario."""
+        self._finish_open()
+        self.geom = replace(self.geom, roc=float(roc))
+        self.sim = self.geom.make_sim(self.device, max_bounces=self.cap)
+
+    def style_ranges(self):
+        """render_camera.CameraRanges of the render style, None for sim (SpotRenderer):
+        camera clean = every effect off; camera train = the run's training ranges (a
+        --camera run), else the defaults without rotation."""
+        if self.render_style == "sim":
+            return None
+        from render_camera import CameraRanges
+
+        if self.render_style == "camera clean":
+            return CameraRanges(clean_p=1.0)
+        return (camera_ranges(self.pcfg, training=True) if self.pcfg.camera
+                else CameraRanges(rotation_p=0.0))
+
+    @torch.inference_mode()
+    def set_render_style(self, style: str) -> Frame:
+        """Render style of the env images (RENDER_STYLES): an open episode is logged, the
+        env rebuilt with its camera, a new episode starts at the start tilt."""
+        assert style in RENDER_STYLES, f"render style {style!r}"
+        self._finish_open()
+        self.render_style = style
+        sc = self.scenario
+        self._build_env(sc.params, torch.tensor([sc.path_ref]))
+        return self.start(self.start_tilt)
+
+    def agent_image(self, image: torch.Tensor) -> torch.Tensor:
+        """(B, C, H, W) uint8 env image with the agent encoder's in_ch channels: 1 -> n
+        copies the gray image (what the 3-channel encoders take for a mono image), n -> 1
+        the channel mean (rounded); as is without an agent."""
+        c = image.shape[1]
+        n = c if self.agent is None else self.agent.cfg.encoder.in_ch
+        if n == c:
+            return image
+        if c == 1:
+            return image.expand(-1, n, -1, -1)
+        assert n == 1, f"no channel adapter for {c} -> {n}"
+        return image.float().mean(1, keepdim=True).round().to(torch.uint8)
+
+    def input_text(self) -> str:
+        """Render style and channels: the env's, -> the agent's when adapted."""
+        c = self.env.img_shape[0]
+        n = c if self.agent is None else self.agent.cfg.encoder.in_ch
+        return f"{self.render_style}, {c} ch" + (f" -> {n}" if n != c else "")
+
     def make_env(self, params, path_ref: torch.Tensor) -> AlignEnv:
         """AlignEnv of the run's settings with one scenario (5 parameters): separation and
-        laser tilt as its one-row table, the laser offset in its geometry; P_ref (1,)."""
+        laser tilt as its one-row table, the laser offset in its geometry; P_ref (1,);
+        images of the render style (EnvConfig.camera = style_ranges())."""
         sep, lp, ly, dx, dy = self.full_params(params)
         ec = env_config(self.pcfg, 1, False, self.cfg.seed, setups="full")
-        ec = replace(ec, geometry=replace(ec.geometry, laser_dx=dx, laser_dy=dy))
+        ec = replace(ec, camera=self.style_ranges(),
+                     geometry=replace(ec.geometry, laser_dx=dx, laser_dy=dy,
+                                      roc=self.geom.roc))
         tab = Scenarios(params=torch.tensor([[sep, lp, ly]], dtype=torch.float32),
                         path_ref=path_ref.float().reshape(1))
         env = AlignEnv(ec, scenarios=tab)
@@ -848,7 +952,12 @@ class Session:
         return env
 
     def _build_env(self, params, path_ref: torch.Tensor):
+        old = self.env
         self.env = self.make_env(params, path_ref)
+        if self.env.cam is not None and old is not None and old.cam is not None:
+            # The camera generator goes on across rebuilds (scenario, checkpoint, style):
+            # camera train shows a new look also after a scenario change
+            self.env.cam_gen.set_state(old.cam_gen.get_state())
 
     # ── Episode ──
 
@@ -904,8 +1013,9 @@ class Session:
         output on the frame (act(); its ring is committed by step()), one host copy."""
         env = self.env
         sim = env.sim.simulate(env.states(env.tilt, env.setup), store_world=True)
+        img = self.agent_image(env.image)
         items = {"tilt": env.tilt[0], "path": env.path[:1], "bounces": env.bounces[:1],
-                 "stop": env.stop[:1], "step": env.step_count[:1], "image": env.image[0, 0],
+                 "stop": env.stop[:1], "step": env.step_count[:1], "image": img[0],
                  "applied": env.prev_action[0] * env.max_step, "count": sim["hit_counts"][:1],
                  "hits": sim["hit_sequence"][0], "mirror": sim["hit_mirror"][0],
                  "local": sim["hit_local_xy"][0], "ep_return": env.ep_return[:1],
@@ -914,8 +1024,7 @@ class Session:
             items.update(action=action[0], term=term[:1], trunc=trunc[:1], reward=reward[:1])
         ag = self.agent
         if ag is not None:
-            out, self._ring_next = self._act_fn(env.image, env.prev_action, self._first,
-                                                self.ring)
+            out, self._ring_next = self._act_fn(img, env.prev_action, self._first, self.ring)
             self._act = (greedy(out["logits"]), sample(out["logits"], self.gen))
             ts = ag.cfg.tilt_scale
             items.update(
@@ -930,9 +1039,11 @@ class Session:
                              scen_std=(0.5 * out["scen_logvar"][0]).exp() * self.head_half)
         h = to_host(items)
         n = int(h["count"][0])
+        im = h["image"].astype(np.uint8)  # (C, H, W) -> gray (H, W) or RGB (H, W, 3)
+        im = im[0] if im.shape[0] == 1 else im.transpose(1, 2, 0)
         f = Frame(step=int(h["step"][0]), tilt=h["tilt"].astype(np.float64),
                   path_mm=float(h["path"][0]), bounces=int(h["bounces"][0]),
-                  stop=int(h["stop"][0]), image=h["image"].astype(np.uint8),
+                  stop=int(h["stop"][0]), image=im,
                   applied=h["applied"].astype(np.float64), hits=h["hits"][:n],
                   hit_mirror=h["mirror"][:n].astype(np.int64), hit_local=h["local"][:n],
                   ep_return=float(h["ep_return"][0]), moves=int(h["moves"][0]))
@@ -963,7 +1074,8 @@ class Session:
             "session": self.log_writer.session if self.log_writer else "",
             "episode": self.episode, "step": f.step, "mode": mode, "scenario": sc.name,
             "sep_mm": sep, "laser_pitch_deg": lp, "laser_yaw_deg": ly,
-            "laser_dx_mm": dx, "laser_dy_mm": dy,
+            "laser_dx_mm": dx, "laser_dy_mm": dy, "roc_mm": self.geom.roc,
+            "render": self.render_style,
             "pitch_before": prev.tilt[0], "yaw_before": prev.tilt[1],
             "pitch_after": f.tilt[0], "yaw_after": f.tilt[1],
             "act_pitch_deg": d[0], "act_yaw_deg": d[1],
@@ -1028,7 +1140,8 @@ class Session:
             "mode": modes[0] if len(modes) == 1 else "mixed",
             "scenario": sc.name, "atlas_index": sc.atlas_index, "sep_mm": sc.params[0],
             "laser_pitch_deg": sc.params[1], "laser_yaw_deg": sc.params[2],
-            "laser_dx_mm": sc.params[3], "laser_dy_mm": sc.params[4],
+            "laser_dx_mm": sc.params[3], "laser_dy_mm": sc.params[4], "roc_mm": self.geom.roc,
+            "render": self.render_style,
             "pmax_m": sc.pmax / 1000, "pref_m": sc.path_ref / 1000, "good": int(sc.good),
             "valid": int(sc.valid), "invalid_reason": sc.invalid_reason,
             "in_training_range": int(sc.in_training_range), "range_note": sc.range_note,
@@ -1065,7 +1178,7 @@ class Session:
 
     def _finish_open(self):
         """An episode with steps that has not ended is logged as abandoned (new start,
-        scenario or checkpoint, window closed)."""
+        scenario, checkpoint or render style, window closed)."""
         if self._ep_open and self._ep_steps > 0:
             self._finish_episode("abandoned")
 
@@ -1202,6 +1315,55 @@ def _fast_textbox_class():
             self._redraw()
 
     return FastTextBox
+
+
+def _slider_box_class():
+    """Value box of a slider (FastTextBox, built on first use): shows the slider's value
+    text, the bare number while typing; Enter submits the typed text and stops typing,
+    Escape or a click elsewhere stops typing without submitting. Text and cursor are
+    animated (drawn with the slider's parts)."""
+    FastTextBox = _fast_textbox_class()
+
+    class SliderBox(FastTextBox):
+        def __init__(self, ax, slider, **kw):
+            self.slider = slider
+            super().__init__(ax, "", initial=slider.valtext.get_text(),
+                             typing=lambda _a: None, **kw)
+            self.text_disp.set_animated(True)
+            self.cursor.set_animated(True)
+            slider.on_changed(lambda _v: self.show_val())  # Before the viewer's callback
+
+        def show_val(self):
+            if not self.capturekeystrokes:
+                self.text_disp.set_text(self.slider.valtext.get_text())
+
+        def begin_typing(self, *args):
+            super().begin_typing(*args)
+            self.text_disp.set_text(self.slider.valfmt.split()[0] % self.slider.val)
+
+        def stop_typing(self):  # Click elsewhere
+            self._end(submit=False)
+
+        def _keypress(self, event):
+            if self.capturekeystrokes and event.key in ("enter", "return", "escape"):
+                self._end(submit=event.key != "escape")
+            else:
+                super()._keypress(event)
+
+        def _end(self, submit: bool):
+            if not self.capturekeystrokes:
+                return
+            text = self.text
+            self._on_stop_typing()  # Shortcut keys back on
+            self._on_stop_typing = None
+            self.capturekeystrokes = False
+            self.cursor.set_visible(False)
+            self.show_val()
+            self._redraw()
+            if submit and self.eventson:
+                self._observers.process("submit", text)
+
+    return SliderBox
 
 
 class Viewer:
@@ -1354,7 +1516,7 @@ class Viewer:
         ax.set_yticks([])
         ax.set_title("camera: agent input (64 px)", **tit)
         _, tax = self._text(CAM_TXT_RECT, "step\nbounces\npath\nstop\ntilt (deg)\nlast move\n"
-                            "episode", layer=None)
+                            "input\nepisode", layer=None)
         self.tx_cam, _ = self._text(None, ax=tax, x=0.24)
 
         # ── Beam: side views and mirror faces ──
@@ -1460,14 +1622,23 @@ class Viewer:
             b.on_clicked(lambda _e: cb())
             return b
 
+        SliderBox = _slider_box_class()
+        self.boxes = {}  # Slider -> its value box
+
         def slider(y, label, lo, hi, v0, step, fmt, cb, layer):
-            ax = fig.add_axes(_px(150, y, 290, 20))
+            ax = fig.add_axes(_px(150, y, 270, 20))
             sl = Slider(ax, label, lo, hi, valinit=v0, valstep=step, valfmt=fmt,
                         initcolor="none", track_color=GRID, color=BLUE)
             sl.drawon = False
-            for t in (sl.label, sl.valtext):
-                t.set_fontsize(FS_LABEL)
-                t.set_color(INK)
+            sl.label.set_fontsize(FS_LABEL)
+            sl.label.set_color(INK)
+            sl.valtext.set_visible(False)  # Shown by the value box
+            box = self.boxes[sl] = SliderBox(
+                fig.add_axes(_px(428, y, 88, 20)), sl, color="white", hovercolor="white",
+                redraw=lambda sl=sl: self._blit_slider(sl))
+            box.text_disp.set_fontsize(FS_LABEL)
+            box.text_disp.set_color(INK)
+            box.on_submit(lambda text, sl=sl: self._on_slider_text(sl, text))
             sl.on_changed(lambda _v, sl=sl: cb(sl))
             for a in self._slider_parts(sl):
                 A(a, layer)
@@ -1479,6 +1650,7 @@ class Viewer:
             w = 100 if g.name == "measured" else 85
             self.buttons[g.name] = button(x, 225, w, g.name, lambda n=g.name: self._on_named(n))
             x += w + 8
+        self.buttons["roc"] = button(x, 225, 100, "", self._on_roc)
         x = 30
         for kind in ("good", "short", "long"):
             self.buttons[f"random {kind}"] = button(x, 186, 125, f"random {kind}",
@@ -1518,13 +1690,20 @@ class Viewer:
         for name, w, cb in (("Step", 75, self._on_step), ("Run", 75, self._on_run),
                             ("Pause", 75, self._on_pause), ("Reset", 75, self._on_reset),
                             ("Random start", 130, self._on_random_start),
-                            ("policy", 165, self._on_mode), ("map", 165, self._on_map_mode)):
+                            ("policy", 165, self._on_mode), ("map", 165, self._on_map_mode),
+                            ("render", 200, self._on_render)):
             self.buttons[name] = button(x, 112, w, name, cb)
             x += w + 8
-        for name in ("policy", "map"):
+        for name in ("policy", "map", "roc", "render"):
             A(self.buttons[name].label, "scene")
         self._set_toggle_labels()
-        ax = fig.add_axes(_px(770, 70, 1090, 30))
+        # Checkpoint picker, right of the box: menu of best_checkpoints(), previous / next file
+        self.buttons["list"] = button(1702, 69, 50, "list", self._on_list)
+        self.buttons["prev"] = button(1756, 69, 50, "prev", lambda: self._on_pick(-1))
+        self.buttons["next"] = button(1810, 69, 50, "next", lambda: self._on_pick(1))
+        self.picked = self.s.ckpt_path  # Picker position: the last picked or loaded file
+        self._menu = None  # The list menu (Tk), kept for the self-test
+        ax = fig.add_axes(_px(770, 70, 926, 30))
         self.textbox = _fast_textbox_class()(
             ax, "checkpoint ", initial=short_path(self.s.cfg.ckpt), color="white",
             hovercolor="white", textalignment="left", redraw=lambda: self._blit(scene=True),
@@ -1536,12 +1715,12 @@ class Viewer:
         self.tx_ckpt, _ = self._text(CKPT_RECT, layer="scene")
         self._show_info()
 
-    @staticmethod
-    def _slider_parts(sl) -> list:
-        """The artists of a slider that move: value bar, handle, value text (the label and
-        track stay in the background)."""
+    def _slider_parts(self, sl) -> list:
+        """The artists of a slider that move: value bar, handle, value box text and cursor
+        (the label, track and box stay in the background)."""
+        box = self.boxes[sl]
         handle = getattr(sl, "_handle", None)
-        return [a for a in (sl.poly, handle, sl.valtext) if a is not None]
+        return [a for a in (sl.poly, handle, box.text_disp, box.cursor) if a is not None]
 
     def _bar_verts(self, h: np.ndarray) -> List[np.ndarray]:
         x0, x1 = self._bar_x - 0.375, self._bar_x + 0.375
@@ -1554,6 +1733,8 @@ class Viewer:
             "policy: sampled" if self.s.sampled else "policy: argmax")
         self.buttons["map"].label.set_text(
             "map: bounces" if self.map_mode == "bounces" else "map: P / P_max")
+        self.buttons["roc"].label.set_text(f"ROC {self.s.geom.roc:g} mm")
+        self.buttons["render"].label.set_text(f"render: {self.s.render_style}")
 
     # ── Drawing ──
 
@@ -1563,12 +1744,11 @@ class Viewer:
         if c.is_saving():
             return
         self._bg = c.copy_from_bbox(self.fig.bbox)
-        r = c.get_renderer()
         self._regions = {}
-        for sl in (self.sl_sep, self.sl_lp, self.sl_ly, self.sl_pitch, self.sl_yaw):
-            a, t = sl.ax.bbox, sl.valtext.get_window_extent(r)
-            bb = Bbox.from_extents(a.x0 - 8, min(a.y0, t.y0) - 6, max(a.x1, t.x1) + 40,
-                                   max(a.y1, t.y1) + 6)
+        for sl, box in self.boxes.items():
+            a, b = sl.ax.bbox, box.ax.bbox
+            bb = Bbox.from_extents(a.x0 - 8, min(a.y0, b.y0) - 6, b.x1 + 6,
+                                   max(a.y1, b.y1) + 6)
             self._regions[sl] = (bb, c.copy_from_bbox(bb))
         self._draw_layer("scene")
         self._bg_scene = c.copy_from_bbox(self.fig.bbox)
@@ -1672,6 +1852,7 @@ class Viewer:
         sl.eventson = False
         sl.set_val(v)
         sl.eventson = True
+        self.boxes[sl].show_val()
 
     def _show(self, f: Frame, scene: bool = False):
         """Update the frame-layer artists in place and blit (scene: also redraw the
@@ -1733,7 +1914,8 @@ class Viewer:
         return (f"{f.step} / {s.env.cfg.max_steps}\n{f.bounces}{cap}\n"
                 f"{f.path_mm / 1000:.3f} m = {ratio(f.path_mm, s.scenario.pmax):.3f} P_max\n"
                 f"{STOP_NAMES[f.stop]}\n{f.tilt[0]:+.3f} / {f.tilt[1]:+.3f}\n"
-                f"{f.applied[0]:+.2f} / {f.applied[1]:+.2f} deg\n{self._episode_state(f)}")
+                f"{f.applied[0]:+.2f} / {f.applied[1]:+.2f} deg\n{s.input_text()}\n"
+                f"{self._episode_state(f)}")
 
     def _show_beam(self, f: Frame):
         s, g = self.s, self.s.geom
@@ -1832,6 +2014,28 @@ class Viewer:
         self._apply_scenario((g.separation, g.laser_pitch, g.laser_yaw), g.name,
                              (g.m2_pitch, g.m2_yaw))
 
+    def _on_roc(self):
+        """Next mirror ROC of ROCS: rescan the scenario, new episode at the start tilt."""
+        s = self.s
+        roc = ROCS[(ROCS.index(s.geom.roc) + 1) % len(ROCS)]
+        self._pause()
+        s.set_roc(roc)
+        self._set_toggle_labels()
+        self._apply_scenario(s.scenario.params, s.scenario.name, note=f"mirror ROC {roc:g} mm")
+
+    def _on_render(self):
+        """Next render style of RENDER_STYLES: env rebuilt, new episode at the start tilt
+        (the first camera render of the process compiles the camera renderer: seconds)."""
+        s = self.s
+        style = RENDER_STYLES[(RENDER_STYLES.index(s.render_style) + 1) % len(RENDER_STYLES)]
+        self._pause()
+        t0 = time.perf_counter()
+        f = s.set_render_style(style)
+        self._set_toggle_labels()
+        self._say(f"render {s.input_text()} ({time.perf_counter() - t0:.1f} s); new episode "
+                  f"at {f.tilt[0]:+.2f} / {f.tilt[1]:+.2f} deg")
+        self._show(f, scene=True)
+
     def _on_random(self, kind: str):
         """Random valid scenario over the scenario space (good: separation 20-400 mm;
         short / long), preferring a good one (Session.random_scenario)."""
@@ -1862,6 +2066,19 @@ class Viewer:
     def _on_tilt_slider(self, sl):
         if not self.th_tilt((self.sl_pitch.val, self.sl_yaw.val)):
             self._blit_slider(sl)
+
+    def _on_slider_text(self, sl, text: str):
+        """A value typed into a slider's box (Enter): snapped to the slider step, clipped to
+        its range and applied at once (as a click)."""
+        try:
+            v = round(float(text.split()[0]) / sl.valstep) * sl.valstep
+        except (IndexError, ValueError, OverflowError):  # Empty, not a number, nan, inf
+            self._say(f"not a number: {text!r}")
+            self._show(self.s.frame, scene=True)
+            return
+        th = self.th_tilt if sl in (self.sl_pitch, self.sl_yaw) else self.th_scen
+        th.last = -math.inf
+        sl.set_val(round(float(np.clip(v, sl.valmin, sl.valmax)), 6))  # Callback applies
 
     def _on_step(self):
         self._pause()
@@ -1924,7 +2141,7 @@ class Viewer:
         self._show_map()
         self._show(self.s.frame, scene=True)
 
-    def _on_load(self, text: str):
+    def _on_load(self, text: str, note: str = ""):
         path = text.strip()
         if not path:
             return
@@ -1936,14 +2153,71 @@ class Viewer:
             self.s.load_checkpoint(path)
             if self.s.frame.step != 0:
                 self.s.start(self.s.start_tilt)
-            self._say(f"loaded {short_path(path)} in {time.perf_counter() - t0:.1f} s")
+            self.picked = self.s.ckpt_path
+            self._say(f"loaded {short_path(path)}{note} in {time.perf_counter() - t0:.1f} s; "
+                      f"render {self.s.render_style}")
         except Exception as e:  # Bad path or format: keep the current agent
             self._say(f"load failed: {type(e).__name__}: {e}")
         # Everything derived from the checkpoint: its line, the training-range marking
-        # (scenario text), the heads (policy panel, redrawn with the frame)
+        # (scenario text), the render style, the heads (policy panel, redrawn with the frame)
         self._show_info()
+        self._set_toggle_labels()
         self._show_scenario()
         self._show(self.s.frame, scene=True)
+
+    def _on_pick(self, d: int):
+        """Previous (d = -1) / next (+1) checkpoint of best_checkpoints(), rescanned on every
+        click (newly copied files appear), from the last picked or loaded file (else the
+        first / last); loaded as from the checkpoint box, which then shows its path."""
+        paths = best_checkpoints()
+        if not paths:
+            self._say(f"no *best*.pt in {short_path(CKPT_ROOT)}/*/")
+            self._show(self.s.frame, scene=True)
+            return
+        i = (paths.index(self.picked) + d if self.picked in paths else
+             (0 if d > 0 else -1)) % len(paths)
+        self._load_picked(paths, i)
+
+    def _on_list(self):
+        """Menu of best_checkpoints() (rescanned), a section per run directory, the loaded
+        file marked; an entry loads as prev / next do. A native Tk menu: TkAgg only."""
+        paths = best_checkpoints()
+        widget = getattr(self.canvas, "get_tk_widget", None)
+        if not paths or widget is None:
+            self._say(f"no *best*.pt in {short_path(CKPT_ROOT)}/*/" if not paths else
+                      "checkpoint list: TkAgg only (use prev / next)")
+            self._show(self.s.frame, scene=True)
+            return
+        import tkinter as tk
+
+        w = widget()
+        if self._menu is not None:
+            self._menu.destroy()
+        self._menu = menu = tk.Menu(w, tearoff=0, font="TkFixedFont")
+        self._menu_var = tk.StringVar(w, self.s.ckpt_path)  # Radio mark of the loaded file
+        run = None
+        for i, p in enumerate(paths):
+            r, name = os.path.basename(os.path.dirname(p)), os.path.basename(p)
+            if run is not None and r != run:
+                menu.add_separator()
+            menu.add_radiobutton(label=f"{r if r != run else '':8s} {name}",
+                                 variable=self._menu_var, value=p,
+                                 command=lambda i=i: self._load_picked(paths, i))
+            run = r
+        # Above the button (it is near the window bottom); Tk keeps the menu on screen
+        b = self.buttons["list"].ax.bbox
+        menu.update_idletasks()
+        menu.tk_popup(w.winfo_rootx() + int(b.x0),
+                      w.winfo_rooty() + int(w.winfo_height() - b.y1) - menu.winfo_reqheight())
+
+    def _load_picked(self, paths: List[str], i: int):
+        """Load paths[i] (picker) as from the checkpoint box, which then shows its path."""
+        self.picked = path = paths[i]  # Also when it fails to load: the next click moves on
+        tb = self.textbox
+        tb.text_disp.set_text(short_path(path))  # No submit; drawn by the full draw below
+        tb.cursor_index = len(tb.text)
+        self._on_load(path, note=f" ({i + 1} / {len(paths)})")
+        self.canvas.draw_idle()  # The box is in the background
 
     # ── Events ──
 
@@ -1995,7 +2269,8 @@ class Viewer:
         self.th_scen.flush()
 
     def _on_key(self, event):
-        if self.textbox.capturekeystrokes:
+        if (self.textbox.capturekeystrokes
+                or any(b.capturekeystrokes for b in self.boxes.values())):
             return
         acts = {"right": self._on_step, "s": self._on_step, " ": self._toggle_run,
                 "r": self._on_reset, "n": self._on_random_start, "d": self._on_mode,
@@ -2157,6 +2432,28 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
     v._on_map_mode()
     v._on_map_mode()
 
+    # Slider value boxes: typed value + Enter (snapped, clipped), not a number, Escape;
+    # keys while typing must not reach the shortcuts
+    def type_in(sl, text: str, end: str = "enter"):
+        click(v.boxes[sl].ax)
+        for k in ("end",) + ("backspace",) * 12 + tuple(text) + (end,):
+            key(k)
+
+    v._on_named("measured")
+    type_in(v.sl_sep, "123.3")
+    sep = s.scenario.params[0]
+    type_in(v.sl_sep, "999")
+    clip = s.scenario.params[0]
+    type_in(v.sl_sep, "abc")
+    bad = v.message.startswith("not a number") and s.scenario.params[0] == clip
+    type_in(v.sl_pitch, "-0.37")
+    pitch = s.start_tilt[0]
+    type_in(v.sl_yaw, "srn", end="escape")
+    checks["slider value boxes"] = (
+        abs(sep - 123.5) < 1e-6 and clip == SEP_RANGE[1] and bad and abs(pitch + 0.37) < 1e-6
+        and s.frame.step == 0 and s.start_tilt[0] == pitch
+        and v.boxes[v.sl_yaw].text == v.sl_yaw.valtext.get_text())
+
     # Episodes: measured cell from the nominal tilt and from a blind start (argmax, checked
     # against evaluation.evaluate and the log), sampled, the other named setups
     print("episodes:")
@@ -2244,6 +2541,22 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
               and "MISSES M2" in v.tx_scen.get_text() and logged(s.scenario, f))
     checks["validity: clipped by hole / misses M2, played and logged"] = clipped and misses
 
+    # Mirror ROC: 150 mm rescans (no atlas, extrapolation), plays and logs; 200 restores
+    v._on_named("measured")
+    sc200 = s.scenario
+    v._on_roc()
+    sc = s.scenario
+    f = run_episode(f"ROC 150 mm, measured ({label(sc)}), argmax")
+    ep = _read_csv(s.log_writer.paths["episodes"])[-1]
+    roc150 = (s.geom.roc == 150.0 and s.env.cfg.geometry.roc == 150.0 and sc.atlas_index < 0
+              and sc.pmax != sc200.pmax and not sc.in_training_range and logged(sc, f)
+              and float(ep["roc_mm"]) == 150.0 and v.buttons["roc"].label.get_text() == "ROC 150 mm")
+    v._on_roc()
+    checks["mirror ROC 150 / 200"] = (roc150 and s.geom.roc == 200.0
+                                      and s.scenario.atlas_index == sc200.atlas_index >= 0
+                                      and s.scenario.pmax == sc200.pmax
+                                      and s.scenario.in_training_range)
+
     # A five-parameter scenario head (synthesized checkpoint: this agent's weights, head
     # with 2 x 5 outputs, range over the scenario space): loads, plays and logs; its head
     # shows if this agent.py builds five-value heads, else it is reported as not loaded
@@ -2325,6 +2638,66 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
     checks["checkpoint box"] = (keys_ok and loaded and v.message.startswith("load failed")
                                 and s.agent is not None)
 
+    # Render styles: each style's images reach the agent with its encoder's channels (the
+    # ring's frames) and the camera panel (gray / RGB); camera train draws a new look per
+    # episode; the cycle ends at the checkpoint's default style
+    print("render styles:")
+    in_ch, res = s.agent.cfg.encoder.in_ch, s.pcfg.img_res
+    shape = (res, res) if in_ch == 1 else (res, res, in_ch)
+    styles_ok = s.render_style == ("camera clean" if s.pcfg.camera else "sim")
+    for _ in RENDER_STYLES:
+        v._on_render()
+        v._on_step()
+        f = s.frame
+        styles_ok &= (s.env.img_shape[0] == (1 if s.render_style == "sim" else 3)
+                      and f.step == 1 and f.image.shape == shape
+                      and v.im_cam.get_array().shape == shape
+                      and s.ring.frame.shape[2] == in_ch and s.render_style in v.message
+                      and _read_csv(s.log_writer.paths["steps"])[-1]["render"] == s.render_style)
+        looks = 1
+        if s.render_style == "camera train":
+            ims = []
+            for _ in range(3):
+                v._on_reset()
+                ims.append(s.frame.image)
+            looks = len({im.tobytes() for im in ims})
+            styles_ok &= looks > 1
+        print(f"  {s.input_text()}: agent input {tuple(s.ring.frame.shape[2:])}, camera panel "
+              f"{f.image.shape}" + (f", {looks} looks in 3 episodes" if looks > 1 else ""))
+    checks["render styles: agent input and camera panel"] = (
+        styles_ok and s.render_style == ("camera clean" if s.pcfg.camera else "sim"))
+
+    # Checkpoint picker: next / prev over best_checkpoints() (from the loaded file), loaded
+    # through the box path (the box shows the file, the render style follows the run)
+    paths, a_path = best_checkpoints(), s.ckpt_path
+    nxt = paths[(paths.index(a_path) + 1) % len(paths) if a_path in paths else 0]
+    v._on_pick(1)
+    v._on_step()
+    next_ok = (s.ckpt_path == nxt and v.textbox.text == short_path(nxt)
+               and v.message.startswith("loaded") and s.frame.step == 1
+               and s.render_style == ("camera clean" if s.pcfg.camera else "sim")
+               and v.buttons["render"].label.get_text() == f"render: {s.render_style}")
+    print(f"  picker next: {v.message}")
+    v._on_pick(-1)
+    prev_ok = (s.ckpt_path == (a_path if a_path in paths else paths[-1])
+               and v.textbox.text == short_path(s.ckpt_path))
+    print(f"  picker prev: {v.message}")
+    checks["checkpoint picker: next / prev"] = next_ok and prev_ok
+
+    # List menu (TkAgg: the entry of a file loads it; Agg: no menu, the message says so)
+    v._on_list()
+    if interactive:
+        m = v._menu
+        m.unpost()
+        j = next(j for j in range(m.index("end") + 1) if m.type(j) == "radiobutton"
+                 and m.entrycget(j, "value") == paths[0])
+        m.invoke(j)
+        list_ok = s.ckpt_path == paths[0] and v.textbox.text == short_path(paths[0])
+        print(f"  picker list: {v.message}")
+    else:
+        list_ok = v.message.startswith("checkpoint list: TkAgg only")
+    checks["checkpoint picker: list"] = list_ok
+
     # Simulator only: tilt and scenario changes work, Step and Run report the missing policy
     s0 = Session(replace(cfg, ckpt="", log_dir=""), log=lambda m: None)
     v0 = Viewer(s0, cfg)
@@ -2360,13 +2733,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=(
             "mouse: click or drag on the landscape sets the start tilt (new episode); click or\n"
             "  drag in the laser-offset disk sets laser dx / dy; Enter in the checkpoint box\n"
-            "  loads it\n"
+            "  loads it; list (menu) / prev / next pick a runs/ppo/*/*best*.pt; the box right\n"
+            "  of each slider takes a typed value (Enter applies, Escape cancels)\n"
+            "render button: sim / camera clean / camera train images for the agent and the\n"
+            "  camera panel (adapted to the agent's input channels)\n"
             "keys: right or s step, space run / pause, r reset (start tilt), n random start,\n"
             "  d argmax / sampled, m map color, g random good scenario, [ / ] separation\n"
             "  -/+0.5 mm, { / } -/+5 mm\n"
             "every played episode is logged (steps and oracle comparison) under --log-dir;\n"
             "the console shows the atlas and log paths at start and the checkpoint details\n"
-            "(path, run name, act mode, scenario head, training range) on every load"))
+            "(path, run name, act mode, input channels, render style, scenario head,\n"
+            "training range) on every load"))
     ap.add_argument("--ckpt", default=d.ckpt,
                     help="ppo.py checkpoint (default: the newest runs/ppo/*/*best*.pt)")
     ap.add_argument("--no-ckpt", action="store_true", help="Simulator only")
