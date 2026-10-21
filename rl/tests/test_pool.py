@@ -38,6 +38,15 @@ Run from rl/:  uv run python tests/test_pool.py
        frame data from sample_valid_scenarios (offsets in the disk, no offset jitter)
    10. pool-mode trainer: save / resume continues the same rollout (pool slots, stream
        position, scores)
+   11. ACCEL levels (camera env): candidates and level merges = a reference selection
+       (shortfall threshold, family cap, top K, ties, candidate capacity); level draws
+       start at the level's tilt, scenario and look (edits: Gaussian tilt offset, no
+       level score update), draw shares; solved levels evicted, in-flight episodes of a
+       replaced level not scored; scenario edits within the ranges, good, of the
+       parent's family; no host syncs in step / reset / observe / draw; save / load
+       (also a checkpoint without levels)
+   12. pool-mode trainer with --accel-levels: save / resume continues the same rollout
+       (levels, candidates)
 """
 
 import argparse
@@ -65,8 +74,10 @@ from geometry import SETUPS, CellGeometry  # noqa: E402
 from herriott_sim import S_LASER_DX, S_LASER_DY, STOP_BLOCKED, STOP_HOLE  # noqa: E402
 from ppo import (PPOConfig, Trainer, ValueNorm, config_from_dict, cont_eval_set,  # noqa: E402
                  encoder_origin, eval_set_names, run_name)
-from scenarios import (STREAM_ENCODER, STREAM_EVAL, STREAM_POOL, AtlasConfig, ContConfig,  # noqa: E402
-                       ContRanges, PoolConfig, SamplerConfig, Scanner, ScenarioPool, box_states,
+from render_camera import CameraRanges  # noqa: E402
+from scenarios import (SRC_EDIT, SRC_FRESH, SRC_LEVEL, STREAM_ENCODER, STREAM_EVAL,  # noqa: E402
+                       STREAM_POOL, AtlasConfig, ContConfig, ContRanges, LevelConfig,
+                       PoolConfig, SamplerConfig, Scanner, ScenarioPool, box_states,
                        build_cont_table, candidate_batch, cont_sep_bins, cont_table_path,
                        load_or_build_cont, offgrid_eval_scenarios, sample_valid_scenarios,
                        scenario_geometry)
@@ -87,12 +98,12 @@ def full_first_hit(sc: Scanner, params: np.ndarray):
 
 
 def make_pool(size=64, frac=0.25, seed=0, ranges=NARROW, round_min=64, round_max=2048,
-              **sampler) -> ScenarioPool:
+              levels=None, **sampler) -> ScenarioPool:
     kw = dict(min_seen=4, beta=1.0, rho=0.1)
     kw.update(sampler)
     return ScenarioPool(PoolConfig(size=size, ranges=ranges, refresh_frac=frac, seed=seed,
                                    round_min=round_min, round_max=round_max),
-                        SamplerConfig(**kw), device=DEV, log=lambda s: None)
+                        SamplerConfig(**kw), device=DEV, log=lambda s: None, levels=levels)
 
 
 # ── 1. Generator ────────────────────────────────────────────────────────────
@@ -411,6 +422,249 @@ def test_env_pool():
           f"observe: no sync")
 
 
+# ── 11. ACCEL levels ────────────────────────────────────────────────────────
+
+
+def level_reference(table, K: int, thresh: float, cap: int):
+    """Expected level merge of entries (dicts with score, fam) in table order: the best
+    cap per family by score (ties: table order), score >= thresh, the top K by score."""
+    order = sorted(range(len(table)), key=lambda i: -table[i]["score"])  # Stable
+    count, kept = {}, []
+    for i in order:
+        f = table[i]["fam"]
+        if count.get(f, 0) < cap:
+            count[f] = count.get(f, 0) + 1
+            if table[i]["score"] >= thresh:
+                kept.append(i)
+    return kept[:K]
+
+
+def look_keys(env) -> list:
+    return [k for k, v in env.cam_params.items() if v[0].numel() <= 256]
+
+
+def run_levels(env, pool, gen, steps: int, thresh: float, log: list, starts=None):
+    """Random-action steps with observe; appends the reference candidates (shortfall,
+    family, slot, parameters, start tilt, stored look) to log; starts (dict): checks the
+    new episodes drawn from levels and counts them."""
+    B, N, lim = env.num_envs, pool.n_slots, env.limit
+    keys = look_keys(env)
+    for _ in range(steps):
+        a = torch.randint(0, env.n_bins, (B, 2), generator=gen, device=DEV)
+        a = torch.where((torch.rand(B, generator=gen, device=DEV) < 0.08)[:, None], 0, a)
+        _, _, term, trunc, info = env.step(a)
+        done = term | trunc
+        s, src, g = info["setup"], info["scenario_src"], info["scenario_gen"]
+        short = (1.0 - info["ep_final_path_mm"] / pool.pmax[s]).clamp(0.0, 1.0)
+        m = done & (g == pool.slot_gen[s]) & pool.good[s] & (src >= SRC_FRESH) & (short >= thresh)
+        for i in torch.nonzero(m).squeeze(1).tolist():
+            log.append({"score": float(short[i]), "fam": int(pool.uid[s[i]]),
+                        "params": pool.atlas.params[s[i]].clone(),
+                        "tilt": info["ep_initial_tilt"][i].clone(),
+                        "look": {k: info["ep_look"][k][i].clone() for k in keys}})
+        pool.observe(s, info["ep_final_path_mm"], done, src, g, info["ep_initial_tilt"], info["ep_look"])
+        if starts is not None:  # New episodes (auto-reset rows) drawn from the levels
+            lv = done & (env.scen_src >= SRC_LEVEL)
+            j = env.setup[lv] - N
+            assert bool(pool.lv_on[j].all()) and torch.equal(env.scen_params[lv], pool.atlas.params[env.setup[lv]])
+            for k in keys:
+                assert torch.equal(env.cam_params[k][lv], pool.lv_look[k][j]), k
+            plain = done & (env.scen_src == SRC_LEVEL)
+            assert torch.equal(env.tilt0[plain], pool.lv_tilt[env.setup[plain] - N].clamp(-lim, lim))
+            ed = done & (env.scen_src == SRC_EDIT)
+            dev_ = (env.tilt0[ed] - pool.lv_tilt[env.setup[ed] - N]).abs()
+            starts["edit_dev"].append(dev_)
+            starts["level"] += int(plain.sum())
+            starts["edit"] += int(ed.sum())
+            starts["all"] += int(done.sum())
+
+
+def test_levels():
+    print("\n== 11. ACCEL levels ==")
+    K, cap, thresh, C = 24, 2, 0.3, 96
+    lc = LevelConfig(size=K, share=0.5, thresh=thresh, family_cap=cap, jitter=0.05, jitter_p=0.5,
+                     edits=0, candidates=C)
+    pool = make_pool(frac=0.25, levels=lc)
+    N = pool.n_slots
+    env = AlignEnv(EnvConfig(num_envs=256, history_len=0, seed=11, max_steps=12,
+                             camera=replace(CameraRanges(), clean_p=0.0)), pool=pool)
+    keys = look_keys(env)
+    assert "grain_tex" not in keys and "prnu_map" not in keys and len(keys) > 20
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(12)
+    assert pool.q_level == 0.0 and not bool(pool.lv_on.any())
+
+    # First merge: candidates only, capacity C (the first C in capture order)
+    log: list = []
+    run_levels(env, pool, gen, 40, thresh, log)
+    assert len(log) > C, len(log)
+    want = level_reference(log[:C], K, thresh, cap)
+    pool.refresh(1)
+    st = pool.last_levels
+    assert st["candidates"] == len(log) and st["dropped"] == len(log) - C and st["inserted"] == len(want)
+    assert torch.nonzero(pool.lv_on).squeeze(1).tolist() == list(range(len(want)))
+    for j, i in enumerate(want):
+        e = log[i]
+        assert torch.equal(pool.atlas.params[N + j], e["params"]) and torch.equal(pool.lv_tilt[j], e["tilt"])
+        assert float(pool.score[N + j]) == e["score"] and int(pool.uid[N + j]) == e["fam"]
+        assert bool(pool.good[N + j]) and bool(pool.seen[N + j])
+        for k in keys:
+            assert torch.equal(pool.lv_look[k][j], e["look"][k]), k
+    fams = torch.bincount(pool.uid[N:][pool.lv_on]).max()
+    n1 = len(want)
+    q = 0.9 * 0.5 * n1 / K
+    assert abs(pool.q_level - q) < 1e-12
+
+    # Level draws: start at the level's tilt (edits: Gaussian offset), scenario and look
+    starts = {"level": 0, "edit": 0, "all": 0, "edit_dev": []}
+    log2: list = []
+    run_levels(env, pool, gen, 40, thresh, log2, starts)
+    share = (starts["level"] + starts["edit"]) / starts["all"]
+    dv = torch.cat(starts["edit_dev"])
+    assert abs(share - q) < 0.05 and starts["edit"] > 0 and starts["level"] > 0, (share, q, starts)
+    assert bool((dv.sum(1) > 0).all()) and float(dv.max()) < 6 * lc.jitter
+
+    # Edit episodes update no level score; level episodes do (EMA)
+    L = torch.tensor([N], device=DEV)
+    s0 = float(pool.score[N])
+    one = torch.ones(1, dtype=torch.bool, device=DEV)
+    for src, want_s in ((SRC_EDIT, s0), (SRC_LEVEL, 0.7 * s0)):
+        pool.observe(L, pool.pmax[L].clone(), one, torch.tensor([src], dtype=torch.int8, device=DEV),
+                     pool.slot_gen[L].clone(), pool.lv_tilt[:1].clone())
+        assert abs(float(pool.score[N]) - want_s) < 1e-6, (src, float(pool.score[N]), want_s)
+    for _ in range(6):  # Solved: below the threshold, evicted at the next merge
+        pool.observe(L, pool.pmax[L].clone(), one, torch.tensor([SRC_LEVEL], dtype=torch.int8, device=DEV),
+                     pool.slot_gen[L].clone(), pool.lv_tilt[:1].clone())
+    assert float(pool.score[N]) < thresh
+
+    # Second merge: the filled levels (current scores) and the new candidates
+    on = torch.nonzero(pool.lv_on).squeeze(1).tolist()
+    ex = [{"score": float(pool.score[N + j]), "fam": int(pool.uid[N + j]), "j": j,
+           "params": pool.atlas.params[N + j].clone(), "tilt": pool.lv_tilt[j].clone()} for j in on]
+    table = ex + log2[:C]
+    want = level_reference(table, K, thresh, cap)
+    gen_before = pool.slot_gen[N:].clone()
+    pool.refresh(2)
+    kept = {table[i]["j"] for i in want if i < len(ex)}
+    new = [table[i] for i in want if i >= len(ex)]
+    free = sorted(set(range(K)) - kept)
+    exp = {j: table[i] for i in want if i < len(ex) for j in [table[i]["j"]]}
+    exp.update(dict(zip(free, new)))
+    assert sorted(torch.nonzero(pool.lv_on).squeeze(1).tolist()) == sorted(exp)
+    for j, e in exp.items():
+        assert torch.equal(pool.atlas.params[N + j], e["params"]) and torch.equal(pool.lv_tilt[j], e["tilt"])
+        assert int(pool.uid[N + j]) == e["fam"]
+        assert (j in kept) == bool(pool.slot_gen[N + j] == gen_before[j]), j
+    assert 0 not in kept and pool.last_levels["evicted"] == len(ex) - len(kept)
+
+    # Scenario edits: within the ranges, beam-valid, good (direct scan), the parent's family
+    pre = {(int(pool.uid[N + j]), tuple(pool.lv_tilt[j].tolist())) for j in range(K) if bool(pool.lv_on[j])}
+    pre_prm = pool.atlas.params[N:][pool.lv_on].clone()
+    pool.lcfg = replace(lc, edits=64, family_cap=4)
+    log3: list = []
+    run_levels(env, pool, gen, 10, thresh, log3)
+    pool.refresh(3)
+    st = pool.last_levels
+    assert st["edits_tried"] == 64 and 0 < st["edits_good"] <= st["edits_valid"] <= 64 and st["inserted_edits"] > 0
+    cand_prm = torch.stack([e["params"] for e in log3[:C]]) if log3 else pre_prm[:0]
+    known = torch.cat((pre_prm, cand_prm))
+    edit_j = [j for j in range(K) if bool(pool.lv_on[j])
+              and not bool((pool.atlas.params[N + j] == known).all(1).any())]
+    assert len(edit_j) == st["inserted_edits"], (len(edit_j), st)
+    r = NARROW
+    prm = pool.atlas.params[N + torch.tensor(edit_j, device=DEV)]
+    p64 = prm.double().cpu().numpy()
+    assert bool(((p64[:, 0] >= r.sep[0]) & (p64[:, 0] <= r.sep[1])).all()) and bool(r.angle_ok(p64).all())
+    assert bool((np.hypot(p64[:, 3], p64[:, 4]) < r.offset_radius).all())
+    d = pool.scanner.scan(prm)
+    assert bool(d["good"].all()) and torch.equal(d["pmax"], pool.atlas.pmax[N + torch.tensor(edit_j, device=DEV)])
+    for j in edit_j:
+        assert (int(pool.uid[N + j]), tuple(pool.lv_tilt[j].tolist())) in pre
+
+    # No host syncs from the levels: a sim-render env on the same pool (the camera's
+    # sample_params syncs by itself), the look paths with the camera env's parameters
+    env2 = AlignEnv(EnvConfig(num_envs=256, history_len=0, seed=13, max_steps=12), pool=pool)
+    acts = [torch.randint(0, env.n_bins, (256, 2), generator=gen, device=DEV) for _ in range(4)]
+    mask = torch.rand(256, generator=gen, device=DEV) < 0.5
+    look, lsrc = env.cam_params, torch.full((256,), SRC_LEVEL, dtype=torch.int8, device=DEV)
+    lslot = N + torch.randint(0, K, (256,), generator=gen, device=DEV)
+    env2.step(acts[0])
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for a in acts:
+            _, _, term, trunc, info = env2.step(a)
+            done = term | trunc
+            pool.observe(info["setup"], info["ep_final_path_mm"], done, info["scenario_src"],
+                         info["scenario_gen"], info["ep_initial_tilt"], look)
+        env2.reset(mask)
+        pool.draw(torch.rand(256, device=DEV))
+        pool.level_look(lslot, lsrc, look)
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    torch.cuda.synchronize()
+
+    # Save / load; a checkpoint without levels into a pool with levels
+    sd = pool.state_dict()
+    p2 = make_pool(frac=0.25, levels=pool.lcfg)
+    p2.load_state_dict(sd)
+    pool.refresh(pool.iteration)  # The draw distribution of the current scores (as the load)
+    n = min(int(pool.c_count), C)
+    same = (torch.equal(p2.lv_on, pool.lv_on) and torch.equal(p2.lv_tilt, pool.lv_tilt)
+            and torch.equal(p2.uid, pool.uid) and torch.equal(p2.score, pool.score)
+            and torch.equal(p2.cdf, pool.cdf) and torch.equal(p2.atlas.params, pool.atlas.params)
+            and int(p2.c_count) == int(pool.c_count) and torch.equal(p2.c_tilt[:n], pool.c_tilt[:n])
+            and all(torch.equal(p2.lv_look[k], pool.lv_look[k]) for k in keys)
+            and all(torch.equal(p2.c_look[k][:n], pool.c_look[k][:n]) for k in keys))
+    assert same
+    p0 = make_pool(frac=0.25)
+    p3 = make_pool(frac=0.25, levels=lc)
+    p3.load_state_dict(p0.state_dict())
+    assert not bool(p3.lv_on.any()) and torch.equal(p3.atlas.params[:N], p0.atlas.params)
+    assert p3.score.numel() == N + K and p3.q_level == 0.0
+    print(f"  merges = reference selection ({n1} levels from {len(log)} candidates, {C} kept, "
+          f"<= {cap} per family (max {int(fams)}); second merge kept {len(kept)}, evicted "
+          f"{len(ex) - len(kept)} incl. a solved level); level draws {share:.3f} of the new episodes "
+          f"(expected {q:.3f}), {starts['edit']} with a tilt edit (max offset {float(dv.max()):.3f} "
+          f"deg), tilt / scenario / look as stored; edits {st['edits_good']} good of "
+          f"{st['edits_tried']}, {st['inserted_edits']} inserted, in range, scan-consistent; no "
+          f"sync; save / load (and from a pool without levels)")
+
+
+def test_pool_resume_accel(tmp: str):
+    print("\n== 12. pool-mode trainer with levels: save / resume ==")
+    d = os.path.join(tmp, "resume_accel")
+    cfg = PPOConfig(setups="full", scenarios="pool", sep_range=(80.0, 120.0), pool_size=64,
+                    pool_refresh=0.25, num_envs=16, rollout_len=24, max_steps=6, history_len=6,
+                    d_model=64, n_layers=2, n_heads=4, mlp_ratio=2.0, amp=False, compile=False,
+                    wandb=False, minibatches=4, eval_every=0, seed=7, total_env_steps=10**6,
+                    plr_min_seen=2, accel_levels=16, accel_share=0.5, accel_edits=16)
+    a = Trainer(cfg, d, build_eval=False)
+    assert "_accel16_" in a.name
+    for _ in range(3):
+        a.sampler.refresh(a.iteration)
+        a.rollout()
+        a.update()
+        a.iteration += 1
+    a.save("latest.pt")
+    a.sampler.refresh(a.iteration)
+    a.rollout()
+    snap = {k: getattr(a.buf, k).clone() for k in ("frames", "actions", "logp", "rewards", "scen",
+                                                   "first")}
+    lv = {k: getattr(a.pool, k).clone() for k in ("lv_on", "lv_tilt", "uid", "score", "c_tilt")}
+    bt = Trainer(cfg, d, build_eval=False)
+    bt.load(os.path.join(d, "latest.pt"))
+    bt.sampler.refresh(bt.iteration)
+    bt.rollout()
+    same = {k: bool(torch.equal(v, getattr(bt.buf, k))) for k, v in snap.items()}
+    same.update({k: bool(torch.equal(v, getattr(bt.pool, k))) for k, v in lv.items()})
+    st = a.sampler.stats()
+    print(f"  {int(st['accel/levels'])} levels, draw share {st['accel/draw_share']:.3f}, level / edit "
+          f"episodes {st['plr/level_episodes']:.0f} / {st['plr/edit_episodes']:.0f}; next rollout "
+          "after resume identical: " + ", ".join(f"{k} {v}" for k, v in same.items()))
+    assert all(same.values()) and st["accel/levels"] > 0 and st["plr/level_episodes"] > 0
+
+
 # ── 6. Sim at 20 and 400 mm ─────────────────────────────────────────────────
 
 
@@ -662,6 +916,8 @@ if __name__ == "__main__":
         test_init_from(tmp)
         test_encoder(sc, tmp)
         test_pool_resume(tmp)
+        test_levels()
+        test_pool_resume_accel(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\nall tests passed")

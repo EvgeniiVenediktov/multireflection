@@ -25,7 +25,8 @@ Run from rl/:  uv run python tests/test_finetune.py
     4. defaults bit-identical: in subprocesses, the code at REF_REV (env.py, scenarios.py,
        ppo.py before these options) and the current code give the same pool slots, rollout
        buffers, parameters after three PPO iterations and env trajectories (four setups,
-       explicit resets); skipped when git or REF_REV is unavailable
+       explicit resets; env state keys added since, NEW_ENV_KEYS, left out); skipped when
+       git or REF_REV is unavailable
 """
 
 import csv
@@ -53,6 +54,7 @@ from scenarios import (REGION_BINS, STREAM_POOL, ContRanges, PoolConfig, Sampler
 DEV = torch.device("cuda")
 NARROW = ContRanges(sep=(80.0, 120.0))
 REF_REV = "493776e"  # Last commit before the fine-tuning options
+NEW_ENV_KEYS = ("tilt0",)  # Env state keys added since (ACCEL levels: start tilts)
 MIX = (0.2, 0.2, 0.25, 0.35)
 q = lambda s: None  # noqa: E731
 
@@ -448,6 +450,9 @@ def test_defaults_identical(tmp: str):
         subprocess.run([sys.executable, "-I", drv, r, RL_DIR, outs[tag]], check=True,
                        capture_output=True, text=True)
     a, b = (torch.load(outs[t], weights_only=False) for t in ("ref", "new"))
+    for k in ("env", "env4"):  # State keys added after REF_REV
+        assert all(n in b[k] for n in NEW_ENV_KEYS)
+        b[k] = {n: v for n, v in b[k].items() if n not in NEW_ENV_KEYS}
     diff = sorted(k for k in a if not same(a[k], b[k]))
     assert a.keys() == b.keys() and not diff, f"differs from {REF_REV}: {diff}"
     print(f"  pool slots (fill + 2 refreshes), rollout buffers and parameters after 3 PPO "

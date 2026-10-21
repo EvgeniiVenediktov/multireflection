@@ -18,7 +18,11 @@ B independent episodes, all state on the device, no host syncs in step() / reset
                pool is table and sampler at once, its slots are replaced between
                iterations, so each env copies the parameters, P_ref and slot generation
                of its episode's scenario at the draw (scen_params (B, 5), scen_ref (B,),
-               scen_gen (B,)); the setup index is the pool slot. No host syncs
+               scen_gen (B,)); the setup index is the pool slot. No host syncs.
+               With ACCEL levels (scenarios.LevelConfig) a level draw starts at the
+               level's tilt (plus the pool's start-tilt edit, source SRC_EDIT) and, with
+               the camera, the level's look; tilt0 (B, 2) is each episode's start tilt
+               (info ep_initial_tilt, with ep_look: the episode's camera parameters)
     state      13-DOF base state of the episode's setup; the controlled DOFs (default
                M2 pitch, M2 yaw) move, every other DOF stays at the setup value
     action     (B, 2) int64, per-axis index into the step ladder
@@ -172,6 +176,7 @@ def set_scenario(states: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
 _M32 = 0xFFFFFFFF
 _STREAMS = (0x9E3779B9, 0x85EBCA6B, 0xC2B2AE35)  # Tilt x, tilt y, setup
 _NEAR_KEY = 0x27D4EB2F  # Env key salt of the near-best draws (coin, radius, angle)
+_LEVEL_KEY = 0x165667B1  # Env key salt of the ACCEL level start edits (coin, Box-Muller pair)
 
 
 def _mul32(x: torch.Tensor, c: int) -> torch.Tensor:
@@ -575,6 +580,8 @@ class AlignEnv:
         k = hash32(k ^ hash32(torch.full((B,), (sd >> 32) & _M32, dtype=torch.long, device=dev)))
         self._env_key = hash32(k ^ torch.arange(B, device=dev))
         self._near_key = hash32(self._env_key ^ _NEAR_KEY)
+        self._level_key = hash32(self._env_key ^ _LEVEL_KEY)
+        self._levels = pool is not None and pool.n_levels > 0  # ACCEL level draws
         r0, r1 = c.near_best_radius
         assert 0.0 <= c.near_best_frac <= 1.0 and 0.0 <= r0 <= r1, "near-best settings"
         assert c.near_best_frac == 0 or pool is not None, "near-best starts need the pool"
@@ -585,6 +592,7 @@ class AlignEnv:
 
         # ── Per-env state ──
         self.tilt = torch.zeros(B, 2, device=dev)  # Controlled DOFs (deg)
+        self.tilt0 = torch.zeros(B, 2, device=dev)  # Start tilt of the episode
         self.setup = torch.zeros(B, dtype=torch.long, device=dev)  # Index into setups
         self.scen_src = self._src0.clone()  # Sampler source of the episode's draw
         self.episode = torch.full((B,), -1, dtype=torch.long, device=dev)  # Counter
@@ -704,6 +712,9 @@ class AlignEnv:
             s, src = s.clamp(max=self.n_setups - 1), self._src0
         if self.cfg.near_best_frac > 0:
             t = self._near_best(t, s, episode)
+        if self._levels:
+            t, src = self.pool.level_start(t, s, src, uniforms(self._level_key, episode))
+            t = t.clamp(-self.limit, self.limit)
         return t, s, src
 
     def _near_best(self, t: torch.Tensor, slot: torch.Tensor, episode: torch.Tensor) -> torch.Tensor:
@@ -829,7 +840,7 @@ class AlignEnv:
 
     _STATE_KEYS = ("tilt", "setup", "episode", "idle", "path", "bounces", "stop", "image",
                    "prev_action", "step_count", "ep_return", "ep_moves", "path0",
-                   "init_center", "init_radius", "scen_src")
+                   "init_center", "init_radius", "scen_src", "tilt0")
 
     _POOL_KEYS = ("scen_params", "scen_ref", "scen_gen")
 
@@ -846,7 +857,7 @@ class AlignEnv:
     def set_state(self, st: Dict[str, torch.Tensor]):
         """Restore get_state() output (same num_envs and config)."""
         for k in self._STATE_KEYS + (self._POOL_KEYS if self.pool is not None else ()):
-            if k in st:  # scen_src: absent in older checkpoints
+            if k in st:  # scen_src, tilt0: absent in older checkpoints
                 setattr(self, k, st[k].to(self.device))
         if self.history is not None and "hist_images" in st:
             self.history.images = st["hist_images"].to(self.device)
@@ -904,6 +915,7 @@ class AlignEnv:
             device=self.device, dtype=torch.float32).clamp(-self.limit, self.limit)
         m1 = mask[:, None]
         tilt = torch.where(m1, new, self.tilt)
+        self.tilt0 = torch.where(m1, new, self.tilt0)
         setup = torch.where(mask, new_s, self.setup)
         self.scen_src = torch.where(mask, new_src, self.scen_src)
         if self.pool is not None:
@@ -915,8 +927,10 @@ class AlignEnv:
         else:
             out = self._simulate(tilt, setup, live=mask)
         if self.cam is not None:
-            self.cam_params = self._cam_where(mask, self.cam.sample_params(B, self.cam_gen),
-                                              self.cam_params)
+            cam = self.cam.sample_params(B, self.cam_gen)
+            if self._levels:  # Level draws: the level's look
+                cam = self.pool.level_look(new_s, new_src, cam)
+            self.cam_params = self._cam_where(mask, cam, self.cam_params)
         img = self._render(out)
 
         self.tilt = tilt
@@ -1000,6 +1014,8 @@ class AlignEnv:
         cam_new = cam_rows = None
         if self.cam is not None and auto:  # Reset rows: the next episode's parameters
             cam_new = self.cam.sample_params(B, self.cam_gen)
+            if self._levels:
+                cam_new = self.pool.level_look(reset_setup, reset_src, cam_new)
             cam_rows = {k: torch.cat((v, cam_new[k])) for k, v in self.cam_params.items()}
         img = self._render(out, cam_rows)
         path_all = out["total_path_length"]
@@ -1051,12 +1067,16 @@ class AlignEnv:
             "ep_initial_path_mm": self.path0,
             "ep_final_path_mm": path,
             "ep_final_bounces": bounces,
+            "ep_initial_tilt": self.tilt0,
         }
+        if self.cam is not None:
+            info["ep_look"] = self.cam_params  # The episode's camera parameters
 
         if auto:
             # Auto-reset of the done envs
             d1 = done[:, None]
             self.tilt = torch.where(d1, reset_tilt, new)
+            self.tilt0 = torch.where(d1, reset_tilt, self.tilt0)
             self.setup = torch.where(done, reset_setup, setup)
             self.scen_src = torch.where(done, reset_src, self.scen_src)
             if pool:

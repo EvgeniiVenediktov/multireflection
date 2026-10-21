@@ -106,6 +106,25 @@ used prefix are discarded), placed in stream order; a refresh replaces the same 
 slots and refills each with a scenario of the bin it held, so the realized shares stay
 exactly the initial quotas. The scan cost per fill grows with the rarest bin's quota /
 natural share (tiny: 20 % / 6.3 % = 3.2x the natural cost).
+ACCEL hard levels (LevelConfig, size K > 0; Parker-Holder et al. 2022): K level slots after
+the pool slots, [size, size + K), each a level = scenario (atlas row) + start tilt + camera
+look (the episode's camera parameters except the per-pixel textures, which are redrawn).
+Candidates: finished episodes of good slots (fresh, replay or level draws) with shortfall
+>= thresh, recorded by observe() (slot, start tilt, look; at most `candidates` per
+iteration, the rest dropped). Once per iteration, before the slot refill, the existing
+levels (score: the EMA of their replays, as the pool scores), the candidates (score:
+their shortfall) and `edits` scenario edits (parents drawn from the level distribution,
+parameters + Gaussian noise of edit_sigma, kept if within the ranges, beam-valid and good
+after a box scan; score: the parent's, start tilt and look: the parent's) are merged:
+entries with score >= thresh, at most family_cap per root pool scenario (the family, kept
+through candidates of levels and edits), the top K by score. Kept levels stay in their
+slot; new ones fill the freed slots, generation incremented. Draws: a share of the good
+draws, share x the filled fraction of K, comes from the levels (SRC_LEVEL; PLR rank /
+staleness distribution over the filled levels, beta and rho of the sampler); the env
+starts such an episode at the level's tilt and look, and with probability jitter_p adds a
+Gaussian start-tilt edit (sigma jitter per axis, source SRC_EDIT: it updates no level
+score but can become a candidate). The level slots are excluded from the pool's own
+draw segments and statistics; stats() adds accel/... and the level / edit episode shares.
 
 Continuous eval table (ContConfig, build_cont_table; ppo.py eval_cont/): the valid
 candidates of the shortest prefix of STREAM_EVAL (seeded) that holds n x 0.9 good and n x
@@ -126,7 +145,7 @@ region sizes, region_stats in the build info).
 
 ScenarioSampler (all on the device; draw() and observe() have no host syncs):
     draws      one categorical over [impossible | fresh good | replay good] segments
-               (without the held-out scenarios):
+               (without the held-out scenarios; a pool with levels adds a level segment):
                impossible_share (10 %) uniform over the impossible set; the rest a
                good scenario, with probability p_fresh (0.3; 1.0 until min_seen = 2048
                good scenarios have a score) uniform over the good set, otherwise from
@@ -166,6 +185,8 @@ DEFAULT_OFFGRID = os.path.join(EVAL_TABLES_DIR, "offgrid_v1.pt")
 ATLAS_VERSION = 1
 PARAM_NAMES = ("separation", "laser_pitch", "laser_yaw")
 SRC_EXPLICIT, SRC_IMPOSSIBLE, SRC_FRESH, SRC_REPLAY = -1, 0, 1, 2
+SRC_LEVEL, SRC_EDIT = 3, 4  # ACCEL level draws: as stored / with a start-tilt edit
+N_SRC = 5
 SEP_BINS = ((50.0, 80.0), (80.0, 110.0), (110.0, 140.0), (140.0, 170.0), (170.0, 200.0))
 # Off-grid eval tables (module docstring): interpolation and the two extrapolation sets,
 # their separation axes (None: midpoints of the grid axis) and separation bins
@@ -1274,7 +1295,9 @@ class SamplerConfig:
 class ScenarioSampler:
     """Regret-prioritized scenario draws over an atlas, see the module docstring."""
 
-    def __init__(self, atlas: Atlas, cfg: Optional[SamplerConfig] = None):
+    def __init__(self, atlas: Atlas, cfg: Optional[SamplerConfig] = None,
+                 exclude: Optional[torch.Tensor] = None):
+        """exclude (N,) bool: rows outside the draw segments as well (pool level slots)."""
         self.cfg = cfg or SamplerConfig()
         self.atlas = atlas
         dev = self.device = atlas.device
@@ -1282,8 +1305,9 @@ class ScenarioSampler:
         # Training scenarios: the atlas without the held-out ones (holdout_mask)
         self.holdout = holdout_mask(atlas, self.cfg.holdout_frac, self.cfg.holdout_seed)
         g, im = atlas.good_ids, atlas.impossible_ids
-        if bool(self.holdout.any()):
-            g, im = g[~self.holdout[g]], im[~self.holdout[im]]
+        drop = self.holdout if exclude is None else self.holdout | exclude
+        if bool(drop.any()):
+            g, im = g[~drop[g]], im[~drop[im]]
         self.good_ids, self.impossible_ids = g, im
         self.n_good, self.n_imp = g.numel(), im.numel()
         assert self.n_good + self.n_imp > 0
@@ -1298,29 +1322,46 @@ class ScenarioSampler:
         self.ids = torch.cat((im, g, g))
         self.src = torch.cat((torch.full_like(im, SRC_IMPOSSIBLE), torch.full_like(g, SRC_FRESH),
                               torch.full_like(g, SRC_REPLAY))).to(torch.int8)
-        self._acc = torch.zeros(4, 3, dtype=torch.float64, device=dev)
+        lv = self._level_slots()
+        if lv is not None:  # Pool levels: a fourth segment
+            self.ids = torch.cat((self.ids, lv))
+            self.src = torch.cat((self.src, torch.full_like(lv, SRC_LEVEL).to(torch.int8)))
+        self._acc = torch.zeros(4, N_SRC, dtype=torch.float64, device=dev)
         self.refresh(0)
 
     # ── Distribution ──
 
-    def replay_probs(self) -> torch.Tensor:
-        """(n_good,) float64 replay distribution over the good training scenarios (0 if
-        unseen)."""
+    def _rank_probs(self, ids: torch.Tensor, seen: torch.Tensor) -> torch.Tensor:
+        """float64 PLR distribution over the rows ids where seen (0 elsewhere): (1 - rho)
+        rank^(-1 / beta) of the scores + rho staleness."""
         c = self.cfg
-        gs = self.good_ids
-        seen = self.seen[gs]
         n_seen = seen.sum()
-        key = torch.where(seen, self.score[gs], -math.inf)
+        key = torch.where(seen, self.score[ids], -math.inf)
         order = torch.argsort(key, descending=True, stable=True)
         rank = torch.empty_like(order)
         rank[order] = torch.arange(1, order.numel() + 1, device=order.device)
         h = torch.where(seen, rank.double() ** (-1.0 / c.beta), 0.0)
         p_s = h / h.sum().clamp(min=1e-300)
-        stale = torch.where(seen, (self.iteration - self.last[gs]).double(), 0.0)
+        stale = torch.where(seen, (self.iteration - self.last[ids]).double(), 0.0)
         tot = stale.sum()
         p_c = torch.where(tot > 0, stale / tot.clamp(min=1e-300),
                           seen.double() / n_seen.clamp(min=1).double())
         return (1.0 - c.rho) * p_s + c.rho * p_c
+
+    def replay_probs(self) -> torch.Tensor:
+        """(n_good,) float64 replay distribution over the good training scenarios (0 if
+        unseen)."""
+        gs = self.good_ids
+        return self._rank_probs(gs, self.seen[gs])
+
+    def _level_slots(self) -> Optional[torch.Tensor]:
+        """Slot indices of the level segment (ScenarioPool with levels); None: none."""
+        return None
+
+    def _level_draw(self) -> Optional[Tuple[float, torch.Tensor]]:
+        """(share of the good draws, float64 distribution over _level_slots()) at a
+        refresh; None without levels."""
+        return None
 
     @torch.no_grad()
     def refresh(self, iteration: int):
@@ -1337,17 +1378,23 @@ class ScenarioSampler:
             p_fresh = torch.ones((), dtype=torch.float64, device=dev)
             p_r = torch.zeros(self.n_good, dtype=torch.float64, device=dev)
         q_imp = c.impossible_share if self.n_imp and self.n_good else float(self.n_good == 0)
-        w = torch.cat((
+        lv = self._level_draw()
+        q_lv = 0.0 if lv is None else lv[0]
+        q_g = (1.0 - q_imp) * (1.0 - q_lv)  # Fresh + replay share
+        w = [
             torch.full((self.n_imp,), q_imp / max(self.n_imp, 1), dtype=torch.float64, device=dev),
-            (1.0 - q_imp) * p_fresh / max(self.n_good, 1)
+            q_g * p_fresh / max(self.n_good, 1)
             * torch.ones(self.n_good, dtype=torch.float64, device=dev),
-            (1.0 - q_imp) * (1.0 - p_fresh) * p_r,
-        ))
-        cdf = torch.cumsum(w, 0)
+            q_g * (1.0 - p_fresh) * p_r,
+        ]
+        if lv is not None:
+            w.append((1.0 - q_imp) * q_lv * lv[1])
+        cdf = torch.cumsum(torch.cat(w), 0)
         self.cdf = cdf / cdf[-1]
         self.p_fresh_eff = p_fresh
         self.p_replay = p_r
         self.q_imp = q_imp
+        self.q_level = (1.0 - q_imp) * q_lv  # Share of all draws from the levels
         self._acc.zero_()
 
     # ── Draws and updates (no host syncs) ──
@@ -1360,16 +1407,19 @@ class ScenarioSampler:
 
     @torch.no_grad()
     def observe(self, scenario: torch.Tensor, final_path: torch.Tensor, done: torch.Tensor,
-                src: Optional[torch.Tensor] = None, gen: Optional[torch.Tensor] = None):
+                src: Optional[torch.Tensor] = None, gen: Optional[torch.Tensor] = None,
+                tilt0: Optional[torch.Tensor] = None, look: Optional[Dict[str, torch.Tensor]] = None):
         """Episode ends: scenario (B,) index, final_path (B,) mm (P_final), done (B,) bool,
-        src (B,) the draw source (statistics only), gen (B,) the pool slot generation
-        (ScenarioPool; unused here). Updates the scores of the good scenarios by scatter
-        ops."""
+        src (B,) the draw source (statistics; SRC_EDIT episodes update no score), gen (B,)
+        the pool slot generation, tilt0 (B, 2) the start tilts and look the camera
+        parameters (B rows) of the episodes (ScenarioPool; unused here). Updates the
+        scores of the good scenarios by scatter ops."""
         a = self.cfg.alpha
         N = self.score.numel()
         good = self.good[scenario] & done
         short = (1.0 - final_path / self.pmax[scenario]).clamp(0.0, 1.0)
-        w = good.float()
+        gw = good.float()
+        w = gw if src is None else (good & (src != SRC_EDIT)).float()
         cnt = torch.zeros(N, device=self.device).index_add_(0, scenario, w)
         tot = torch.zeros(N, device=self.device).index_add_(0, scenario, short * w)
         upd = cnt > 0
@@ -1388,7 +1438,7 @@ class ScenarioSampler:
             d = ok.double()
             self._acc[0].index_add_(0, col, d)
             self._acc[1].index_add_(0, col, d * good.double())
-            self._acc[2].index_add_(0, col, (short * w).double() * d)
+            self._acc[2].index_add_(0, col, (short * gw).double() * d)
 
     # ── Logging (host syncs) ──
 
@@ -1463,6 +1513,28 @@ class PoolConfig:
     region_mix: Tuple[float, ...] = ()  # Good-slot share per target-region bin; () = natural
 
 
+@dataclass
+class LevelConfig:
+    """ACCEL hard levels of the ScenarioPool (module docstring); size 0 = off."""
+
+    size: int = 0  # Level slots K
+    share: float = 0.2  # Share of the good draws from the levels, x their filled fraction
+    thresh: float = 0.3  # Shortfall 1 - P_final / P_max to enter and to stay
+    family_cap: int = 4  # Levels per root pool scenario
+    jitter: float = 0.05  # deg, sigma per axis of the start-tilt edit
+    jitter_p: float = 0.5  # Share of the level draws with a start-tilt edit (SRC_EDIT)
+    edits: int = 256  # Scenario edits per iteration
+    edit_sigma: Tuple[float, ...] = (5.0, 0.1, 0.1, 0.05, 0.05)  # sep mm, pitch / yaw deg, dx / dy mm
+    candidates: int = 8192  # Candidate rows per iteration; the rest dropped (accel/dropped)
+
+
+STREAM_EDIT = 5  # Generator stream of the level edits (seeded by pool seed and iteration)
+LOOK_MAX_NUMEL = 256  # Camera parameters with more values per row (textures) are not stored
+# Statistics of the last level update (accel/...)
+LEVEL_UPDATE_KEYS = ("candidates", "dropped", "inserted", "inserted_edits", "evicted",
+                     "edits_tried", "edits_valid", "edits_good", "update_s")
+
+
 def region_quotas(mix, n: int) -> List[int]:
     """Per-bin counts of n slots for the shares mix (normalized): floor of share x n,
     the remainder one each to the largest fractional parts (ties: lower bin first)."""
@@ -1496,18 +1568,23 @@ class ScenarioPool(ScenarioSampler):
     [0, n_good) hold good scenarios, [n_good, size) impossible ones; atlas is the slot
     table (an Atlas, params (size, 5)); slot_gen counts the replacements of each slot
     (an episode scores its slot only if the slot was not replaced meanwhile), born the
-    iteration of the last fill."""
+    iteration of the last fill. levels (LevelConfig, size K > 0): K ACCEL level slots
+    [size, size + K) after them (atlas rows, scores and generations as the pool slots;
+    lv_on, lv_tilt (K, 2), lv_look; uid: root pool scenario of every slot)."""
 
     def __init__(self, cfg: Optional[PoolConfig] = None, sampler: Optional[SamplerConfig] = None,
                  scan: Optional[AtlasConfig] = None, device: Optional[torch.device] = None,
-                 log=print):
+                 log=print, levels: Optional[LevelConfig] = None):
         self.pcfg = pc = cfg or PoolConfig()
+        self.lcfg = lc = levels or LevelConfig()
         sc = sampler or SamplerConfig()
         assert sc.holdout_frac == 0, "no hold-out in the pool"
         dev = torch.device(device) if device is not None else DEVICE
         self.scanner = Scanner(scan or AtlasConfig(), dev)
         self.log = log
-        N = pc.size
+        N = self.n_slots = pc.size
+        K = self.n_levels = lc.size
+        assert K >= 0 and len(lc.edit_sigma) == 5, "levels: size >= 0, five edit sigmas"
         n_imp = int(round(N * sc.impossible_share)) if sc.impossible_share > 0 else 0
         if sc.impossible_share > 0:
             n_imp = max(n_imp, 1)
@@ -1535,14 +1612,32 @@ class ScenarioPool(ScenarioSampler):
         _sync(dev)
         st["refresh_s"] = time.perf_counter() - t0
         st["replaced"] = N
+        if K:  # Level slots: copies of slot 0, not good (never drawn, never scored) until filled
+            d = {k: torch.cat((v, v[:1].expand(K, *v.shape[1:]))) for k, v in d.items()}
+            d["good"][N:] = False
         d.update(version=ATLAS_VERSION, key=self.key(), named={}, n_grid=N,
                  build_s=st["refresh_s"], offgrid=None)
         atlas = Atlas(d, dev, "pool")
         assert bool(atlas.good[:self.n_good_slots].all()) and not bool(atlas.good[self.n_good_slots:].any())
-        self.slot_gen = torch.zeros(N, dtype=torch.long, device=dev)
-        self.born = torch.zeros(N, dtype=torch.long, device=dev)
+        self.slot_gen = torch.zeros(N + K, dtype=torch.long, device=dev)
+        self.born = torch.zeros(N + K, dtype=torch.long, device=dev)
         self.last_fill = st
-        super().__init__(atlas, sc)
+        if K:
+            self.lv_on = torch.zeros(K, dtype=torch.bool, device=dev)
+            self.lv_tilt = torch.zeros(K, 2, device=dev)
+            self.lv_look: Optional[Dict[str, torch.Tensor]] = None  # Allocated at the first look
+            self.uid = torch.arange(N + K, device=dev)  # Root pool scenario (family) per slot
+            self.next_uid = N + K
+            self.levels_iter = 0
+            C = lc.candidates  # Candidate rows; row C takes the discarded writes
+            self.c_slot = torch.zeros(C + 1, dtype=torch.long, device=dev)
+            self.c_gen = torch.zeros(C + 1, dtype=torch.long, device=dev)
+            self.c_tilt = torch.zeros(C + 1, 2, device=dev)
+            self.c_short = torch.zeros(C + 1, device=dev)
+            self.c_look: Optional[Dict[str, torch.Tensor]] = None
+            self.c_count = torch.zeros((), dtype=torch.long, device=dev)
+            self.last_levels: Dict[str, float] = dict.fromkeys(LEVEL_UPDATE_KEYS, 0.0)
+        super().__init__(atlas, sc, exclude=torch.arange(N + K, device=dev) >= N)
         log(f"pool: {N} slots ({self.n_good_slots} good, {self.n_imp_slots} impossible), "
             f"{pc.ranges.tag()} (laser pitch {pc.ranges.pitch}, yaw {pc.ranges.yaw} deg, offsets "
             f"over r = {pc.ranges.offset_radius} mm), filled in {st['refresh_s']:.1f} s: "
@@ -1552,6 +1647,11 @@ class ScenarioPool(ScenarioSampler):
             + (f" (quotas {'/'.join(map(str, self.quotas))} of mix {pc.region_mix}; "
                f"{st['rejected']} good candidates of the prefix discarded)" if self.quotas else
                " (natural)"))
+        if K:
+            log(f"pool: {K} ACCEL level slots: {lc.share:g} of the good draws x filled share, "
+                f"shortfall >= {lc.thresh:g}, <= {lc.family_cap} per root scenario, start-tilt "
+                f"edits {lc.jitter:g} deg on {lc.jitter_p:g} of the level draws, {lc.edits} "
+                f"scenario edits per iteration (sigma {', '.join(f'{s:g}' for s in lc.edit_sigma)})")
 
     def key(self) -> Dict[str, Any]:
         """Scan settings of the slot table (Atlas.check) and the pool settings."""
@@ -1688,7 +1788,10 @@ class ScenarioPool(ScenarioSampler):
         self.visits[slots] = 0
         self.slot_gen[slots] += 1
         self.born[slots] = iteration
-        self.ptr = [(self.ptr[0] + k_g) % ng, (self.ptr[1] + k_i) % max(ni, 1)]
+        if self.n_levels:  # New root scenarios
+            self.uid[slots] = self.next_uid + torch.arange(slots.numel(), device=dev)
+            self.next_uid += slots.numel()
+        self.ptr =[(self.ptr[0] + k_g) % ng, (self.ptr[1] + k_i) % max(ni, 1)]
         self.filled_iter = iteration
         _sync(dev)
         st["refresh_s"] = time.perf_counter() - t0
@@ -1711,18 +1814,224 @@ class ScenarioPool(ScenarioSampler):
         """Once per iteration: at a new iteration, replace the oldest refresh_frac of the
         slots with freshly scanned scenarios (host syncs), then recompute the draw
         distribution (ScenarioSampler.refresh)."""
+        if self.n_levels and iteration > self.levels_iter:  # Before the refill: candidates' slots
+            self._update_levels(iteration)
         if iteration > self.filled_iter and self.pcfg.refresh_frac > 0:
             self._replace(iteration)
         super().refresh(iteration)
 
     @torch.no_grad()
     def observe(self, scenario: torch.Tensor, final_path: torch.Tensor, done: torch.Tensor,
-                src: Optional[torch.Tensor] = None, gen: Optional[torch.Tensor] = None):
+                src: Optional[torch.Tensor] = None, gen: Optional[torch.Tensor] = None,
+                tilt0: Optional[torch.Tensor] = None, look: Optional[Dict[str, torch.Tensor]] = None):
         """ScenarioSampler.observe for episodes whose slot still holds their scenario
-        (gen (B,) = the slot generation at the draw; None: all)."""
+        (gen (B,) = the slot generation at the draw; None: all); with levels, the level
+        candidates among them (needs src and tilt0; look: camera runs)."""
         if gen is not None:
             done = done & (gen == self.slot_gen[scenario])
         super().observe(scenario, final_path, done, src)
+        if self.n_levels and src is not None:
+            self._capture(scenario, final_path, done, src, tilt0, look)
+
+    # ── ACCEL levels (module docstring) ──
+
+    def _level_slots(self) -> Optional[torch.Tensor]:
+        if not self.n_levels:
+            return None
+        return self.n_slots + torch.arange(self.n_levels, device=self.device)
+
+    def level_probs(self) -> torch.Tensor:
+        """(K,) float64 draw distribution over the filled levels (PLR rank and staleness)."""
+        return self._rank_probs(self._level_slots(), self.lv_on)
+
+    def _level_draw(self) -> Optional[Tuple[float, torch.Tensor]]:
+        if not self.n_levels:
+            return None
+        n_on = int(self.lv_on.sum())
+        p = self.level_probs() if n_on else torch.zeros(self.n_levels, dtype=torch.float64,
+                                                        device=self.device)
+        return self.lcfg.share * n_on / self.n_levels, p
+
+    def level_start(self, t: torch.Tensor, slot: torch.Tensor, src: torch.Tensor,
+                    v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Start tilts (B, 2) and sources (B,) of draws (slot, src) with the levels: a level
+        draw (SRC_LEVEL) starts at its level's tilt, with probability jitter_p plus a
+        Gaussian edit (sigma jitter per axis; source SRC_EDIT); the other rows keep t and
+        src. v (B, 3) uniforms in [0, 1) (coin, Box-Muller pair). No sync; unclamped."""
+        lc = self.lcfg
+        lv = src == SRC_LEVEL
+        j = (slot - self.n_slots).clamp(0, self.n_levels - 1)
+        edit = lv & (v[:, 0] < lc.jitter_p)
+        r = torch.sqrt(-2.0 * torch.log1p(-v[:, 1]))
+        a = (2.0 * math.pi) * v[:, 2]
+        z = r[:, None] * torch.stack((torch.cos(a), torch.sin(a)), 1)
+        tl = self.lv_tilt[j] + torch.where(edit[:, None], lc.jitter * z, 0.0)
+        return torch.where(lv[:, None], tl, t), torch.where(edit, SRC_EDIT, src).to(src.dtype)
+
+    def level_look(self, slot: torch.Tensor, src: torch.Tensor,
+                   look: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Camera parameters look (B rows) with the stored keys of each level draw's look
+        (src SRC_LEVEL / SRC_EDIT); the textures stay as drawn. No sync."""
+        if self.lv_look is None:
+            return look
+        m = src >= SRC_LEVEL
+        j = (slot - self.n_slots).clamp(0, self.n_levels - 1)
+        out = dict(look)
+        for k, v in self.lv_look.items():
+            out[k] = torch.where(m.view(-1, *([1] * (v.dim() - 1))), v[j], look[k])
+        return out
+
+    def _capture(self, scenario: torch.Tensor, final_path: torch.Tensor, done: torch.Tensor,
+                 src: torch.Tensor, tilt0: Optional[torch.Tensor],
+                 look: Optional[Dict[str, torch.Tensor]]):
+        """Record the level candidates among the finished episodes: good slot, drawn
+        (fresh, replay, level, edit), shortfall >= thresh. No sync: rows past the
+        capacity go to the discard row."""
+        assert tilt0 is not None, "levels need the episodes' start tilts"
+        lc = self.lcfg
+        C = lc.candidates
+        short = (1.0 - final_path / self.pmax[scenario]).clamp(0.0, 1.0)
+        m = done & self.good[scenario] & (src >= SRC_FRESH) & (short >= lc.thresh)
+        pos = self.c_count + torch.cumsum(m.long(), 0) - 1
+        idx = torch.where(m & (pos < C), pos, C)
+        self.c_slot[idx] = scenario
+        self.c_gen[idx] = self.slot_gen[scenario]
+        self.c_tilt[idx] = tilt0
+        self.c_short[idx] = short
+        if look is not None:
+            if self.c_look is None:
+                keep = {k: v for k, v in look.items() if v[0].numel() <= LOOK_MAX_NUMEL}
+                self.c_look = {k: torch.zeros(C + 1, *v.shape[1:], dtype=v.dtype, device=self.device)
+                               for k, v in keep.items()}
+                self.lv_look = {k: torch.zeros(self.n_levels, *v.shape[1:], dtype=v.dtype,
+                                               device=self.device) for k, v in keep.items()}
+            for k, v in self.c_look.items():
+                v[idx] = look[k]
+        self.c_count += m.sum()
+
+    @torch.no_grad()
+    def _edits(self, iteration: int, ex: torch.Tensor) -> Dict[str, Any]:
+        """Scenario edits of the filled levels ex (level indices): edits parents drawn from
+        the level distribution, parameters + N(0, edit_sigma) (laser offsets fixed with
+        offset radius 0), kept within the ranges (separation, angle bounds, offset disk),
+        beam-checked, box-scanned; returns parent (level index) and atlas rows of the good
+        ones, and the counts (host syncs; numpy generator of (STREAM_EDIT, seed,
+        iteration))."""
+        lc, r = self.lcfg, self.pcfg.ranges
+        out: Dict[str, Any] = {"parent": ex[:0], "rows": None, "tried": 0, "valid": 0}
+        if lc.edits <= 0 or ex.numel() == 0:
+            return out
+        rng = np.random.default_rng([STREAM_EDIT, self.pcfg.seed, iteration])
+        p = self.level_probs()[ex].cpu().numpy()
+        exn = ex.cpu().numpy()
+        par = exn[rng.choice(exn.size, size=lc.edits, p=p / p.sum())]
+        sig = np.array(lc.edit_sigma, dtype=np.float64)
+        if r.offset_radius <= 0:
+            sig[3:] = 0.0
+        prm = self.atlas.params[self.n_slots + torch.from_numpy(par).to(self.device)].double().cpu().numpy()
+        prm = prm + rng.normal(size=prm.shape) * sig
+        ok = (prm[:, 0] >= r.sep[0]) & (prm[:, 0] <= r.sep[1]) & r.angle_ok(prm)
+        if r.offset_radius > 0:
+            ok &= np.hypot(prm[:, 3], prm[:, 4]) < r.offset_radius * OFFSET_SHRINK
+        idx = np.nonzero(ok)[0]
+        out["tried"] = lc.edits
+        if idx.size:
+            chk = self.scanner.check(torch.from_numpy(prm[idx]))
+            idx = idx[(~chk["clipped"] & ~chk["missed"]).cpu().numpy()]
+        out["valid"] = int(idx.size)
+        if idx.size:
+            d = self.scanner.scan(torch.from_numpy(prm[idx]))
+            g = d["good"]
+            out["parent"] = torch.from_numpy(par[idx]).to(self.device)[g]
+            out["rows"] = {k: d[k][g] for k in Atlas.TENSORS}
+        return out
+
+    @torch.no_grad()
+    def _update_levels(self, iteration: int):
+        """Once per new iteration, before the slot refill (host syncs): merge the filled
+        levels (score: EMA of their replays), the candidates (score: their shortfall) and
+        the edits (score: the parent's) into the level slots: score >= thresh, at most
+        family_cap per root scenario (best first), the top K by score (ties: levels before
+        candidates before edits); kept levels stay, new ones fill the free slots
+        (generation, born, scores, start tilt and look set; the freed ones not refilled
+        are emptied)."""
+        lc, dev = self.lcfg, self.device
+        N, K, C = self.n_slots, self.n_levels, lc.candidates
+        at = self.atlas
+        _sync(dev)
+        t0 = time.perf_counter()
+        n_cand = int(self.c_count)
+        n = min(n_cand, C)
+        ci = torch.arange(n, device=dev)
+        ci = ci[self.c_gen[:n] == self.slot_gen[self.c_slot[:n]]]
+        cs = self.c_slot[ci]
+        ex = torch.nonzero(self.lv_on).squeeze(1)
+        e = self._edits(iteration, ex)
+        ep = e["parent"]
+        n_ex, n_c, n_e = ex.numel(), ci.numel(), ep.numel()
+        score = torch.cat((self.score[N + ex], self.c_short[ci], self.score[N + ep]))
+        fam = torch.cat((self.uid[N + ex], self.uid[cs], self.uid[N + ep]))
+        kind = torch.cat((torch.zeros(n_ex, dtype=torch.long, device=dev),
+                          torch.ones(n_c, dtype=torch.long, device=dev),
+                          torch.full((n_e,), 2, dtype=torch.long, device=dev)))
+        sub = torch.cat((ex, ci, torch.arange(n_e, device=dev)))  # Row within its kind
+        # Per family the best family_cap (score order, stable: table order on ties)
+        order = torch.argsort(score, descending=True, stable=True)
+        order = order[torch.argsort(fam[order], stable=True)]
+        f = fam[order]
+        pos = torch.arange(f.numel(), device=dev)
+        head = torch.ones_like(f, dtype=torch.bool)
+        head[1:] = f[1:] != f[:-1]
+        start = torch.cummax(torch.where(head, pos, 0), 0).values
+        in_cap = torch.zeros_like(head)
+        in_cap[order] = (pos - start) < lc.family_cap
+        rows = torch.nonzero((score >= lc.thresh) & in_cap).squeeze(1)
+        top = rows[torch.argsort(score[rows], descending=True, stable=True)[:K]]
+        sel = torch.zeros(score.numel(), dtype=torch.bool, device=dev)
+        sel[top] = True
+        # Sources of the new levels, gathered before any write
+        new_c = sub[top[kind[top] == 1]]
+        new_e = sub[top[kind[top] == 2]]
+        src_slot = self.c_slot[new_c]
+        vals = {k: torch.cat((getattr(at, k)[src_slot],
+                              e["rows"][k][new_e].to(getattr(at, k).dtype) if n_e else
+                              getattr(at, k)[:0])) for k in Atlas.TENSORS}
+        par = ep[new_e]
+        tilt = torch.cat((self.c_tilt[new_c], self.lv_tilt[par]))
+        look = ({k: torch.cat((self.c_look[k][new_c], self.lv_look[k][par])) for k in self.lv_look}
+                if self.lv_look is not None else None)
+        sc = torch.cat((self.c_short[new_c], self.score[N + par]))
+        fm = torch.cat((self.uid[src_slot], self.uid[N + par]))
+        # Free the levels not kept, then fill the free slots
+        out = ex[~sel[:n_ex]]
+        self.lv_on[out] = False
+        at.good[N + out] = False
+        self.seen[N + out] = False
+        self.slot_gen[N + out] += 1
+        jn = torch.nonzero(~self.lv_on).squeeze(1)[:sc.numel()]
+        s = N + jn
+        for k in Atlas.TENSORS:
+            getattr(at, k)[s] = vals[k]
+        self.pmax[s] = at.pmax[s].clamp(min=1e-6)
+        self.score[s] = sc
+        self.seen[s] = True
+        self.last[s] = iteration
+        self.visits[s] = 0
+        self.slot_gen[s] += 1
+        self.born[s] = iteration
+        self.uid[s] = fm
+        self.lv_tilt[jn] = tilt
+        if look is not None:
+            for k, v in self.lv_look.items():
+                v[jn] = look[k]
+        self.lv_on[jn] = True
+        self.c_count.zero_()
+        self.levels_iter = iteration
+        _sync(dev)
+        self.last_levels = {"candidates": n_cand, "dropped": n_cand - n, "inserted": new_c.numel(),
+                            "inserted_edits": new_e.numel(), "evicted": out.numel(),
+                            "edits_tried": e["tried"], "edits_valid": e["valid"], "edits_good": n_e,
+                            "update_s": time.perf_counter() - t0}
 
     # ── Logging (host syncs) ──
 
@@ -1754,9 +2063,41 @@ class ScenarioPool(ScenarioSampler):
             out[f"pool/valid_share_{nm}"] = float(c[4, j] / c[0, j]) if c[0, j] else math.nan
         for nm, m in sep_bin_masks(sep, self.bins).items():
             out[f"pool/hist_{nm}"] = float(m.float().mean())
-        out["pool/age_mean"] = float((self.iteration - self.born).double().mean())
+        out["pool/age_mean"] = float((self.iteration - self.born[:self.n_slots]).double().mean())
         out["pool/rejected"] = float(lf.get("rejected", math.nan))
         out.update({f"pool/{k}": v for k, v in self.region_shares().items()})
+        if self.n_levels:
+            out.update(self.level_stats())
+        return out
+
+    def level_stats(self) -> Dict[str, float]:
+        """accel/...: filled levels and share, share of all draws, score quantiles, root
+        scenarios (families), mean age (iterations) and replays of the filled levels, the
+        last update (candidates recorded / dropped, inserted from candidates / edits,
+        evicted, edits tried / valid / good, time); plr/level_... and plr/edit_...:
+        episodes and mean shortfall of the level draws as stored / with a tilt edit."""
+        N, K = self.n_slots, self.n_levels
+        on = self.lv_on
+        n_on = int(on.sum())
+        acc = self._acc.cpu()
+        nan = math.nan
+        out = {"accel/levels": float(n_on), "accel/fill": n_on / K,
+               "accel/draw_share": float(self.q_level)}
+        for j, name in ((SRC_LEVEL, "level"), (SRC_EDIT, "edit")):
+            ng = float(acc[1, j])
+            out[f"plr/{name}_episodes"] = float(acc[0, j])
+            out[f"plr/{name}_shortfall"] = float(acc[2, j]) / ng if ng else nan
+        out.update({k: nan for k in ("accel/score_q10", "accel/score_q50", "accel/score_q90",
+                                     "accel/families", "accel/age_mean", "accel/visits_mean")})
+        if n_on:
+            sc = self.score[N:][on].double()
+            q = torch.quantile(sc, torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64,
+                                                device=sc.device)).tolist()
+            out.update({"accel/score_q10": q[0], "accel/score_q50": q[1], "accel/score_q90": q[2],
+                        "accel/families": float(torch.unique(self.uid[N:][on]).numel()),
+                        "accel/age_mean": float((self.iteration - self.born[N:][on]).double().mean()),
+                        "accel/visits_mean": float(self.visits[N:][on].double().mean())})
+        out.update({f"accel/{k}": float(v) for k, v in self.last_levels.items()})
         return out
 
     # ── Checkpoint ──
@@ -1767,20 +2108,58 @@ class ScenarioPool(ScenarioSampler):
                  born=self.born, cursor=self.cursor, ptr=list(self.ptr),
                  filled_iter=self.filled_iter, cum=self.cum.copy(), last_fill=dict(self.last_fill),
                  pool_cfg=asdict(self.pcfg), cum_rbin=self.cum_rbin.copy())
+        if self.n_levels:
+            n = min(int(self.c_count), self.lcfg.candidates)
+            d["levels"] = {
+                "cfg": asdict(self.lcfg), "on": self.lv_on, "tilt": self.lv_tilt, "look": self.lv_look,
+                "uid": self.uid, "next_uid": self.next_uid, "iter": self.levels_iter,
+                "last": dict(self.last_levels), "c_count": self.c_count,
+                "cand": {"slot": self.c_slot[:n], "gen": self.c_gen[:n], "tilt": self.c_tilt[:n],
+                         "short": self.c_short[:n],
+                         "look": {k: v[:n] for k, v in self.c_look.items()} if self.c_look else None}}
         return d
 
     def load_state_dict(self, d: Dict[str, Any]):
+        """Also a checkpoint without levels into a pool with levels (levels empty)."""
         dev = self.device
         have = {"region_mix": (), **d["pool_cfg"]}  # Checkpoints from before region_mix
         assert have == asdict(self.pcfg), "pool settings differ from the checkpoint"
+        n_ck = d["pool"]["params"].shape[0]
+        assert n_ck in (self.n_slots, self.atlas.n), f"pool checkpoint with {n_ck} rows"
         for k in Atlas.TENSORS:
-            getattr(self.atlas, k).copy_(d["pool"][k].to(dev))
+            getattr(self.atlas, k)[:n_ck].copy_(d["pool"][k].to(dev))
         self.pmax = self.atlas.pmax.clamp(min=1e-6)
-        self.slot_gen, self.born = d["slot_gen"].to(dev), d["born"].to(dev)
+        pad = lambda v: torch.cat((v.to(dev), torch.zeros(self.atlas.n - v.shape[0], dtype=v.dtype,  # noqa: E731
+                                                          device=dev)))
+        self.slot_gen, self.born = pad(d["slot_gen"]), pad(d["born"])
         self.cursor, self.ptr, self.filled_iter = int(d["cursor"]), list(d["ptr"]), int(d["filled_iter"])
         self.cum = np.array(d["cum"], dtype=np.int64)
         self.last_fill = dict(d["last_fill"])
         self.cum_rbin = np.array(d.get("cum_rbin", np.zeros_like(self.cum_rbin)), dtype=np.int64)
+        lv = d.get("levels")
+        assert lv is None or self.n_levels, "the checkpoint has levels, this pool none"
+        if lv is not None:
+            want = {**asdict(self.lcfg), "edit_sigma": list(self.lcfg.edit_sigma)}
+            assert {**lv["cfg"], "edit_sigma": list(lv["cfg"]["edit_sigma"])} == want, \
+                "level settings differ from the checkpoint"
+            self.lv_on, self.lv_tilt = lv["on"].to(dev), lv["tilt"].to(dev)
+            self.uid, self.next_uid, self.levels_iter = lv["uid"].to(dev), int(lv["next_uid"]), int(lv["iter"])
+            self.last_levels = dict(lv["last"])
+            self.c_count = lv["c_count"].to(dev)
+            c = lv["cand"]
+            n = c["slot"].shape[0]
+            for name in ("slot", "gen", "tilt", "short"):
+                getattr(self, f"c_{name}")[:n] = c[name].to(dev)
+            if lv["look"] is not None:
+                C = self.lcfg.candidates
+                self.lv_look = {k: v.to(dev) for k, v in lv["look"].items()}
+                self.c_look = {k: torch.zeros(C + 1, *v.shape[1:], dtype=v.dtype, device=dev)
+                               for k, v in self.lv_look.items()}
+                for k, v in (c["look"] or {}).items():
+                    self.c_look[k][:n] = v.to(dev)
+        elif self.n_levels:  # Levels start empty; the checkpoint's slots are the roots
+            self.levels_iter = int(d["iteration"])
+        d = {**d, **{k: pad(d[k]) for k in ("score", "seen", "last", "visits")}}
         super().load_state_dict(d)
 
 

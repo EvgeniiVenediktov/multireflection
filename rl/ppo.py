@@ -151,6 +151,16 @@ Cluster: cluster/ppo_l40s.slurm.
                deterministic % of the oracle (eval_region/bin_mean/pct_oracle, logged
                with every region eval); the value used is logged as best/value. Run-name
                markers _nb<F>[r<RMIN>-<RMAX>], _rmix, _bmregion
+    accel      (pool runs, off by default) --accel-levels K: ACCEL hard levels (scenarios.py
+               LevelConfig): K level slots of scenario + start tilt + camera look, filled
+               once per iteration from the episodes ending with shortfall >= --accel-thresh
+               (0.3) and from --accel-edits (256) box-scanned scenario edits of levels
+               (Gaussian noise --accel-edit-sigma: sep mm, pitch / yaw deg, dx / dy mm),
+               <= --accel-family-cap (4) per root pool scenario, the top K by score (EMA of
+               the replays); --accel-share (0.2) of the good draws x the filled share comes
+               from them (PLR rank / staleness), --accel-jitter-p (0.5) of those with a
+               Gaussian start-tilt edit of --accel-jitter (0.05) deg. Logged accel/... and
+               plr/level_..., plr/edit_...; marker _accel<K>
     holdout    --holdout-frac F (default 0): a seeded (--holdout-seed) random share F of
                the grid scenarios, stratified good / impossible, never drawn in
                training (scenarios.holdout_mask, removed from the sampler's segments)
@@ -234,6 +244,15 @@ class PPOConfig:
     pool_size: int = 16384
     pool_refresh: float = 0.0625  # Share of the pool rescanned per iteration (was 0.125)
     pool_region_mix: str = ""  # Good-slot shares per target-region bin "a,b,c,d"; "" = natural
+    # ACCEL hard levels in the pool (scenarios.LevelConfig); accel_levels 0 = off
+    accel_levels: int = 0  # Level slots (scenario + start tilt + camera look)
+    accel_share: float = 0.2  # Share of the good draws from the levels, x their filled share
+    accel_thresh: float = 0.3  # Shortfall 1 - P_final / P_max to enter and to stay
+    accel_family_cap: int = 4  # Levels per root pool scenario
+    accel_jitter: float = 0.05  # deg, start-tilt edit sigma per axis
+    accel_jitter_p: float = 0.5  # Share of the level draws with a start-tilt edit
+    accel_edits: int = 256  # Scenario edits per iteration (box-scanned)
+    accel_edit_sigma: Tuple[float, ...] = (5.0, 0.1, 0.1, 0.05, 0.05)  # sep mm, pitch / yaw deg, dx / dy mm
 
     # ── Scenario sampler (--setups full) ──
     plr: bool = True  # Regret-prioritized replay; False: good scenarios uniform
@@ -367,6 +386,16 @@ def cont_ranges_of(c: PPOConfig):
     from scenarios import cont_ranges
 
     return cont_ranges(c.sep_range, c.laser_range, c.laser_offset_radius, c.laser_mode)
+
+
+def level_config(c: PPOConfig):
+    """scenarios.LevelConfig of the run (--accel-*; size 0 = no levels)."""
+    from scenarios import LevelConfig
+
+    return LevelConfig(size=c.accel_levels, share=c.accel_share, thresh=c.accel_thresh,
+                       family_cap=c.accel_family_cap, jitter=c.accel_jitter,
+                       jitter_p=c.accel_jitter_p, edits=c.accel_edits,
+                       edit_sigma=tuple(c.accel_edit_sigma))
 
 
 def agent_config(c: PPOConfig, n_bins: int) -> AgentConfig:
@@ -1022,8 +1051,8 @@ class Trainer:
         assert c.scenarios in SCENARIO_CHOICES, f"scenarios {c.scenarios!r} not in {SCENARIO_CHOICES}"
         assert c.encoder_epochs >= 0 and c.encoder_train_until >= 0, "encoder schedule"
         assert c.best_metric in BEST_METRICS, f"best_metric {c.best_metric!r} not in {BEST_METRICS}"
-        assert pool_mode(c) or (c.near_best_frac == 0 and not c.pool_region_mix), \
-            "--near-best-frac / --pool-region-mix need --scenarios pool"
+        assert pool_mode(c) or (c.near_best_frac == 0 and not c.pool_region_mix and not c.accel_levels), \
+            "--near-best-frac / --pool-region-mix / --accel-levels need --scenarios pool"
         self.device = dev = torch.device(device or "cuda")
         torch.manual_seed(c.seed)
 
@@ -1049,7 +1078,7 @@ class Trainer:
             self.pool = self.sampler = ScenarioPool(
                 PoolConfig(size=c.pool_size, ranges=cont_ranges_of(c), refresh_frac=c.pool_refresh,
                            seed=c.seed, region_mix=parse_region_mix(c.pool_region_mix)),
-                scfg, device=dev, log=log)
+                scfg, device=dev, log=log, levels=level_config(c))
             self.pool.atlas.check(ec.max_bounces, ec.geometry.m2_tilt_limit, ec.step_unit)
             scen_kw = {"pool": self.pool}
         elif c.setups == "full":
@@ -1249,7 +1278,8 @@ class Trainer:
             done = term | trunc
             if self.sampler is not None:
                 self.sampler.observe(info["setup"], info["ep_final_path_mm"], done,
-                                     info["scenario_src"], info["scenario_gen"])
+                                     info["scenario_src"], info["scenario_gen"],
+                                     info["ep_initial_tilt"], info.get("ep_look"))
             d = done.double()
             st["n"] += d.sum()
             st["ret"] += (info["ep_return"].double() * d).sum()
@@ -1689,6 +1719,14 @@ class Logger:
                   f"top ({row.get('plr/top_sep', math.nan):g} mm, {row.get('plr/top_laser_pitch', math.nan):g}, "
                   f"{row.get('plr/top_laser_yaw', math.nan):g}) share {row.get('plr/top_draw_share', math.nan):.4f}",
                   flush=True)
+        if "accel/levels" in row:
+            print(f"      accel: levels {row['accel/levels']:.0f} ({row['accel/families']:g} roots) draw share "
+                  f"{row['accel/draw_share']:.3f} | +{row['accel/inserted']:.0f} cand "
+                  f"+{row['accel/inserted_edits']:.0f} edits (valid {row['accel/edits_valid']:.0f}, good "
+                  f"{row['accel/edits_good']:.0f} of {row['accel/edits_tried']:.0f}) -{row['accel/evicted']:.0f} | "
+                  f"cand {row['accel/candidates']:.0f} dropped {row['accel/dropped']:.0f} | score q50 "
+                  f"{row['accel/score_q50']:.3f} | shortfall level {row['plr/level_shortfall']:.3f} edit "
+                  f"{row['plr/edit_shortfall']:.3f} | {row['accel/update_s']:.2f} s", flush=True)
         if "pool/candidates" in row:
             hist = " ".join(f"{k[len('pool/hist_sep'):]} {100 * v:.0f}" for k, v in row.items()
                             if k.startswith("pool/hist_"))
@@ -1745,7 +1783,7 @@ def encoder_origin(encoder_info: Optional[dict]) -> str:
 def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     """Display / directory name from the config, built at start:
     ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_ee<N>][_eu<F>][_pr<F>][_nb<F>[r<lo>-<hi>]]
-    [_rmix][_bm<metric>][_cam[-norot][-evtrain]][_fp][_stop<V>][_<tag>]_<jobid>, prefixed
+    [_rmix][_accel<K>][_bm<metric>][_cam[-norot][-evtrain]][_fp][_stop<V>][_<tag>]_<jobid>, prefixed
     with <run tag>_ when --run-tag is set;
     <enc>: encoder_origin; <scen>: <ranges>-plr / -unif with the pool (ContRanges.tag,
     e.g. cont20-400-plr), full-plr / full-unif with the atlas (prioritized / uniform
@@ -1753,8 +1791,8 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     (--holdout-frac); _ft<run>: initialized from that PPO run (--init-from); _ee<N> /
     _eu<F>: --encoder-epochs / --encoder-train-until when set; _pr<F>: --pool-refresh
     when not the default (pool runs); _nb<F>: --near-best-frac (r<lo>-<hi>: a
-    --near-best-radius other than the default); _rmix: --pool-region-mix; _bm<metric>:
-    --best-metric other than cont."""
+    --near-best-radius other than the default); _rmix: --pool-region-mix; _accel<K>:
+    --accel-levels; _bm<metric>: --best-metric other than cont."""
     enc = encoder_origin(encoder_info)
     if pool_mode(c):
         scen = cont_ranges_of(c).tag() + ("-plr" if c.plr else "-unif")
@@ -1784,6 +1822,8 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
             name += f"r{lo:g}-{hi:g}"
     if c.pool_region_mix:
         name += "_rmix"
+    if c.accel_levels:
+        name += f"_accel{c.accel_levels}"
     if c.best_metric != "cont":
         name += f"_bm{c.best_metric}"
     if c.camera:
