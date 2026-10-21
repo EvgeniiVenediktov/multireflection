@@ -168,7 +168,9 @@ Cluster: cluster/ppo_l40s.slurm.
                --no-wandb, display name built at start from the config, --wandb-tags (comma
                list) set at start. --run-tag r<N>-<short> (e.g. r9-cam-logp): prefix of the
                display name and of the W&B run id (<tag>-<8 hex>, kept in the checkpoint),
-               and a W&B tag, so the run is found by its short name
+               and a W&B tag, so the run is found by its short name; without --run-tag the
+               W&B display name takes the first r<N>-<short> tag of --wandb-tags as its
+               prefix (display_name; runs started before --run-tag, also on resume)
     checkpoint latest.pt (every --ckpt-minutes and at exit), best.pt (best deterministic
                % of the oracle: on the cont set with the pool, the full set with the
                atlas, else on the set of the run; --best-metric region: the region-bin
@@ -1655,8 +1657,20 @@ def count(agent: Agent) -> str:
             f"{n(agent):.2f} M params")
 
 
+RUN_TAG_RE = re.compile(r"r\d+[a-z]?(-[A-Za-z0-9]+)*")  # r<N>[<letter>]-<short>, e.g. r7b-cam-fp
+
+
+def display_name(name: str, config: dict) -> str:
+    """W&B display name: name prefixed with the run's tag (--run-tag, else the first
+    r<N>-<short> tag of --wandb-tags, e.g. runs started before --run-tag) unless it
+    already starts with it."""
+    tags = [t.strip() for t in (config.get("wandb_tags") or "").split(",") if t.strip()]
+    rt = config.get("run_tag") or next((t for t in tags if RUN_TAG_RE.fullmatch(t)), "")
+    return name if not rt or name.startswith(f"{rt}_") else f"{rt}_{name}"
+
+
 class Logger:
-    """train.csv / eval.csv (appended on resume) and W&B."""
+    """train.csv / eval.csv (appended on resume) and W&B (display name: display_name)."""
 
     def __init__(self, run_dir: str, name: str, config: dict, encoder_info: Optional[dict],
                  use_wandb: bool, project: str, wandb_id: Optional[str],
@@ -1677,7 +1691,8 @@ class Logger:
             self.wandb_id = wandb_id or (f"{rt}-{uuid.uuid4().hex[:8]}" if rt else uuid.uuid4().hex[:12])
             tags = [t.strip() for t in config.get("wandb_tags", "").split(",") if t.strip()]
             tags += [rt] if rt and rt not in tags else []
-            self.wb = wandb.init(project=project, name=name, id=self.wandb_id, resume="allow",
+            self.wb = wandb.init(project=project, name=display_name(name, config), id=self.wandb_id,
+                                 resume="allow",
                                  config={**config, "encoder_info": encoder_info,
                                          "init_info": init_short},
                                  tags=tags or None, dir=os.environ.get("WANDB_DIR", run_dir))
