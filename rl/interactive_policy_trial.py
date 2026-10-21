@@ -19,9 +19,10 @@ Panels
                ended, the oracle's target. Below: the scenario and the last episode vs its
                oracle
     camera     the 64 px uint8 image the agent receives, in the render style (sim:
-               env.SpotRenderer; camera clean / camera train: render_camera.CameraRenderer)
-               and the agent's input channels (RGB for 3, gray for 1), step, bounce
+               env.SpotRenderer; camera: render_camera.CameraRenderer with the camera
+               look) and the agent's input channels (RGB for 3, gray for 1), step, bounce
                count, path, stop reason, input (style, channels), episode state
+    look       camera look panel (right of the camera image), see Camera look
     beam       x-z and y-z side views (z / separation) of the ray between the mirrors
                (dashed: the leaving ray), both mirror faces with the hit points (local x / y,
                color = bounce index)
@@ -54,16 +55,12 @@ Controls and keys
                appear): list opens a menu of them (a section per run directory, the loaded
                one marked; a native Tk menu, TkAgg only), prev / next take the previous /
                next file (from the loaded checkpoint, else the first / last); the file is
-               loaded as from the box, which then shows its path; render: sim /
-               camera clean / camera train (cycles; the env is rebuilt and a new episode
-               starts at the start tilt): sim = env.SpotRenderer (1 channel, runs r2-r6),
-               camera clean = render_camera.CameraRenderer with every effect off
-               (CameraRanges(clean_p=1), 3 channels, the camera runs' evals), camera train
-               = the run's training augmentation (ppo.camera_ranges(training=True); a run
-               without --camera: CameraRanges() with rotation_p 0), parameters drawn per
-               episode (pose, color camera, lit face, marks, edge scatter, sensor noise:
-               each new episode a new look). A loaded checkpoint starts in camera clean if
-               it trained with --camera, else in sim. The image reaches the agent with its
+               loaded as from the box, which then shows its path; render: sim / camera
+               (the env is rebuilt and a new episode starts at the start tilt): sim =
+               env.SpotRenderer (1 channel, runs r2-r6), camera =
+               render_camera.CameraRenderer under the camera look (3 channels). A loaded
+               checkpoint starts in camera if it trained with --camera, else in sim (the
+               camera look stays). The image reaches the agent with its
                encoder's in_ch channels: 1 -> 3 copies the gray image (as the 3-channel
                encoders were trained to take it), 3 -> 1 takes the channel mean (rounded);
                the camera panel shows that image
@@ -81,9 +78,30 @@ Controls and keys
     keys       right or s: step; space: run / pause; r: reset; n: random start; d: argmax /
                sampled; m: map color; g: random good scenario; [ / ]: separation -/+0.5 mm;
                { / }: -/+5 mm
+Camera look: the parameters of every camera render are fixed (AlignEnv draws none per
+episode: Session._install_look), so tilt changes and new episodes keep the look; they are
+a base look with the panel settings on top. Any change starts a new episode at the start
+tilt; in sim it is kept for the camera style.
+    new look   base = a draw from the run's training ranges (ppo.camera_ranges(training=
+               True); a run without --camera: CameraRanges() without rotation; never clean)
+    clean      base = every effect off (the camera runs' evals; the default)
+               (both set the panel from the base, except the scatter amplitude)
+    camera     mono / red / green / blue laser (a color base keeps its crosstalk, tint and
+               white balance; from mono: 0.1 crosstalk, neutral color)
+    noise      frozen (default): the camera generator restarts before every render, so
+               the per-frame draws (sensor noise, speckle, edge-scatter shape) repeat and
+               the same tilt gives the same frame; live: redrawn every frame (training);
+               off: no read / shot / row noise and speckle (draws repeat as frozen)
+    scatter    edge scatter on / off (amplitude: slider; drawn per frame in training)
+    pose       off: no rotation / shift / scale / perspective (on: the base's)
+    marks      off: no rings, grain, engraving, scratches, dust, rim glow (on: the base's)
+    sliders    lit face (face brightness after the sensor, 0 = dark), laser (first-spot
+               peak), spot sigma (mm), scatter (amplitude), exposure, gamma, read noise
+               (std), speckle (per-spot log-normal std); a value box as the other sliders
 Decision log (one pair of files per session in runs/viewer_logs/, gitignored; --no-log):
     <session>_steps.csv     a row per agent step: the scenario (incl. laser_dx_mm /
-                            laser_dy_mm, roc_mm), render style, tilt before / after, the
+                            laser_dy_mm, roc_mm), render style, camera look (look:
+                            Session.look_text, "" in sim), tilt before / after, the
                             action (ladder step and applied delta, deg; not_move), P(not
                             move), the
                             probability of the taken step and the top 3 steps per axis,
@@ -94,9 +112,9 @@ Decision log (one pair of files per session in runs/viewer_logs/, gitignored; --
                             laser_dy_mm>, nan where the head has no value) vs the scenario,
                             reward, return so far, stop reason, done flags
     <session>_episodes.csv  a row per played episode (stopped, truncated, or abandoned by
-                            a new start / scenario / checkpoint / ROC / render style):
+                            a new start / scenario / checkpoint / ROC / render style / look):
                             scenario (incl. laser_dx_mm / laser_dy_mm, roc_mm), render
-                            style, P_max, valid / invalid_reason,
+                            style, camera look, P_max, valid / invalid_reason,
                             in_training_range (0: extrapolation) / range_note, start,
                             steps, moves, final tilt and path, P / P_max, return, and the
                             oracle of that scenario and start (baselines.plan_oracle):
@@ -207,7 +225,7 @@ MAP_RECT = _px(80, 525, 490, 490)
 CBAR_RECT = _px(582, 525, 12, 490)
 SCEN_TXT_RECT = _px(30, 380, 590, 38)
 LAST_TXT_RECT = _px(30, 352, 590, 22)
-CAM_RECT = _px(690, 730, 300, 300)
+CAM_RECT = _px(655, 730, 300, 300)
 CAM_TXT_RECT = _px(655, 570, 520, 148)
 FACE_RECTS = (_px(670, 265, 235, 235), _px(925, 265, 235, 235))
 HIT_CBAR_RECT = _px(1170, 280, 9, 200)
@@ -233,7 +251,20 @@ FS_HEAD = 11.5  # Control group headers
 # 4407578, which trained on 50-200 mm, 0-8 deg and the measured offsets) ──
 SEP_RANGE = (20.0, 400.0)  # mm (slider step 0.5 mm; keys [ ] and { })
 ROCS = (200.0, 150.0)  # mm, mirror ROC button (200: measured cell; 150: March 2026 sim)
-RENDER_STYLES = ("sim", "camera clean", "camera train")  # Render button (env images)
+RENDER_STYLES = ("sim", "camera")  # Render button (env images)
+# Camera look panel: camera button, noise button, sliders (CameraParams key, label, range
+# (the CameraRanges defaults; 0 = off where it has an off), step, format)
+LOOK_CAMERAS = ("mono", "red", "green", "blue")
+LOOK_NOISE = ("frozen", "live", "off")
+LOOK_SLIDERS = (("face", "lit face", (0.0, 0.7), 0.01, "%.2f"),
+                ("laser", "laser", (0.4, 6.0), 0.05, "%.2f"),
+                ("sigma", "spot sigma", (0.2, 0.6), 0.01, "%.2f mm"),
+                ("scatter_amp", "scatter", (1.0, 20.0), 0.5, "%.1f"),
+                ("exposure", "exposure", (0.4, 2.5), 0.05, "%.2f"),
+                ("gamma", "gamma", (0.7, 1.4), 0.01, "%.2f"),
+                ("read_noise", "read noise", (0.0, 0.03), 0.001, "%.3f"),
+                ("speckle", "speckle", (0.0, 0.3), 0.01, "%.2f"))
+MARK_KEYS = ("ring_a", "grain", "engrave_amp", "scratch_amp", "dust_amp", "rim")  # Face marks
 ANGLE_RANGE = (-8.0, 8.0)  # deg, laser pitch and yaw
 SHORT_SEPS = (20.0, 49.0)  # "random short"
 LONG_SEPS = (201.0, 400.0)  # "random long"
@@ -618,6 +649,19 @@ class Session:
         # ── Agent ──
         self.pcfg = PPOConfig()  # Env settings of the loaded run (defaults without one)
         self.render_style = "sim"  # RENDER_STYLES; a loaded checkpoint sets its own
+        # Camera look: fixed parameters of every camera render (no per-episode draw): the
+        # base (clean or a draw) with the panel's settings on top (look_params())
+        self._look_base: Optional[Dict[str, torch.Tensor]] = None  # (1, ...) CameraParams
+        self.look_name = "clean"  # Of the base: clean / draw <k>
+        self.look_edited = False  # A setting changed since the base
+        self.look_ctl: Dict[str, object] = {"camera": "mono", "scatter": False, "pose": True,
+                                            "marks": True, "noise": "frozen"}
+        self.look_ctl.update(face=0.0, laser=1.0, sigma=0.5, scatter_amp=4.5, exposure=1.0,
+                             gamma=1.0, read_noise=0.0, speckle=0.0)
+        self.look_draws = 0
+        self.look_gen = torch.Generator(device=dev)
+        self.look_gen.manual_seed(cfg.seed)
+        self._look_cams: Dict[int, object] = {}  # img_res -> CameraRenderer (draws only)
         self.agent: Optional[Agent] = None
         self._act_fn = None  # agent.act or its GraphAct
         self.vnorm: Optional[ValueNorm] = None
@@ -663,7 +707,8 @@ class Session:
         """Agent of a ppo.py checkpoint (best.pt / latest.pt): its AgentConfig, every tensor
         whose name and shape match (Agent.init_from; an old setup head is skipped, a
         missing scenario head stays untrained and is hidden), the value norm and the run's
-        PPOConfig (env settings; render style camera clean for a --camera run, else sim).
+        PPOConfig (env settings; render style camera for a --camera run, else sim; the
+        camera look stays).
         Restarts the episode at the start tilt."""
         path = os.path.abspath(path)
         ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
@@ -685,7 +730,7 @@ class Session:
         info = agent.init_from(path)
         agent.to(self.device).eval().requires_grad_(False)
         self.agent, self.vnorm, self.pcfg = agent, vn, pcfg
-        self.render_style = "camera clean" if pcfg.camera else "sim"
+        self.render_style = "camera" if pcfg.camera else "sim"
         self.ckpt_path = path
         try:  # Outputs of the scenario head of this agent.py: mean and log-variance per value
             n_out = agent.scenario[-1].out_features // 2
@@ -893,23 +938,156 @@ class Session:
         self.geom = replace(self.geom, roc=float(roc))
         self.sim = self.geom.make_sim(self.device, max_bounces=self.cap)
 
-    def style_ranges(self):
-        """render_camera.CameraRanges of the render style, None for sim (SpotRenderer):
-        camera clean = every effect off; camera train = the run's training ranges (a
-        --camera run), else the defaults without rotation."""
-        if self.render_style == "sim":
-            return None
+    # ── Camera look ──
+
+    def look_ranges(self):
+        """render_camera.CameraRanges the new looks are drawn from: the run's training
+        ranges (a --camera run), else the defaults without rotation; never clean."""
         from render_camera import CameraRanges
 
-        if self.render_style == "camera clean":
-            return CameraRanges(clean_p=1.0)
-        return (camera_ranges(self.pcfg, training=True) if self.pcfg.camera
-                else CameraRanges(rotation_p=0.0))
+        r = (camera_ranges(self.pcfg, training=True) if self.pcfg.camera
+             else CameraRanges(rotation_p=0.0))
+        return replace(r, clean_p=0.0)
+
+    def _look_cam(self, env: Optional[AlignEnv] = None):
+        """A CameraRenderer of the run's image size (on the SpotRenderer of env, default
+        the session's) for neutral / sampled parameters (not the env's camera: its
+        sample_params returns the look)."""
+        res = self.pcfg.img_res
+        if res not in self._look_cams:
+            from render_camera import CameraRenderer
+
+            self._look_cams[res] = CameraRenderer((env or self.env).renderer,
+                                                  self.look_ranges())
+        return self._look_cams[res]
+
+    def _set_look_base(self, p: Dict[str, torch.Tensor], name: str):
+        """New base look; the panel settings are read back from it (the scatter amplitude,
+        drawn per frame in training, stays)."""
+        self._look_base, self.look_name, self.look_edited = p, name, False
+        f = lambda k: float(p[k][0])
+        mono = f("mono") > 0.5
+        rgb = p["laser_rgb"][0]
+        self.look_ctl.update(
+            camera="mono" if mono else LOOK_CAMERAS[1 + int(rgb.argmax())],
+            scatter=f("scatter_on") > 0.5, pose=True, marks=True,
+            face=f("face"), laser=f("laser"), sigma=f("sigma"), exposure=f("exposure"),
+            gamma=f("gamma"), read_noise=f("read_noise"), speckle=f("speckle"))
+
+    def look_params(self, env: Optional[AlignEnv] = None) -> Dict[str, torch.Tensor]:
+        """(1, ...) CameraParams of every camera render: the base look (clean until set)
+        with the panel settings: camera (mono / laser color; a color look keeps its
+        crosstalk, tint and white balance, from a mono base 0.1 crosstalk, neutral color),
+        edge scatter on / off, pose off = identity, marks off = no rings, grain, engraving,
+        scratches, dust, rim glow; noise off = no read / shot / row noise and speckle."""
+        if self._look_base is None or self._look_base["prnu_map"].shape[-1] != self.pcfg.img_res:
+            self._set_look_base(self._look_cam(env).neutral_params(1), "clean")
+        c = self.look_ctl
+        p = {k: v.clone() for k, v in self._look_base.items()}
+        base_mono = float(p["mono"][0]) > 0.5
+        if c["camera"] == "mono":
+            qe = p["laser_rgb"].max(1, keepdim=True).values if base_mono else 1.0
+            p["mono"].fill_(1.0)
+            p["laser_rgb"] = torch.ones_like(p["laser_rgb"]) * qe
+            for k in ("ambient_rgb", "wb"):
+                p[k] = torch.ones_like(p[k])
+        else:
+            k = LOOK_CAMERAS.index(c["camera"]) - 1
+            rgb = self._look_base["laser_rgb"]
+            x = 0.1 if base_mono else float(rgb[0].sort().values[:2].mean())
+            p["mono"].fill_(0.0)
+            p["laser_rgb"] = torch.full_like(rgb, x)
+            p["laser_rgb"][:, k] = 1.0
+        p["scatter_on"].fill_(float(c["scatter"]))
+        if not c["pose"]:
+            eye = torch.eye(3, device=p["warp"].device)[None]
+            p["warp"], p["warp_inv"] = eye.clone(), eye.clone()
+            p["scale"].fill_(1.0)
+        if not c["marks"]:
+            for k in MARK_KEYS:
+                p[k] = torch.zeros_like(p[k])
+        for k in ("face", "laser", "sigma", "exposure", "gamma", "read_noise", "speckle"):
+            p[k].fill_(float(c[k]))
+        if c["noise"] == "off":
+            for k in ("read_noise", "shot_noise", "row_noise", "speckle"):
+                p[k].fill_(0.0)
+        return p
+
+    def _install_look(self, env: AlignEnv):
+        """The look on an env's camera: its parameters for every reset (no per-episode
+        draw) and now, the scatter amplitude fixed (drawn per frame in training)."""
+        if env.cam is None:
+            return
+        p = self.look_params(env)
+        env.cam.sample_params = lambda n, gen, ranges=None: {
+            k: v.expand(n, *v.shape[1:]).clone() for k, v in p.items()}
+        env.cam_params = env.cam.sample_params(env.num_envs, None)
+        a = float(self.look_ctl["scatter_amp"])
+        env.cam.ranges = replace(env.cam.ranges, scatter_amp=(a, a))
+
+    def _reseed_camera(self):
+        """Noise frozen / off: the camera generator restarts before every render, so the
+        per-frame draws (sensor noise, speckle, edge-scatter shape) repeat and the same
+        tilt gives the same frame; live: they go on (as in training)."""
+        if self.env.cam is not None and self.look_ctl["noise"] != "live":
+            self.env.reseed_camera(self.cfg.seed + self.look_draws)
+
+    @torch.inference_mode()
+    def set_look(self, **ctl) -> Optional[Frame]:
+        """Change panel settings (look_ctl keys); in the camera style a new episode starts
+        at the start tilt (an open one is logged), None in sim (kept for the camera)."""
+        assert set(ctl) <= set(self.look_ctl), f"look settings {sorted(ctl)}"
+
+        def update():
+            self.look_ctl.update(ctl)
+            self.look_edited = True
+
+        return self._change_look(update)
+
+    @torch.inference_mode()
+    def new_look(self, clean: bool = False) -> Optional[Frame]:
+        """Base look: clean (every effect off) or a new draw from look_ranges(); the panel
+        settings follow it. A new episode as set_look."""
+        cam = self._look_cam()
+
+        def update():
+            if clean:
+                self._set_look_base(cam.neutral_params(1), "clean")
+            else:
+                self.look_draws += 1
+                self._set_look_base(cam.sample_params(1, self.look_gen, self.look_ranges()),
+                                    f"draw {self.look_draws}")
+
+        return self._change_look(update)
+
+    def _change_look(self, update: Callable[[], None]) -> Optional[Frame]:
+        """Log an open episode under the old look, update, install, restart."""
+        if self.env.cam is None:
+            update()
+            return None
+        self._finish_open()
+        update()
+        self._install_look(self.env)
+        return self.start(self.start_tilt)
+
+    def look_text(self) -> str:
+        """The look of the camera renders in one line ("" in sim): base, settings."""
+        if self.render_style == "sim":
+            return ""
+        c = self.look_ctl
+        on = lambda k: "on" if c[k] else "off"
+        return (f"{self.look_name}{' edited' if self.look_edited else ''}: {c['camera']}, "
+                f"face {c['face']:.2f}, laser {c['laser']:.2f}, sigma {c['sigma']:.2f}, "
+                f"scatter {on('scatter')} {c['scatter_amp']:.1f}, pose {on('pose')}, "
+                f"marks {on('marks')}, exposure {c['exposure']:.2f}, gamma {c['gamma']:.2f}, "
+                f"read noise {c['read_noise']:.3f}, speckle {c['speckle']:.2f}, "
+                f"noise {c['noise']}")
 
     @torch.inference_mode()
     def set_render_style(self, style: str) -> Frame:
         """Render style of the env images (RENDER_STYLES): an open episode is logged, the
-        env rebuilt with its camera, a new episode starts at the start tilt."""
+        env rebuilt (camera: with the camera look), a new episode starts at the start
+        tilt."""
         assert style in RENDER_STYLES, f"render style {style!r}"
         self._finish_open()
         self.render_style = style
@@ -931,7 +1109,8 @@ class Session:
         return image.float().mean(1, keepdim=True).round().to(torch.uint8)
 
     def input_text(self) -> str:
-        """Render style and channels: the env's, -> the agent's when adapted."""
+        """Render style and channels: the env's, -> the agent's when adapted (the camera
+        look: look_text())."""
         c = self.env.img_shape[0]
         n = c if self.agent is None else self.agent.cfg.encoder.in_ch
         return f"{self.render_style}, {c} ch" + (f" -> {n}" if n != c else "")
@@ -939,16 +1118,17 @@ class Session:
     def make_env(self, params, path_ref: torch.Tensor) -> AlignEnv:
         """AlignEnv of the run's settings with one scenario (5 parameters): separation and
         laser tilt as its one-row table, the laser offset in its geometry; P_ref (1,);
-        images of the render style (EnvConfig.camera = style_ranges())."""
+        images of the render style (camera: the camera look on every reset)."""
         sep, lp, ly, dx, dy = self.full_params(params)
         ec = env_config(self.pcfg, 1, False, self.cfg.seed, setups="full")
-        ec = replace(ec, camera=self.style_ranges(),
+        ec = replace(ec, camera=self.look_ranges() if self.render_style == "camera" else None,
                      geometry=replace(ec.geometry, laser_dx=dx, laser_dy=dy,
                                       roc=self.geom.roc))
         tab = Scenarios(params=torch.tensor([[sep, lp, ly]], dtype=torch.float32),
                         path_ref=path_ref.float().reshape(1))
         env = AlignEnv(ec, scenarios=tab)
         assert env.n_bins == self.ladder_units.size
+        self._install_look(env)
         return env
 
     def _build_env(self, params, path_ref: torch.Tensor):
@@ -956,7 +1136,7 @@ class Session:
         self.env = self.make_env(params, path_ref)
         if self.env.cam is not None and old is not None and old.cam is not None:
             # The camera generator goes on across rebuilds (scenario, checkpoint, style):
-            # camera train shows a new look also after a scenario change
+            # live noise does not repeat after a scenario change
             self.env.cam_gen.set_state(old.cam_gen.get_state())
 
     # ── Episode ──
@@ -974,6 +1154,7 @@ class Session:
         self._finish_open()
         t = [float(np.clip(v, -self.limit, self.limit)) for v in tilt]
         self.start_tilt = (t[0], t[1])
+        self._reseed_camera()
         self.env.reset(tilts=torch.tensor([t], dtype=torch.float32, device=self.device))
         self._first = torch.ones(1, dtype=torch.bool, device=self.device)
         self.frame = self.frame0 = self._observe()
@@ -992,6 +1173,7 @@ class Session:
         g, s = self._act
         a = s if self.sampled else g
         self.ring = self._ring_next  # Commit the window that produced the action (rollout)
+        self._reseed_camera()
         _, rew, term, trunc, _ = self.env.step(a)
         self._first = torch.zeros(1, dtype=torch.bool, device=self.device)
         prev = self.frame
@@ -1075,7 +1257,7 @@ class Session:
             "episode": self.episode, "step": f.step, "mode": mode, "scenario": sc.name,
             "sep_mm": sep, "laser_pitch_deg": lp, "laser_yaw_deg": ly,
             "laser_dx_mm": dx, "laser_dy_mm": dy, "roc_mm": self.geom.roc,
-            "render": self.render_style,
+            "render": self.render_style, "look": self.look_text(),
             "pitch_before": prev.tilt[0], "yaw_before": prev.tilt[1],
             "pitch_after": f.tilt[0], "yaw_after": f.tilt[1],
             "act_pitch_deg": d[0], "act_yaw_deg": d[1],
@@ -1141,7 +1323,7 @@ class Session:
             "scenario": sc.name, "atlas_index": sc.atlas_index, "sep_mm": sc.params[0],
             "laser_pitch_deg": sc.params[1], "laser_yaw_deg": sc.params[2],
             "laser_dx_mm": sc.params[3], "laser_dy_mm": sc.params[4], "roc_mm": self.geom.roc,
-            "render": self.render_style,
+            "render": self.render_style, "look": self.look_text(),
             "pmax_m": sc.pmax / 1000, "pref_m": sc.path_ref / 1000, "good": int(sc.good),
             "valid": int(sc.valid), "invalid_reason": sc.invalid_reason,
             "in_training_range": int(sc.in_training_range), "range_note": sc.range_note,
@@ -1416,6 +1598,8 @@ class Viewer:
         c.mpl_connect("close_event", lambda _e: self.s.close())
         self.th_tilt = Throttle(c, self._apply_tilt, cfg.throttle_ms)
         self.th_scen = Throttle(c, self._apply_scenario, cfg.throttle_ms)
+        self.th_look = Throttle(c, self._apply_look, cfg.throttle_ms)
+        self._show_look()
         self.timer = c.new_timer(interval=cfg.run_interval_ms)
         self.timer.add_callback(self._on_tick)
         g = SETUPS[0]
@@ -1614,8 +1798,8 @@ class Viewer:
                         (655, 154, "episode and policy")):
             fig.text(x / _W, y / _H, t, fontsize=FS_HEAD, color=INK, weight="bold")
 
-        def button(x, y, w, label, cb):
-            b = Button(fig.add_axes(_px(x, y, w, 32)), label, color=BTN, hovercolor=BTN)
+        def button(x, y, w, label, cb, h=32):
+            b = Button(fig.add_axes(_px(x, y, w, h)), label, color=BTN, hovercolor=BTN)
             b.drawon = False
             b.label.set_fontsize(FS_LABEL)
             b.label.set_color(INK)
@@ -1625,8 +1809,8 @@ class Viewer:
         SliderBox = _slider_box_class()
         self.boxes = {}  # Slider -> its value box
 
-        def slider(y, label, lo, hi, v0, step, fmt, cb, layer):
-            ax = fig.add_axes(_px(150, y, 270, 20))
+        def slider(y, label, lo, hi, v0, step, fmt, cb, layer, x=150, w=270, bw=88):
+            ax = fig.add_axes(_px(x, y, w, 20))
             sl = Slider(ax, label, lo, hi, valinit=v0, valstep=step, valfmt=fmt,
                         initcolor="none", track_color=GRID, color=BLUE)
             sl.drawon = False
@@ -1634,7 +1818,7 @@ class Viewer:
             sl.label.set_color(INK)
             sl.valtext.set_visible(False)  # Shown by the value box
             box = self.boxes[sl] = SliderBox(
-                fig.add_axes(_px(428, y, 88, 20)), sl, color="white", hovercolor="white",
+                fig.add_axes(_px(x + w + 8, y, bw, 20)), sl, color="white", hovercolor="white",
                 redraw=lambda sl=sl: self._blit_slider(sl))
             box.text_disp.set_fontsize(FS_LABEL)
             box.text_disp.set_color(INK)
@@ -1694,7 +1878,27 @@ class Viewer:
                             ("render", 200, self._on_render)):
             self.buttons[name] = button(x, 112, w, name, cb)
             x += w + 8
-        for name in ("policy", "map", "roc", "render"):
+
+        # Camera look (right of the camera panel): base look buttons, toggles, sliders
+        fig.text(968 / _W, 1038 / _H, "camera look", fontsize=FS_HEAD, color=INK,
+                 weight="bold")
+        self.tx_look, _ = self._text(_px(1090, 1030, 98, 16), layer="scene", size=FS_SMALL)
+        for name, x, y, w, cb in (
+                ("new look", 968, 1000, 110, lambda: self._on_new_look(False)),
+                ("clean", 1084, 1000, 102, lambda: self._on_new_look(True)),
+                ("camera", 968, 966, 110, lambda: self._on_look_cycle("camera", LOOK_CAMERAS)),
+                ("noise", 1084, 966, 102, lambda: self._on_look_cycle("noise", LOOK_NOISE)),
+                ("scatter", 968, 932, 110, lambda: self._on_look_toggle("scatter")),
+                ("pose", 1084, 932, 102, lambda: self._on_look_toggle("pose")),
+                ("marks", 968, 898, 110, lambda: self._on_look_toggle("marks"))):
+            self.buttons[name] = button(x, y, w, name, cb, h=28)
+        self.look_sliders = {}  # CameraParams key -> slider
+        for i, (key, label, (lo, hi), st, fmt) in enumerate(LOOK_SLIDERS):
+            self.look_sliders[key] = slider(866 - 26 * i, label, lo, hi,
+                                            float(np.clip(s.look_ctl[key], lo, hi)), st, fmt,
+                                            self._on_look_slider, "scene", x=1040, w=76, bw=62)
+        for name in ("policy", "map", "roc", "render", "camera", "noise", "scatter", "pose",
+                     "marks"):
             A(self.buttons[name].label, "scene")
         self._set_toggle_labels()
         # Checkpoint picker, right of the box: menu of best_checkpoints(), previous / next file
@@ -1735,6 +1939,11 @@ class Viewer:
             "map: bounces" if self.map_mode == "bounces" else "map: P / P_max")
         self.buttons["roc"].label.set_text(f"ROC {self.s.geom.roc:g} mm")
         self.buttons["render"].label.set_text(f"render: {self.s.render_style}")
+        c = self.s.look_ctl
+        self.buttons["camera"].label.set_text(f"camera: {c['camera']}")
+        self.buttons["noise"].label.set_text(f"noise: {c['noise']}")
+        for k in ("scatter", "pose", "marks"):
+            self.buttons[k].label.set_text(f"{k}: {'on' if c[k] else 'off'}")
 
     # ── Drawing ──
 
@@ -2036,6 +2245,56 @@ class Viewer:
                   f"at {f.tilt[0]:+.2f} / {f.tilt[1]:+.2f} deg")
         self._show(f, scene=True)
 
+    # ── Camera look ──
+
+    def _show_look(self):
+        """Look panel from the session: sliders (without callbacks), toggle labels, the
+        base line (scene layer: drawn with the next scene blit)."""
+        s = self.s
+        for k, sl in self.look_sliders.items():
+            self._set_slider(sl, float(np.clip(s.look_ctl[k], sl.valmin, sl.valmax)))
+        self._set_toggle_labels()
+        self.tx_look.set_text(s.look_name + (" edited" if s.look_edited else ""))
+
+    def _look_done(self, f: Optional[Frame], what: str):
+        s = self.s
+        self._show_look()
+        if f is None:
+            self._say(f"camera look: {what} (render sim: shown in render camera)")
+            f = s.frame
+        else:
+            self._say(f"camera look: {what}; new episode at {f.tilt[0]:+.2f} / "
+                      f"{f.tilt[1]:+.2f} deg")
+        self._show(f, scene=True)
+
+    def _on_new_look(self, clean: bool):
+        """Base look: clean, or a new draw from the run's training ranges."""
+        self._pause()
+        f = self.s.new_look(clean)
+        self._look_done(f, "clean" if clean else f"new look, {self.s.look_name}")
+
+    def _on_look_cycle(self, key: str, values: Tuple[str, ...]):
+        c = self.s.look_ctl
+        v = values[(values.index(c[key]) + 1) % len(values)]
+        self._pause()
+        self._look_done(self.s.set_look(**{key: v}), f"{key} {v}")
+
+    def _on_look_toggle(self, key: str):
+        v = not self.s.look_ctl[key]
+        self._pause()
+        self._look_done(self.s.set_look(**{key: v}), f"{key} {'on' if v else 'off'}")
+
+    def _on_look_slider(self, sl):
+        key = next(k for k, v in self.look_sliders.items() if v is sl)
+        if not self.th_look(key):
+            self._blit_slider(sl)
+
+    def _apply_look(self, key: str):
+        sl = self.look_sliders[key]
+        self._pause()
+        self._look_done(self.s.set_look(**{key: float(sl.val)}),
+                        f"{sl.label.get_text()} {sl.valtext.get_text()}")
+
     def _on_random(self, kind: str):
         """Random valid scenario over the scenario space (good: separation 20-400 mm;
         short / long), preferring a good one (Session.random_scenario)."""
@@ -2076,7 +2335,8 @@ class Viewer:
             self._say(f"not a number: {text!r}")
             self._show(self.s.frame, scene=True)
             return
-        th = self.th_tilt if sl in (self.sl_pitch, self.sl_yaw) else self.th_scen
+        th = (self.th_tilt if sl in (self.sl_pitch, self.sl_yaw) else
+              self.th_look if sl in self.look_sliders.values() else self.th_scen)
         th.last = -math.inf
         sl.set_val(round(float(np.clip(v, sl.valmin, sl.valmax)), 6))  # Callback applies
 
@@ -2267,6 +2527,7 @@ class Viewer:
         self._dragging_map = self._dragging_hole = False
         self.th_tilt.flush()
         self.th_scen.flush()
+        self.th_look.flush()
 
     def _on_key(self, event):
         if (self.textbox.capturekeystrokes
@@ -2639,12 +2900,13 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
                                 and s.agent is not None)
 
     # Render styles: each style's images reach the agent with its encoder's channels (the
-    # ring's frames) and the camera panel (gray / RGB); camera train draws a new look per
-    # episode; the cycle ends at the checkpoint's default style
-    print("render styles:")
+    # ring's frames) and the camera panel (gray / RGB); the cycle ends at the checkpoint's
+    # default style
+    print("render styles and camera look:")
     in_ch, res = s.agent.cfg.encoder.in_ch, s.pcfg.img_res
     shape = (res, res) if in_ch == 1 else (res, res, in_ch)
-    styles_ok = s.render_style == ("camera clean" if s.pcfg.camera else "sim")
+    default = "camera" if s.pcfg.camera else "sim"
+    styles_ok = s.render_style == default
     for _ in RENDER_STYLES:
         v._on_render()
         v._on_step()
@@ -2654,18 +2916,63 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
                       and v.im_cam.get_array().shape == shape
                       and s.ring.frame.shape[2] == in_ch and s.render_style in v.message
                       and _read_csv(s.log_writer.paths["steps"])[-1]["render"] == s.render_style)
-        looks = 1
-        if s.render_style == "camera train":
-            ims = []
-            for _ in range(3):
-                v._on_reset()
-                ims.append(s.frame.image)
-            looks = len({im.tobytes() for im in ims})
-            styles_ok &= looks > 1
         print(f"  {s.input_text()}: agent input {tuple(s.ring.frame.shape[2:])}, camera panel "
-              f"{f.image.shape}" + (f", {looks} looks in 3 episodes" if looks > 1 else ""))
+              f"{f.image.shape}")
     checks["render styles: agent input and camera panel"] = (
-        styles_ok and s.render_style == ("camera clean" if s.pcfg.camera else "sim"))
+        styles_ok and s.render_style == default)
+
+    # Camera look: fixed over tilt changes and episodes (noise frozen: the same tilt gives
+    # the same frame), live noise differs per frame, off repeats; the panel changes the
+    # frame (lit face, laser color) and the log; clean restores the clean base
+    if s.render_style != "camera":
+        v._on_render()
+    click(v.buttons["new look"].ax)
+    drawn, t0 = s.look_name, s.start_tilt
+    im0 = s.frame.image.copy()
+    p0 = {k: t.clone() for k, t in s.env.cam_params.items()}
+    v._apply_tilt((t0[0] + 0.05, t0[1] - 0.05))
+    moved = s.frame.image.copy()
+    v._apply_tilt(t0)
+    fixed = (all(torch.equal(p0[k], t) for k, t in s.env.cam_params.items())
+             and np.array_equal(s.frame.image, im0) and not np.array_equal(moved, im0))
+
+    def two_episodes() -> bool:
+        ims = []
+        for _ in range(2):
+            v._on_reset()
+            ims.append(s.frame.image.copy())
+        return np.array_equal(*ims)
+
+    type_in(v.look_sliders["read_noise"], "0.02")
+    click(v.buttons["noise"].ax)  # frozen -> live
+    live = s.look_ctl["noise"] == "live" and not two_episodes()
+    click(v.buttons["noise"].ax)  # live -> off
+    off = s.look_ctl["noise"] == "off" and two_episodes()
+    mean = lambda: s.env.image[0].float().mean((1, 2)).cpu().numpy()
+    type_in(v.look_sliders["face"], "0")
+    m0 = mean()
+    type_in(v.look_sliders["face"], "0.6")
+    face = s.look_ctl["face"] == 0.6 and mean().mean() > m0.mean() + 5
+    type_in(v.look_sliders["face"], "0")
+    while s.look_ctl["camera"] != "red":
+        click(v.buttons["camera"].ax)
+    m = mean()
+    red = bool(m[0] > m[1] and m[0] > m[2]) and v.buttons["camera"].label.get_text() == "camera: red"
+    v._on_step()
+    look = _read_csv(s.log_writer.paths["steps"])[-1]["look"]
+    logged = look.startswith(f"{drawn} edited: red") and "noise off" in look
+    click(v.buttons["clean"].ax)
+    clean = (s.look_name == "clean" and not s.look_edited and s.look_ctl["camera"] == "mono"
+             and s.look_ctl["face"] == 0.0 and v.tx_look.get_text() == "clean")
+    while s.look_ctl["noise"] != "frozen":
+        click(v.buttons["noise"].ax)
+    print(f"  {drawn}: fixed over a tilt change and back {fixed}, live noise differs {live}, "
+          f"off repeats {off}, lit face {face}, red laser {red}, logged {logged}, clean "
+          f"{clean}")
+    checks["camera look: fixed, noise modes, controls, log, clean"] = (
+        fixed and live and off and face and red and logged and clean)
+    while s.render_style != default:
+        v._on_render()
 
     # Checkpoint picker: next / prev over best_checkpoints() (from the loaded file), loaded
     # through the box path (the box shows the file, the render style follows the run)
@@ -2675,7 +2982,7 @@ def selftest(cfg: ViewerConfig, screenshot: str) -> int:
     v._on_step()
     next_ok = (s.ckpt_path == nxt and v.textbox.text == short_path(nxt)
                and v.message.startswith("loaded") and s.frame.step == 1
-               and s.render_style == ("camera clean" if s.pcfg.camera else "sim")
+               and s.render_style == ("camera" if s.pcfg.camera else "sim")
                and v.buttons["render"].label.get_text() == f"render: {s.render_style}")
     print(f"  picker next: {v.message}")
     v._on_pick(-1)
@@ -2735,8 +3042,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "  drag in the laser-offset disk sets laser dx / dy; Enter in the checkpoint box\n"
             "  loads it; list (menu) / prev / next pick a runs/ppo/*/*best*.pt; the box right\n"
             "  of each slider takes a typed value (Enter applies, Escape cancels)\n"
-            "render button: sim / camera clean / camera train images for the agent and the\n"
-            "  camera panel (adapted to the agent's input channels)\n"
+            "render button: sim / camera images for the agent and the camera panel (adapted\n"
+            "  to the agent's input channels); the camera look panel sets the camera render\n"
+            "  (fixed over tilt changes and episodes)\n"
             "keys: right or s step, space run / pause, r reset (start tilt), n random start,\n"
             "  d argmax / sampled, m map color, g random good scenario, [ / ] separation\n"
             "  -/+0.5 mm, { / } -/+5 mm\n"
