@@ -68,6 +68,10 @@
 #                 re-initialized when its normalization or width differs, e.g. 4407578's
 #                 three-parameter 50-200 mm head in a pool run). Default empty (no init).
 #                 E.g. /ix1/kchen/evv/multireflection/rl_runs/4407578/best.pt
+#   INIT_BEST_OF  a run directory instead of INIT_FROM: when the job starts (new runs
+#                 only), that run's current best.pt is copied to best_snapshot_it<N>.pt in
+#                 its directory (N: the checkpoint's iteration; kept if it exists) and used
+#                 as INIT_FROM, so a queued run starts from the best checkpoint at its start
 #   RUN_ID        run directory name under /ix1/kchen/evv/multireflection/rl_runs/
 #                 (default: this job id). If <run dir>/latest.pt exists the job resumes it
 #                 (--resume); otherwise it starts a new run there.
@@ -187,6 +191,7 @@ LASER_RANGE="${LASER_RANGE:--8 8}"
 LASER_OFFSET_RADIUS="${LASER_OFFSET_RADIUS:-1.5}"
 ATLAS="${ATLAS:-$RUNS_ROOT/atlas/atlas_v1.pt}"
 INIT_FROM="${INIT_FROM:-}"
+INIT_BEST_OF="${INIT_BEST_OF:-}"
 EVAL_TABLES="${EVAL_TABLES:-$RUNS_ROOT/eval_sets}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
@@ -209,6 +214,17 @@ if [ -f "$RUN_DIR/latest.pt" ]; then
     MODE="resume $RUN_DIR/latest.pt"
 else
     START_ARGS=(--atlas "$ATLAS" --scenarios "$SCENARIOS")
+    BEST_INFO=""
+    if [ -n "$INIT_BEST_OF" ]; then  # The run's best.pt now (written atomically by ppo.py)
+        [ -z "$INIT_FROM" ] || { echo "INIT_FROM and INIT_BEST_OF are exclusive"; exit 1; }
+        [ -f "$INIT_BEST_OF/best.pt" ] || { echo "no best.pt in INIT_BEST_OF=$INIT_BEST_OF"; exit 1; }
+        TMP="$INIT_BEST_OF/.best_snapshot.${SLURM_JOB_ID:-$$}"
+        cp "$INIT_BEST_OF/best.pt" "$TMP"
+        IT=$("$VENV_PY" -c "import sys, torch; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False, mmap=True)['iteration'])" "$TMP")
+        INIT_FROM="$INIT_BEST_OF/best_snapshot_it$IT.pt"
+        if [ -f "$INIT_FROM" ]; then rm -f "$TMP"; else mv "$TMP" "$INIT_FROM"; fi
+        BEST_INFO=", best of $INIT_BEST_OF at start: iteration $IT"
+    fi
     if [ -z "$ENCODER_INIT" ] || [ "$ENCODER_INIT" = "none" ]; then
         [ -n "$INIT_FROM" ] || { echo "ENCODER_INIT=${ENCODER_INIT:-(empty)} needs INIT_FROM (the encoder comes from it)"; exit 1; }
         MODE="new run, encoder from INIT_FROM"
@@ -226,7 +242,7 @@ else
     if [ -n "$INIT_FROM" ]; then
         [ -f "$INIT_FROM" ] || { echo "no checkpoint at INIT_FROM=$INIT_FROM"; exit 1; }
         START_ARGS+=(--init-from "$INIT_FROM")
-        MODE="$MODE, init from $INIT_FROM"
+        MODE="$MODE, init from $INIT_FROM$BEST_INFO"
     fi
 fi
 
