@@ -156,7 +156,9 @@ Cluster: cluster/ppo_l40s.slurm.
                training (scenarios.holdout_mask, removed from the sampler's segments)
     logging    train.csv / eval.csv in the run dir; W&B (project herriott-rl) unless
                --no-wandb, display name built at start from the config, --wandb-tags (comma
-               list) set at start
+               list) set at start. --run-tag r<N>-<short> (e.g. r9-cam-logp): prefix of the
+               display name and of the W&B run id (<tag>-<8 hex>, kept in the checkpoint),
+               and a W&B tag, so the run is found by its short name
     checkpoint latest.pt (every --ckpt-minutes and at exit), best.pt (best deterministic
                % of the oracle: on the cont set with the pool, the full set with the
                atlas, else on the set of the run; --best-metric region: the region-bin
@@ -310,6 +312,7 @@ class PPOConfig:
     wandb: bool = True
     wandb_project: str = "herriott-rl"
     wandb_tags: str = ""  # Comma list of W&B tags set at start (e.g. the r<N>-<short> name)
+    run_tag: str = ""  # Short name r<N>-<short>: prefix of the display name and W&B id, a W&B tag
     name_tag: str = ""
 
 
@@ -1639,8 +1642,11 @@ class Logger:
         if use_wandb:
             import wandb
 
-            self.wandb_id = wandb_id or uuid.uuid4().hex[:12]  # Kept in the checkpoint
+            rt = config.get("run_tag") or ""
+            # Kept in the checkpoint; with a run tag the id starts with it (findable in URLs)
+            self.wandb_id = wandb_id or (f"{rt}-{uuid.uuid4().hex[:8]}" if rt else uuid.uuid4().hex[:12])
             tags = [t.strip() for t in config.get("wandb_tags", "").split(",") if t.strip()]
+            tags += [rt] if rt and rt not in tags else []
             self.wb = wandb.init(project=project, name=name, id=self.wandb_id, resume="allow",
                                  config={**config, "encoder_info": encoder_info,
                                          "init_info": init_short},
@@ -1739,7 +1745,8 @@ def encoder_origin(encoder_info: Optional[dict]) -> str:
 def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     """Display / directory name from the config, built at start:
     ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_ee<N>][_eu<F>][_pr<F>][_nb<F>[r<lo>-<hi>]]
-    [_rmix][_bm<metric>][_cam[-norot][-evtrain]][_fp][_stop<V>][_<tag>]_<jobid>;
+    [_rmix][_bm<metric>][_cam[-norot][-evtrain]][_fp][_stop<V>][_<tag>]_<jobid>, prefixed
+    with <run tag>_ when --run-tag is set;
     <enc>: encoder_origin; <scen>: <ranges>-plr / -unif with the pool (ContRanges.tag,
     e.g. cont20-400-plr), full-plr / full-unif with the atlas (prioritized / uniform
     good draws), or set<S>, with -ho<pct>[s<seed>] when grid scenarios are held out
@@ -1790,7 +1797,11 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
         name += f"_stop{c.stop_at_best:g}"
     if c.name_tag:
         name += f"_{c.name_tag}"
-    return name + "_" + os.environ.get("SLURM_JOB_ID", "local")
+    name += "_" + os.environ.get("SLURM_JOB_ID", "local")
+    if c.run_tag:
+        assert re.fullmatch(r"[A-Za-z0-9-]+", c.run_tag), f"--run-tag {c.run_tag!r}: letters, digits, '-'"
+        name = f"{c.run_tag}_{name}"
+    return name
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────

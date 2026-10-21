@@ -75,6 +75,7 @@ import math
 import os
 import re
 import time
+import uuid
 from dataclasses import asdict, replace
 from typing import Any, Dict
 
@@ -304,6 +305,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--val-n", type=int, default=1024)
     ap.add_argument("--tag", default="", help="Suffix for the run name")
+    ap.add_argument("--run-tag", default="",
+                    help="Short name e<N>-<short>: prefix of the run name and W&B id, a W&B tag")
     ap.add_argument("--camera", action="store_true",
                     help="Camera mode: 3-channel CameraRenderer inputs, camera-frame targets")
     ap.add_argument("--init-agent", default="",
@@ -341,7 +344,8 @@ def run_name(args: argparse.Namespace, cfg: EncoderConfig, init_name: str = "") 
     <model>_w<width>_lr<lr>_b<batch>_<steps>_s<seed>[_ft-<origin>][_<data>][_cam][_<tag>]
     (<steps>: conv<cap> with --converge),
     data grid<N>, <ranges tag>x<N> (continuous) or set4; _ft-<origin> with --init
-    (_ft-<--init-agent-tag> with --init-agent); _cam in camera mode."""
+    (_ft-<--init-agent-tag> with --init-agent); _cam in camera mode; prefixed with
+    <--run-tag>_ when given."""
     k = args.steps / 1000
     steps = f"{k:g}k" if args.steps >= 1000 else str(args.steps)
     if getattr(args, "converge", False):
@@ -361,7 +365,12 @@ def run_name(args: argparse.Namespace, cfg: EncoderConfig, init_name: str = "") 
         name += f"_set{len(SETUPS)}"
     if getattr(args, "camera", False):
         name += "_cam"
-    return name + (f"_{args.tag}" if args.tag else "")
+    name += f"_{args.tag}" if args.tag else ""
+    rt = getattr(args, "run_tag", "")  # Optional: callers may pass a partial Namespace
+    if rt:
+        assert re.fullmatch(r"[A-Za-z0-9-]+", rt), f"--run-tag {rt!r}: letters, digits, '-'"
+        name = f"{rt}_{name}"
+    return name
 
 
 def data_config(setups: str, batch_size: int = 256) -> DataConfig:
@@ -485,7 +494,9 @@ def main():
     if args.wandb:
         import wandb
 
-        wb = wandb.init(project="rl-encoder", name=name, config=info, dir=run_dir)
+        rt = args.run_tag
+        wb = wandb.init(project="rl-encoder", name=name, config=info, dir=run_dir,
+                        id=f"{rt}-{uuid.uuid4().hex[:8]}" if rt else None, tags=[rt] if rt else None)
 
     train_f = open(os.path.join(run_dir, "train.csv"), "w", newline="")
     val_f = open(os.path.join(run_dir, "val.csv"), "w", newline="")
