@@ -16,6 +16,8 @@ Run from rl/:  uv run python tests/test_camera.py
     5. 3-channel stem: expand_stem on a 1-channel encoder gives the same z for a gray
        image copied x 3; init_agent_encoder from a ppo.py-style checkpoint
     6. camera-mode pretraining smoke run (3 steps, eager)
+    7. camera env: no host syncs in step (auto-reset rows draw new parameters) and reset,
+       every effect on (pose warp, homographies)
 """
 
 import math
@@ -35,6 +37,7 @@ from encoders import CNNEncoder, EncoderConfig, FrameModel  # noqa: E402
 from frame_data import DataConfig, FrameData  # noqa: E402
 from geometry import SETUPS  # noqa: E402
 from pretrain_encoder import camera_sim, expand_stem, init_agent_encoder  # noqa: E402
+from env import AlignEnv, EnvConfig  # noqa: E402
 from render_camera import CameraRanges, CameraRenderer  # noqa: E402
 
 DEV = torch.device("cuda")
@@ -215,6 +218,27 @@ def test_pretrain_smoke():
         print(f"  run {runs[0]}: model.pt with in_ch 3 and the camera config")
 
 
+def test_env_no_sync():
+    print("\n== camera env: no host syncs ==")
+    env = AlignEnv(EnvConfig(num_envs=256, history_len=0, seed=3, max_steps=6,
+                             camera=ranges_all(1.0)))
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(1)
+    acts = [torch.randint(0, env.n_bins, (256, 2), generator=gen, device=DEV) for _ in range(6)]
+    mask = torch.rand(256, generator=gen, device=DEV) < 0.5
+    env.step(acts[0])
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for a in acts[1:]:
+            env.step(a)
+        env.reset(mask)
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    torch.cuda.synchronize()
+    print("  5 steps (auto-reset parameter draws) and a reset with every effect on: no sync")
+
+
 if __name__ == "__main__":
     print(f"device {torch.cuda.get_device_name()}")
     data = FrameData(DataConfig(setups=SETUPS), DEV)
@@ -225,4 +249,5 @@ if __name__ == "__main__":
     test_targets(data, cam)
     test_stem_and_agent_init()
     test_pretrain_smoke()
+    test_env_no_sync()
     print("\nall tests passed")

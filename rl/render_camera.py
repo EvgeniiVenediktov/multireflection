@@ -347,7 +347,9 @@ class CameraRenderer:
         n_ring = some(N_RING)
 
         p = {
-            "warp": torch.linalg.inv(warp_inv.double()).float(), "warp_inv": warp_inv,
+            # inv_ex without the error check: linalg.inv syncs the host to check the result
+            "warp": torch.linalg.inv_ex(warp_inv.double(), check_errors=False).inverse.float(),
+            "warp_inv": warp_inv,
             "scale": scale,
             "laser": pick(r.laser_p, _log_uniform(n, r.laser, gen, dev), 1.0),
             "sigma": pick(r.sigma_p, U(r.sigma), self.base.sigma),

@@ -155,8 +155,21 @@ def corner_homography(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
     rows_u = torch.stack((x, y, o, z, z, z, -u * x, -u * y), -1)
     rows_v = torch.stack((z, z, z, x, y, o, -v * x, -v * y), -1)
     A = torch.cat((rows_u, rows_v), 1)  # (n, 8, 8)
-    h = torch.linalg.solve(A, torch.cat((u, v), 1))
+    # solve_ex without the error check: linalg.solve syncs the host to check the result
+    h = torch.linalg.solve_ex(A, torch.cat((u, v), 1), check_errors=False).result
     return torch.cat((h, torch.ones(n, 1, dtype=h.dtype, device=h.device)), 1).view(n, 3, 3)
+
+
+_CORNERS: Dict[torch.device, torch.Tensor] = {}  # Field corners per device (one copy each)
+
+
+def _field_corners(dev: torch.device) -> torch.Tensor:
+    """(4, 2) float64 field corners on dev, created once (a host-to-device copy syncs)."""
+    c = _CORNERS.get(dev)
+    if c is None:
+        c = _CORNERS[dev] = torch.tensor(
+            [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], dtype=torch.float64, device=dev)
+    return c
 
 
 def pose_warp(
@@ -185,9 +198,7 @@ def pose_warp(
     A_inv[:, 0, 2] = -(c * t[:, 0] + s * t[:, 1]) / sc
     A_inv[:, 1, 2] = -(-s * t[:, 0] + c * t[:, 1]) / sc
     A_inv[:, 2, 2] = 1.0
-    corners = torch.tensor(
-        [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], dtype=torch.float64, device=dev
-    ).expand(n, 4, 2)
+    corners = _field_corners(dev).expand(n, 4, 2)
     P_inv = corner_homography(corners + corner_disp.double(), corners)
     return (P_inv @ A_inv).float()
 
