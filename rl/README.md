@@ -75,5 +75,16 @@ plateau takes about 1 deg; the real mount resolves 0.01 deg.
   hit is detected only within the cap. The real mirrors have glass thickness, edges and
   bevels; a beam landing on an edge scatters light that shows up in the camera image.
   Modelling the substrate geometry and that scattering is needed for sim-to-real.
+- **Teacher-guided training.** A teacher that sees what the agent cannot gives it a dense
+  signal at every step instead of only the path reward. Teachers: the oracle planner
+  (`baselines.plan_oracle`: knows the scenario, plans the best move sequence; already
+  computed for the evals) or a policy trained on the privileged state (true M2 tilt and
+  scenario parameters). Guidance: an auxiliary imitation loss (cross-entropy / KL to the
+  teacher's action on the states the agent visits, DAgger-style, annealed over training)
+  next to the PPO loss, or a shaping term for the deviation from the teacher's move (e.g.
+  the move toward the centre of the longest-path region). Caveat: the teacher acts on
+  information the frames may not contain (e.g. from a blind start), so imitation should
+  be limited to informative states or use a teacher restricted to what the history can
+  reveal, with the RL loss kept for the rest.
 
 Plan and code review: [PLAN.md](PLAN.md).
