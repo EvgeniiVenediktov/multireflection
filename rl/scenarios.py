@@ -1791,7 +1791,7 @@ class ScenarioPool(ScenarioSampler):
         if self.n_levels:  # New root scenarios
             self.uid[slots] = self.next_uid + torch.arange(slots.numel(), device=dev)
             self.next_uid += slots.numel()
-        self.ptr =[(self.ptr[0] + k_g) % ng, (self.ptr[1] + k_i) % max(ni, 1)]
+        self.ptr = [(self.ptr[0] + k_g) % ng, (self.ptr[1] + k_i) % max(ni, 1)]
         self.filled_iter = iteration
         _sync(dev)
         st["refresh_s"] = time.perf_counter() - t0
