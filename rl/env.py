@@ -144,6 +144,8 @@ class EnvConfig:
 
     # ── Observation (D3) ──
     img_res: int = 64
+    render_res: int = 0  # Render resolution (a multiple of img_res; 0 = img_res), area-averaged to img_res
+    keep_full: bool = False  # With render_res: env.image_full, the full-resolution image of env.image
     spot_sigma: float = 0.5  # mm
     gain: float = 1.6  # 1 - exp(-gain * I): a unit spot (k = 0) peaks at 0.80
     oversample: int = 0  # Splat grid oversampling; 0 = auto (sigma >= 2.5 grid px)
@@ -366,6 +368,41 @@ class SpotRenderer:
         return self.respond(self.intensity(hit_mirror, hit_local_xy))
 
 
+def downscale(img: torch.Tensor, factor: int) -> torch.Tensor:
+    """(n, C, H, W) uint8 image averaged over factor x factor blocks, rounded to uint8."""
+    if factor == 1:
+        return img
+    return torch.nn.functional.avg_pool2d(img.float(), factor).round().to(torch.uint8)
+
+
+class DownscaleRenderer:
+    """A SpotRenderer at a multiple of res, scaled down to res: the camera pipeline, the
+    response and the 8-bit quantization per sensor pixel, then the mean of each
+    factor x factor block rounded to 8 bit (downscale). Same interface as SpotRenderer
+    (intensity: the full-resolution intensity; respond / __call__: res x res images);
+    full: the full-resolution renderer."""
+
+    def __init__(self, full: SpotRenderer, res: int):
+        assert full.res % res == 0 and full.res > res, (full.res, res)
+        self.full, self.res, self.factor = full, res, full.res // res
+        self.radius, self.sigma, self.gain = full.radius, full.sigma, full.gain
+        self.hit_intensity = full.hit_intensity
+        self.pitch = 2 * full.radius / res
+        pix = torch.arange(res, device=full.xs.device, dtype=torch.float32)
+        self.xs = -self.radius + (pix + 0.5) * self.pitch
+        self.ys = self.radius - (pix + 0.5) * self.pitch
+        self.aperture = torch.nn.functional.avg_pool2d(full.aperture[None, None], self.factor)[0, 0]
+
+    def intensity(self, hit_mirror: torch.Tensor, hit_local_xy: torch.Tensor) -> torch.Tensor:
+        return self.full.intensity(hit_mirror, hit_local_xy)
+
+    def respond(self, intensity: torch.Tensor) -> torch.Tensor:
+        return downscale(self.full.respond(intensity), self.factor)
+
+    def __call__(self, hit_mirror: torch.Tensor, hit_local_xy: torch.Tensor) -> torch.Tensor:
+        return self.respond(self.intensity(hit_mirror, hit_local_xy))
+
+
 # ── History stack ───────────────────────────────────────────────────────────
 
 
@@ -537,16 +574,18 @@ class AlignEnv:
 
         # ── Simulator and renderer ──
         self.sim = g.make_sim(dev, max_bounces=c.max_bounces)
-        self.renderer = SpotRenderer(
-            c.img_res, g.diameter, c.spot_sigma, c.gain, g.reflectivity,
-            c.max_bounces, c.oversample, dev,
-        )
+        rr = c.render_res or c.img_res
+        assert rr % c.img_res == 0, f"render_res {rr} must be a multiple of img_res {c.img_res}"
+        self.render_factor = rr // c.img_res
+        full = SpotRenderer(rr, g.diameter, c.spot_sigma, c.gain, g.reflectivity,
+                            c.max_bounces, c.oversample, dev)
+        self.renderer = full if rr == c.img_res else DownscaleRenderer(full, c.img_res)
         self.img_shape = (1, c.img_res, c.img_res)
         self.cam = None
         if c.camera is not None:
             from render_camera import CameraRenderer  # (imports env: SpotRenderer)
 
-            self.cam = CameraRenderer(self.renderer, c.camera, seed=c.seed).compile()
+            self.cam = CameraRenderer(full, c.camera, seed=c.seed).compile()
             self.cam_gen = torch.Generator(device=dev)
             self.reseed_camera(c.seed * 1_000_003 + 17)
             self.img_shape = (3, c.img_res, c.img_res)
@@ -601,6 +640,10 @@ class AlignEnv:
         self.bounces = torch.zeros(B, dtype=torch.long, device=dev)
         self.stop = torch.zeros(B, dtype=torch.int8, device=dev)
         self.image = torch.zeros(B, *self.img_shape, dtype=torch.uint8, device=dev)
+        self._keep_full = c.keep_full and self.render_factor > 1
+        if self._keep_full:  # Full-resolution image of each env's current frame (viewer)
+            rr = c.img_res * self.render_factor
+            self.image_full = torch.zeros(B, self.img_shape[0], rr, rr, dtype=torch.uint8, device=dev)
         self.prev_action = torch.zeros(B, 2, device=dev)  # Led to the current frame
         self.step_count = torch.zeros(B, dtype=torch.long, device=dev)
         self.ep_return = torch.zeros(B, device=dev)
@@ -795,16 +838,21 @@ class AlignEnv:
         """Images of the sim rows: SpotRenderer, or with the camera CameraRenderer under
         cam_params (one row each; default the envs' current episode parameters)."""
         if self.cam is None:
+            if self._keep_full:
+                self._full_last = self.renderer.full(out["hit_mirror"], out["hit_local_xy"])
+                return downscale(self._full_last, self.render_factor)
             return self.renderer(out["hit_mirror"], out["hit_local_xy"])
         from render_camera import chunks
 
         p = self.cam_params if cam_params is None else cam_params
         hm, lxy = out["hit_mirror"], out["hit_local_xy"]
         miss = (out["miss_mirror"], out["miss_local_xy"], out["intensity"])
-        return torch.cat([
-            self.cam.render(hm[s], lxy[s], {k: v[s] for k, v in p.items()}, self.cam_gen,
-                            tuple(t[s] for t in miss))
-            for s in chunks(hm.shape[0], self.cfg.camera_chunk)])
+        full = [self.cam.render(hm[s], lxy[s], {k: v[s] for k, v in p.items()}, self.cam_gen,
+                                tuple(t[s] for t in miss))
+                for s in chunks(hm.shape[0], self.cfg.camera_chunk)]
+        if self._keep_full:
+            self._full_last = torch.cat(full)
+        return torch.cat([downscale(f, self.render_factor) for f in full])
 
     def reseed_camera(self, seed: int):
         """Restart the camera generator (augmentation parameters and per-frame noise)."""
@@ -820,14 +868,19 @@ class AlignEnv:
     def render_tilts(
         self, tilts: torch.Tensor, setup: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
-        """Diagnostics: sim + image of arbitrary (n, 2) tilts of setups (n,) (default 0);
-        no env state change."""
+        """Diagnostics: sim + image (SpotRenderer, img_res) of arbitrary (n, 2) tilts of
+        setups (n,) (default 0); with render_res > img_res also image_full (the image
+        before the downscale); no env state change."""
         tilts = tilts.to(device=self.device, dtype=torch.float32)
         if setup is not None:
             setup = setup.to(device=self.device, dtype=torch.long)
         out = self._simulate(tilts, setup)
         inten = self.renderer.intensity(out["hit_mirror"], out["hit_local_xy"])
+        res = {}
+        if self.render_factor > 1:
+            res["image_full"] = self.renderer.full.respond(inten)
         return {
+            **res,
             "image": self.renderer.respond(inten),
             "intensity": inten,
             "path_mm": out["total_path_length"],
@@ -941,6 +994,8 @@ class AlignEnv:
         self.bounces = torch.where(mask, out["hit_counts"], self.bounces)
         self.stop = torch.where(mask, out["stop_reason"], self.stop)
         self.image = torch.where(mask.view(-1, 1, 1, 1), img, self.image)
+        if self._keep_full:
+            self.image_full = torch.where(mask.view(-1, 1, 1, 1), self._full_last, self.image_full)
         self.prev_action = torch.where(m1, 0.0, self.prev_action)
         self.step_count = torch.where(mask, 0, self.step_count)
         self.ep_return = torch.where(mask, 0.0, self.ep_return)
@@ -1027,6 +1082,8 @@ class AlignEnv:
         bounces = torch.where(move, count_all[:B], self.bounces)
         stop = torch.where(move, stop_all[:B], self.stop)
         image = torch.where(move.view(-1, 1, 1, 1), img[:B], self.image)
+        if self._keep_full:
+            image_full = torch.where(move.view(-1, 1, 1, 1), self._full_last[:B], self.image_full)
         reward = torch.where(move, self._norm(path - self.path, setup, ref_cur) - c.step_cost, 0.0)
         prev_action = applied if auto else torch.where(idle[:, None], self.prev_action, applied)
 
@@ -1088,6 +1145,8 @@ class AlignEnv:
             self.bounces = torch.where(done, count_all[B:], bounces)
             self.stop = torch.where(done, stop_all[B:], stop)
             self.image = torch.where(done.view(-1, 1, 1, 1), img[B:], image)
+            if self._keep_full:
+                self.image_full = torch.where(done.view(-1, 1, 1, 1), self._full_last[B:], image_full)
             self.prev_action = torch.where(d1, 0.0, applied)
             self.step_count = torch.where(done, 0, step_count)
             self.ep_return = torch.where(done, 0.0, ep_return)
@@ -1101,6 +1160,8 @@ class AlignEnv:
             # Done envs keep their final frame and idle until reset()
             self.tilt = new
             self.path, self.bounces, self.stop, self.image = path, bounces, stop, image
+            if self._keep_full:
+                self.image_full = image_full
             self.prev_action = prev_action
             self.step_count = step_count
             self.ep_return = ep_return

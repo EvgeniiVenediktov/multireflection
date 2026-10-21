@@ -20,6 +20,11 @@ Run from rl/:  uv run python tests/test_env.py
        (seed, env, episode), Triton hash = torch reference
    15. auto_reset=False (idle envs), reset(return_info=True), partial reset isolation
    16. no host syncs with 4 setups and without auto-reset
+   17. render_res: rendered at a multiple of img_res, image = block mean of the full image
+       rounded to 8 bit (the full image = a direct render at that resolution); env
+       observations stay img_res (also camera renders); keep_full: image_full is the
+       full image of env.image through steps, auto-resets and resets (sim and camera);
+       render_res not a multiple refused
 """
 
 import math
@@ -685,6 +690,47 @@ def test_no_sync_multi():
           "and off)")
 
 
+def test_render_res():
+    print("\n== 17. render_res: render at a multiple of img_res, block mean to img_res ==")
+    from render_camera import CameraRanges
+
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(17)
+    tilts = 4.0 * torch.rand(64, 2, generator=gen, device=DEV) - 2.0
+    r0 = AlignEnv(EnvConfig(num_envs=4, history_len=0)).render_tilts(tilts)
+    hi = AlignEnv(EnvConfig(num_envs=4, history_len=0, render_res=256))
+    r1 = hi.render_tilts(tilts)
+    assert torch.equal(r0["path_mm"], r1["path_mm"]) and "image_full" not in r0
+    assert r1["image_full"].shape == (64, 1, 256, 256) and r1["image"].shape == (64, 1, 64, 64)
+    assert torch.equal(r1["image"], F.avg_pool2d(r1["image_full"].float(), 4).round().to(torch.uint8))
+    direct = AlignEnv(EnvConfig(num_envs=4, history_len=0, img_res=256)).render_tilts(tilts)["image"]
+    assert torch.equal(direct, r1["image_full"])
+    assert hi.reset()["image"].shape[1:] == (1, 64, 64)
+    cam = AlignEnv(EnvConfig(num_envs=4, history_len=0, render_res=128, camera=CameraRanges()))
+    assert cam.reset()["image"].shape[1:] == (3, 64, 64)
+    obs, *_ = cam.step(torch.zeros(4, 2, dtype=torch.long, device=DEV))
+    assert obs["image"].shape[1:] == (3, 64, 64) and obs["image"].dtype == torch.uint8
+    for camera in (None, CameraRanges()):  # keep_full: env.image_full tracks env.image
+        e = AlignEnv(EnvConfig(num_envs=16, history_len=0, render_res=128, keep_full=True,
+                               max_steps=3, camera=camera))
+        for t in range(8):
+            a = torch.randint(0, e.n_bins, (16, 2), generator=gen, device=DEV)
+            e.step(torch.zeros_like(a) if t % 3 == 2 else a)
+            assert torch.equal(e.image, F.avg_pool2d(e.image_full.float(), 2).round().to(torch.uint8))
+        e.reset(torch.rand(16, generator=gen, device=DEV) < 0.5)
+        assert torch.equal(e.image, F.avg_pool2d(e.image_full.float(), 2).round().to(torch.uint8))
+    refused = False
+    try:
+        AlignEnv(EnvConfig(num_envs=1, history_len=0, render_res=100))
+    except AssertionError as e:
+        refused = "multiple" in str(e)
+    assert refused
+    d = (r1["image"].float() - r0["image"].float()).pow(2).mean().sqrt()
+    print(f"  256 -> 64: image = block mean of the 256 px image (= a direct 256 px render), "
+          f"RMS vs direct 64 px {float(d):.2f} levels; env and camera observations 64 px; "
+          "image_full consistent through steps / resets; render_res 100 refused")
+
+
 if __name__ == "__main__":
     geom = CellGeometry()
     print(f"device {torch.cuda.get_device_name()}")
@@ -704,4 +750,5 @@ if __name__ == "__main__":
     test_reset_draws()
     test_no_auto_reset()
     test_no_sync_multi()
+    test_render_res()
     print("\nall tests passed")
