@@ -156,9 +156,12 @@ Cluster: cluster/ppo_l40s.slurm.
                once per iteration from the episodes ending with shortfall >= --accel-thresh
                (0.3) and from --accel-edits (256) box-scanned scenario edits of levels
                (Gaussian noise --accel-edit-sigma: sep mm, pitch / yaw deg, dx / dy mm),
-               <= --accel-family-cap (4) per root pool scenario, the top K by score (EMA of
-               the replays); --accel-share (0.2) of the good draws x the filled share comes
-               from them (PLR rank / staleness), --accel-jitter-p (0.5) of those with a
+               <= --accel-family-cap (4) per root pool scenario, into the slots freed by
+               solved levels (shortfall EMA of the replays < the threshold) and by retired
+               ones (--accel-max-replays 8 replays or --accel-max-age 64 iterations; no
+               displacement), in a random order; --accel-share (0.2) of the good draws x
+               the filled share comes from them (PLR rank by --accel-priority learnability:
+               p (1 - p) of the smoothed win rate, or score; staleness), --accel-jitter-p (0.5) of those with a
                Gaussian start-tilt edit of --accel-jitter (0.05) deg. Logged accel/... and
                plr/level_..., plr/edit_...; marker _accel<K>
     holdout    --holdout-frac F (default 0): a seeded (--holdout-seed) random share F of
@@ -255,6 +258,9 @@ class PPOConfig:
     accel_jitter_p: float = 0.5  # Share of the level draws with a start-tilt edit
     accel_edits: int = 256  # Scenario edits per iteration (box-scanned)
     accel_edit_sigma: Tuple[float, ...] = (5.0, 0.1, 0.1, 0.05, 0.05)  # sep mm, pitch / yaw deg, dx / dy mm
+    accel_max_replays: int = 8  # A level not solved after this many replays retires
+    accel_max_age: int = 64  # Iterations; an older level not solved retires
+    accel_priority: str = "learnability"  # Level draws: p (1 - p) of the win rate, or "score"
 
     # ── Scenario sampler (--setups full) ──
     plr: bool = True  # Regret-prioritized replay; False: good scenarios uniform
@@ -397,7 +403,8 @@ def level_config(c: PPOConfig):
     return LevelConfig(size=c.accel_levels, share=c.accel_share, thresh=c.accel_thresh,
                        family_cap=c.accel_family_cap, jitter=c.accel_jitter,
                        jitter_p=c.accel_jitter_p, edits=c.accel_edits,
-                       edit_sigma=tuple(c.accel_edit_sigma))
+                       edit_sigma=tuple(c.accel_edit_sigma), max_replays=c.accel_max_replays,
+                       max_age=c.accel_max_age, priority=c.accel_priority)
 
 
 def agent_config(c: PPOConfig, n_bins: int) -> AgentConfig:
@@ -1736,10 +1743,12 @@ class Logger:
                   flush=True)
         if "accel/levels" in row:
             print(f"      accel: levels {row['accel/levels']:.0f} ({row['accel/families']:g} roots) draw share "
-                  f"{row['accel/draw_share']:.3f} | +{row['accel/inserted']:.0f} cand "
-                  f"+{row['accel/inserted_edits']:.0f} edits (valid {row['accel/edits_valid']:.0f}, good "
-                  f"{row['accel/edits_good']:.0f} of {row['accel/edits_tried']:.0f}) -{row['accel/evicted']:.0f} | "
-                  f"cand {row['accel/candidates']:.0f} dropped {row['accel/dropped']:.0f} | score q50 "
+                  f"{row['accel/draw_share']:.3f} | out: solved {row['accel/solved']:.0f} retired "
+                  f"{row['accel/retired_replays']:.0f} + {row['accel/retired_age']:.0f} (replays + age) | in: "
+                  f"{row['accel/inserted']:.0f} cand + {row['accel/inserted_edits']:.0f} edits "
+                  f"(edits good {row['accel/edits_good']:.0f} of {row['accel/edits_tried']:.0f}) | cand "
+                  f"{row['accel/candidates']:.0f} dropped {row['accel/dropped']:.0f} | win rate "
+                  f"{row['accel/win_rate']:.3f} learn q50 {row['accel/learn_q50']:.3f} score q50 "
                   f"{row['accel/score_q50']:.3f} | shortfall level {row['plr/level_shortfall']:.3f} edit "
                   f"{row['plr/edit_shortfall']:.3f} | {row['accel/update_s']:.2f} s", flush=True)
         if "pool/candidates" in row:
@@ -1912,6 +1921,8 @@ def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
             ap.add_argument(flag, choices=SCENARIO_CHOICES, default=dflt(v))
         elif f.name == "laser_mode":
             ap.add_argument(flag, choices=("landing", "angle"), default=dflt(v))
+        elif f.name == "accel_priority":
+            ap.add_argument(flag, choices=("learnability", "score"), default=dflt(v))
         elif f.name == "best_metric":
             ap.add_argument(flag, choices=BEST_METRICS, default=dflt(v))
         else:
