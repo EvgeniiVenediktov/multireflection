@@ -86,5 +86,13 @@ plateau takes about 1 deg; the real mount resolves 0.01 deg.
   information the frames may not contain (e.g. from a blind start), so imitation should
   be limited to informative states or use a teacher restricted to what the history can
   reveal, with the RL loss kept for the rest.
+- **Curriculum from the start.** The current agents grew through stages (one cell, four
+  setups, the grid atlas, the continuous pool, camera renders), each initialized from the
+  previous run. A fresh agent could instead follow one planned curriculum from the first
+  step: starts close to the best tilt widening to the whole box (`AlignEnv.set_init_box`
+  is the hook), large target regions first and the region mix shifting toward tiny ones,
+  separation and laser ranges widening, camera augmentation strength rising, each step
+  advanced when the success rate on the current stage passes a threshold. Compare against
+  the staged runs at equal env steps, in sim and on the real raster.
 
 Plan and code review: [PLAN.md](PLAN.md).

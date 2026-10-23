@@ -32,7 +32,8 @@ B independent episodes, all state on the device, no host syncs in step() / reset
                the applied delta (after clamping) / largest ladder step is the action
                that led to the next frame
     reward     move:     (P_t - P_{t-1}) / P_ref - step_cost
-               not move: 0, the episode terminates (decision D2)
+               not move: 0, the episode terminates (decision D2); plus target_bonus
+               (default 0) when it stops at P >= target_frac (0.9) x P_ref
                P_t = optical path after step t (bounce cap, D1); P_ref per setup
                (scenario mode: from the table; otherwise EnvConfig.path_ref):
                "nominal" = path at the setup's nominal tilt
@@ -41,7 +42,7 @@ B independent episodes, all state on the device, no host syncs in step() / reset
                same scan gives the target-region size, cells with path >= NEAR_FRAC x
                P_max, and the cells at the highest bounce count); the default
                "auto" is nominal for one setup and max for several. The return is
-               (P_final - P_0) / P_ref - step_cost * moves
+               (P_final - P_0) / P_ref - step_cost * moves (+ the target bonus)
     truncation the step count reaches max_steps without termination
     auto-reset done envs restart inside step(): obs is the first frame of the new
                episode, info holds the pre-reset quantities (final frame and its
@@ -134,6 +135,8 @@ class EnvConfig:
     # ── Episode and reward (D2) ──
     max_steps: int = 64
     step_cost: float = 0.01
+    target_bonus: float = 0.0  # Reward added when the agent stops (not move) at P >= target_frac x P_ref
+    target_frac: float = 0.9
     auto_reset: bool = True  # False: done envs idle until reset() (evaluation)
 
     # ── Reset: initial tilts uniform in center +- radius, clamped to the limits ──
@@ -1085,6 +1088,9 @@ class AlignEnv:
         if self._keep_full:
             image_full = torch.where(move.view(-1, 1, 1, 1), self._full_last[:B], self.image_full)
         reward = torch.where(move, self._norm(path - self.path, setup, ref_cur) - c.step_cost, 0.0)
+        if c.target_bonus:  # Stopped in the target region (not at the step limit: bootstrapped)
+            at_target = self._norm(path, setup, ref_cur) >= c.target_frac
+            reward = reward + torch.where(terminated & at_target, c.target_bonus, 0.0)
         prev_action = applied if auto else torch.where(idle[:, None], self.prev_action, applied)
 
         ep_return = self.ep_return + reward

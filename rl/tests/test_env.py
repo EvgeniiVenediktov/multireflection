@@ -25,6 +25,9 @@ Run from rl/:  uv run python tests/test_env.py
        observations stay img_res (also camera renders); keep_full: image_full is the
        full image of env.image through steps, auto-resets and resets (sim and camera);
        render_res not a multiple refused
+   18. target_bonus: the reward rises by exactly the bonus on the steps where the agent
+       stops at P >= 0.9 P_ref (not on moves, low stops or step-limit truncations); same
+       trajectory otherwise; ppo.env_config (the eval envs) keeps it 0
 """
 
 import math
@@ -731,6 +734,33 @@ def test_render_res():
           "image_full consistent through steps / resets; render_res 100 refused")
 
 
+def test_target_bonus():
+    print("\n== 18. target_bonus: stopping at P >= 0.9 P_ref ==")
+    from ppo import PPOConfig, env_config
+
+    kw = dict(num_envs=256, history_len=0, seed=21, max_steps=6)
+    e0, e1 = AlignEnv(EnvConfig(**kw)), AlignEnv(EnvConfig(target_bonus=0.75, **kw))
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(18)
+    n_bonus = n_low = n_trunc = 0
+    for _ in range(40):
+        a = torch.randint(0, e0.n_bins, (256, 2), generator=gen, device=DEV)
+        a = torch.where((torch.rand(256, generator=gen, device=DEV) < 0.3)[:, None], 0, a)
+        _, r0, t0, u0, i0 = e0.step(a)
+        _, r1, t1, u1, i1 = e1.step(a)
+        assert torch.equal(t0, t1) and torch.equal(u0, u1) and torch.equal(i0["path_mm"], i1["path_mm"])
+        hit = t0 & (i0["path_norm"] >= 0.9)
+        assert torch.equal(r1 - r0, torch.where(hit, 0.75, 0.0)), "bonus only on stops at the target"
+        n_bonus += int(hit.sum())
+        n_low += int((t0 & ~hit).sum())
+        n_trunc += int((u0 & (i0["path_norm"] >= 0.9)).sum())
+    assert n_bonus > 0 and n_low > 0 and n_trunc > 0
+    c = PPOConfig(target_bonus=0.75)
+    assert env_config(c, 8, False, 0).target_bonus == 0.0 and env_config(c, 8, True, 0).target_bonus == 0.0
+    print(f"  {n_bonus} stops at the target got +0.75, {n_low} lower stops and {n_trunc} truncations "
+          "at the target nothing; trajectories identical; eval env config without the bonus")
+
+
 if __name__ == "__main__":
     geom = CellGeometry()
     print(f"device {torch.cuda.get_device_name()}")
@@ -751,4 +781,5 @@ if __name__ == "__main__":
     test_no_auto_reset()
     test_no_sync_multi()
     test_render_res()
+    test_target_bonus()
     print("\nall tests passed")

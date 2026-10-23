@@ -164,6 +164,10 @@ Cluster: cluster/ppo_l40s.slurm.
                p (1 - p) of the smoothed win rate, or score; staleness), --accel-jitter-p (0.5) of those with a
                Gaussian start-tilt edit of --accel-jitter (0.05) deg. Logged accel/... and
                plr/level_..., plr/edit_...; marker _accel<K>
+    reward     --target-bonus B (default 0): the training env adds B when the agent stops at
+               P >= 0.9 P_ref (env.EnvConfig.target_bonus; not at the step limit, which is
+               bootstrapped); the eval envs keep the plain reward, so pct_oracle stays
+               comparable; training returns include it. Marker _tb<B>
     holdout    --holdout-frac F (default 0): a seeded (--holdout-seed) random share F of
                the grid scenarios, stratified good / impossible, never drawn in
                training (scenarios.holdout_mask, removed from the sampler's segments)
@@ -233,6 +237,7 @@ class PPOConfig:
     rollout_len: int = 128
     max_steps: int = 64
     step_cost: float = 0.01
+    target_bonus: float = 0.0  # Training env only: reward for stopping at P >= 0.9 P_ref
     img_res: int = 64
     path_ref: str = "max"  # --setups all / measured; full: the atlas P_ref
     init_center: Tuple[float, float] = (0.0, 0.0)
@@ -1103,6 +1108,7 @@ class Trainer:
         # ── Env and agent ──
         ecfg = env_config(c, c.num_envs, True, c.seed)
         ecfg.near_best_frac, ecfg.near_best_radius = c.near_best_frac, tuple(c.near_best_radius)
+        ecfg.target_bonus = c.target_bonus  # Eval envs keep the plain reward (pct_oracle comparable)
         self.env = AlignEnv(ecfg, **scen_kw)
         if c.near_best_frac > 0:
             print(f"near-best starts: {c.near_best_frac:g} of the good-scenario episodes start "
@@ -1807,7 +1813,7 @@ def encoder_origin(encoder_info: Optional[dict]) -> str:
 def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     """Display / directory name from the config, built at start:
     ppo_<enc>_k<K>_<scen>_b<B>_s<seed>[_ft<run>][_uf<it>|_e2e][_ee<N>][_eu<F>][_pr<F>][_nb<F>[r<lo>-<hi>]]
-    [_rmix][_accel<K>][_bm<metric>][_cam[-norot][-evtrain]][_fp][_stop<V>][_<tag>]_<jobid>, prefixed
+    [_rmix][_accel<K>][_tb<B>][_bm<metric>][_cam[-norot][-evtrain]][_fp][_stop<V>][_<tag>]_<jobid>, prefixed
     with <run tag>_ when --run-tag is set;
     <enc>: encoder_origin; <scen>: <ranges>-plr / -unif with the pool (ContRanges.tag,
     e.g. cont20-400-plr), full-plr / full-unif with the atlas (prioritized / uniform
@@ -1816,7 +1822,7 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
     _eu<F>: --encoder-epochs / --encoder-train-until when set; _pr<F>: --pool-refresh
     when not the default (pool runs); _nb<F>: --near-best-frac (r<lo>-<hi>: a
     --near-best-radius other than the default); _rmix: --pool-region-mix; _accel<K>:
-    --accel-levels; _bm<metric>: --best-metric other than cont."""
+    --accel-levels; _tb<B>: --target-bonus; _bm<metric>: --best-metric other than cont."""
     enc = encoder_origin(encoder_info)
     if pool_mode(c):
         scen = cont_ranges_of(c).tag() + ("-plr" if c.plr else "-unif")
@@ -1848,6 +1854,8 @@ def run_name(c: PPOConfig, encoder_info: Optional[dict]) -> str:
         name += "_rmix"
     if c.accel_levels:
         name += f"_accel{c.accel_levels}"
+    if c.target_bonus:
+        name += f"_tb{c.target_bonus:g}"
     if c.best_metric != "cont":
         name += f"_bm{c.best_metric}"
     if c.camera:
