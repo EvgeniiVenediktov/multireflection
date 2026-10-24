@@ -50,17 +50,20 @@ r8 = everything trainable (job 4459206, init from r7b it1050), best.pt at its st
 r7b's best.pt at 500M (eval job 4458701); r9 best = job 4467696 (init from r8 best it2100,
 everything trainable + log-path head), best.pt at it3500 / 459M (sim region-bin mean 85.08 vs
 r8's 82.98), eval job 4467699: better in simulation, worse on the real raster on 7 of 8 maps. r10b best = job 4497815 (r9 it3000 + ACCEL hard levels, 18 % of the draws), best.pt at
-the end of 500M (sim region-bin mean 85.13), eval job 4497818.
+the end of 500M (sim region-bin mean 85.13), eval job 4497818. r12 best = job 4513021 (r9 best it3500 +
+100M steps with --target-bonus 1.0: +1 for stopping at P >= 0.9 P_ref; sim region-bin mean 83.89,
+cont success 0.843 vs r9's 0.82 with longer episodes), best.pt at it700, eval job 4513023:
+the best mean so far, but uneven over the maps (x,y 29.5 % and -y,-x 23.5 % below r8).
 
-| axis map | r6 it7630 | r7b it2650 | r7b it2950 | r8 best | r7b it3815 (500M) | r9 best | r10b best |
-|---|---|---|---|---|---|---|---|
-| x,y | 23.1 % | 42.4 % | 40.9 % | 41.3 % | 45.2 % | 36.2 % | 43.5 % |
-| x,-y | 19.3 % | 43.8 % | 40.7 % | 46.8 % | 45.3 % | 41.4 % | 52.8 % |
-| -x,y | 26.6 % | 31.9 % | 36.8 % | 75.2 % | 31.9 % | 62.1 % | 67.6 % |
-| -x,-y | 23.1 % | 37.7 % | 41.0 % | 59.1 % | 38.1 % | 50.7 % | 52.0 % |
-| y,x | 23.8 % | 41.0 % | 37.0 % | 58.4 % | 42.7 % | 57.0 % | 55.3 % |
-| y,-x | 29.3 % | 44.5 % | 46.8 % | 64.6 % | 47.7 % | 56.3 % | 59.7 % |
-| -y,x | 19.1 % | 39.6 % | 39.9 % | 70.6 % | 37.7 % | 67.0 % | 64.2 % |
-| -y,-x | 20.6 % | 26.4 % | 27.2 % | 32.1 % | 25.5 % | 31.8 % | 34.6 % |
-| mean over maps | 23.1 % | 38.4 % | 38.8 % | 56.0 % | 39.3 % | 50.3 % | 53.7 % |
-| mean end in bright band | 20.9 % | 8.3 % | 10.6 % | 6.4 % | 10.5 % | 5.8 % | 4.7 % |
+| axis map | r6 it7630 | r7b it2650 | r7b it2950 | r8 best | r7b it3815 (500M) | r9 best | r10b best | r12 best |
+|---|---|---|---|---|---|---|---|---|
+| x,y | 23.1 % | 42.4 % | 40.9 % | 41.3 % | 45.2 % | 36.2 % | 43.5 % | 29.5 % |
+| x,-y | 19.3 % | 43.8 % | 40.7 % | 46.8 % | 45.3 % | 41.4 % | 52.8 % | 57.1 % |
+| -x,y | 26.6 % | 31.9 % | 36.8 % | 75.2 % | 31.9 % | 62.1 % | 67.6 % | 78.4 % |
+| -x,-y | 23.1 % | 37.7 % | 41.0 % | 59.1 % | 38.1 % | 50.7 % | 52.0 % | 65.7 % |
+| y,x | 23.8 % | 41.0 % | 37.0 % | 58.4 % | 42.7 % | 57.0 % | 55.3 % | 73.9 % |
+| y,-x | 29.3 % | 44.5 % | 46.8 % | 64.6 % | 47.7 % | 56.3 % | 59.7 % | 56.7 % |
+| -y,x | 19.1 % | 39.6 % | 39.9 % | 70.6 % | 37.7 % | 67.0 % | 64.2 % | 77.8 % |
+| -y,-x | 20.6 % | 26.4 % | 27.2 % | 32.1 % | 25.5 % | 31.8 % | 34.6 % | 23.5 % |
+| mean over maps | 23.1 % | 38.4 % | 38.8 % | 56.0 % | 39.3 % | 50.3 % | 53.7 % | 57.8 % |
+| mean end in bright band | 20.9 % | 8.3 % | 10.6 % | 6.4 % | 10.5 % | 5.8 % | 4.7 % | 2.8 % |
