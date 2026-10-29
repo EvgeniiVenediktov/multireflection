@@ -15,8 +15,8 @@ Sources: eval_policy.py JSONs (--sim name=path), W&B runs (--wandb name=run id: 
 row with the best eval_region/bin_mean/pct_oracle, i.e. the row of best.pt), eval_real.py
 JSONs (--real name=path). Splits: cont all / good (the possible scenarios: impossible ones
 have P_max below the floor, success unreachable by definition) / blind / informative /
-separation bins (all scenarios of the bin, ~10 % impossible), region bins of the region
-set, the set4 setups.
+good scenarios per target-region bin and per separation bin, the region bins of the region
+set (all good), the set4 setups.
 
     uv run python cpk.py [--sim r6=reports/r6_it7630.json ...] [--wandb r12=<run id> ...]
         [--real r12=reports/real_eval/r12_best.json ...] [--out reports]
@@ -41,6 +41,8 @@ REAL = ["r6=reports/real_eval/r6_it7630.json", "r7b=reports/real_eval/r7b_it2950
         "r10b=reports/real_eval/r10b_best.json", "r12=reports/real_eval/r12_best.json"]
 
 ROWS = ([("eval_cont", s) for s in ("all", "good", "blind", "informative")]
+        + [("eval_cont", s) for s in ("region_tiny", "region_small", "region_medium",
+                                      "region_large")]
         + [("eval_region", s) for s in ("region_tiny", "region_small", "region_medium",
                                         "region_large", "all")]
         + [("eval_cont", f"sep{a}-{b}") for a, b in ((20, 50), (50, 100), (100, 150),
@@ -136,7 +138,9 @@ def report(sim: Dict[str, dict], real: Dict[str, dict]) -> str:
     L += ["## Simulation, best.pt of each run (argmax policy)", "",
           "r6, r7b: local eval_policy.py reports (r6 on clean renders, r7b on camera renders);",
           "r8 - r12: the W&B eval row of best.pt (camera renders). cont good = the possible",
-          "scenarios (the 10 % impossible ones excluded); sep bins include impossible scenarios.", "",
+          "scenarios (the 10 % impossible ones excluded); the cont region and separation bins are",
+          "good scenarios of the training mix; the region set is good scenarios only, a quarter",
+          "per target-region bin.", "",
           "| split | n | " + " | ".join(tags) + " |", "|---|---|" + "---|" * len(tags),
           "| region-bin mean pct_oracle | | " + " | ".join(
               f"{sim[t]['_best']:.2f}" if sim[t].get("_best") else "-" for t in tags) + " |"]

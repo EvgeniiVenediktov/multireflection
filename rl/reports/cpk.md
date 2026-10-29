@@ -21,7 +21,9 @@ With 1024 episodes per bin and no failures the yield bound gives Cpk <= 0.92.
 
 r6, r7b: local eval_policy.py reports (r6 on clean renders, r7b on camera renders);
 r8 - r12: the W&B eval row of best.pt (camera renders). cont good = the possible
-scenarios (the 10 % impossible ones excluded); sep bins include impossible scenarios.
+scenarios (the 10 % impossible ones excluded); the cont region and separation bins are
+good scenarios of the training mix; the region set is good scenarios only, a quarter
+per target-region bin.
 
 | split | n | r6 | r7b | r8 | r9 | r10b | r12 |
 |---|---|---|---|---|---|---|---|
@@ -30,6 +32,10 @@ scenarios (the 10 % impossible ones excluded); sep bins include impossible scena
 | cont good | 3686 | +0.45 (91.1 %) | +0.44 (90.6 %) | +0.40 (88.7 %) | +0.44 (90.7 %) | +0.45 (90.9 %) | +0.49 (93.0 %) |
 | cont blind | 2293 | +0.27 (79.5 %) | +0.28 (79.8 %) | +0.27 (78.8 %) | +0.28 (79.9 %) | +0.29 (80.4 %) | +0.30 (81.6 %) |
 | cont informative | 1803 | +0.36 (85.8 %) | +0.34 (84.5 %) | +0.30 (81.9 %) | +0.34 (84.5 %) | +0.34 (84.3 %) | +0.38 (87.1 %) |
+| cont region_tiny | 216 | -0.09 (38.9 %) | -0.11 (36.6 %) | -0.14 (33.8 %) | -0.08 (40.3 %) | -0.07 (41.7 %) | -0.04 (44.9 %) |
+| cont region_small | 331 | +0.26 (78.2 %) | +0.24 (76.7 %) | +0.21 (73.1 %) | +0.24 (76.1 %) | +0.26 (78.2 %) | +0.36 (86.1 %) |
+| cont region_medium | 703 | +0.43 (90.0 %) | +0.43 (90.0 %) | +0.40 (88.3 %) | +0.44 (90.5 %) | +0.42 (89.6 %) | +0.49 (92.9 %) |
+| cont region_large | 2436 | +0.67 (97.8 %) | +0.65 (97.5 %) | +0.58 (95.9 %) | +0.64 (97.2 %) | +0.65 (97.4 %) | +0.70 (98.2 %) |
 | region region_tiny | 1024 | +0.01 (51.1 %) | -0.02 (48.0 %) | -0.03 (45.9 %) | -0.02 (47.8 %) | +0.00 (50.1 %) | +0.05 (55.7 %) |
 | region region_small | 1024 | +0.26 (77.9 %) | +0.20 (72.7 %) | +0.19 (71.1 %) | +0.23 (75.5 %) | +0.23 (75.7 %) | +0.32 (83.4 %) |
 | region region_medium | 1024 | +0.43 (90.0 %) | +0.37 (86.9 %) | +0.35 (85.5 %) | +0.40 (88.4 %) | +0.39 (87.7 %) | +0.49 (92.9 %) |
