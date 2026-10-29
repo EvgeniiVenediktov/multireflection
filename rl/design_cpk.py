@@ -158,7 +158,7 @@ def build_cells(sc: Scanner, designs: List[Dict[str, Any]], a, dev, log):
 
 
 def stats(r1: np.ndarray, r2: np.ndarray, ceil2: np.ndarray, good: np.ndarray) -> Dict[str, Any]:
-    out = {"possible": float(good.mean())}
+    out = {"possible": float(good.mean()), "cells": int(len(good))}
     r1, r2, ceil2 = r1[good], r2[good], ceil2[good]
     for nm, r in (("align", r1), ("delivered", r2)):
         e = entry(float((r >= SUCCESS_FRAC).mean()), len(r))
@@ -210,7 +210,7 @@ def report(res: Dict[str, Any]) -> str:
           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for nm, s in res["cpk"].items():
         al, dl = s["align"], s["delivered"]
-        L.append(f"| {nm} | {dl['n']} | {100 * s['possible']:.1f} % | {al['n']} | {100 * al['yield']:.1f} % | "
+        L.append(f"| {nm} | {s.get('cells', dl['n'])} | {100 * s['possible']:.1f} % | {al['n']} | {100 * al['yield']:.1f} % | "
                  f"{fmt_cpk(al)} | {al['cpk_normal']:+.2f} | {100 * dl['ceiling']:.1f} % | "
                  f"{100 * dl['yield']:.1f} % | {fmt_cpk(dl)} | {dl['cpk_normal']:+.2f} | {s['length']:.1f} |")
     return "\n".join(L) + "\n"
