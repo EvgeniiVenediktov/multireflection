@@ -26,10 +26,10 @@ Specs, one-sided, lower limit SUCCESS_FRAC (0.9): alignment, P_final / P_ref(as-
 (the eval success) over the possible as-built cells (good: P_max >= P_floor; on an
 impossible cell P_ref = P_floor is out of reach by definition, so those count as
 manufacturing loss, reported as the possible share); delivered path, P_final / P_max(nominal
-design) over all cells. Cpk: the yield
+design), also over the possible cells. Cpk: the yield
 equivalent Phi^-1(yield) / 3 (cpk.py) and the normal-theory (mean - LSL) / (3 sd) of the
 per-episode ratio, per design and over all designs; manufacturing ceiling of the delivered
-path: share of cells with P_max(as-built) >= 0.9 P_max(nominal).
+path: share of the possible cells with P_max(as-built) >= 0.9 P_max(nominal).
 
 Outputs (--out): design_cpk.md, design_cpk.json, episodes.npz. The search scan is cached in
 runs/design_cpk/ (by seed, candidates and tolerance inset).
@@ -159,7 +159,7 @@ def build_cells(sc: Scanner, designs: List[Dict[str, Any]], a, dev, log):
 
 def stats(r1: np.ndarray, r2: np.ndarray, ceil2: np.ndarray, good: np.ndarray) -> Dict[str, Any]:
     out = {"possible": float(good.mean())}
-    r1 = r1[good]
+    r1, r2, ceil2 = r1[good], r2[good], ceil2[good]
     for nm, r in (("align", r1), ("delivered", r2)):
         e = entry(float((r >= SUCCESS_FRAC).mean()), len(r))
         sd = float(r.std(ddof=1))
@@ -192,10 +192,10 @@ def report(res: Dict[str, Any]) -> str:
          "P_ref.", "",
          "Possible = share of as-built cells with P_max >= P_floor (20 bounces x separation); "
          "the others hold no long path at any M2 tilt (manufacturing loss). Specs (lower limit "
-         "0.9): align = P_final / P_ref(as-built) (the eval success) over the possible cells; "
-         "delivered = P_final / P_max(nominal design) over all cells. Cpk_y = Phi^-1(yield) / 3 (yield "
+         "0.9), both over the possible cells: align = P_final / P_ref(as-built) (the eval success); "
+         "delivered = P_final / P_max(nominal design). Cpk_y = Phi^-1(yield) / 3 (yield "
          "equivalent, [95 %]); Cpk_n = (mean - 0.9) / (3 sd) of the per-episode ratio. Ceiling = "
-         "share of cells with P_max(as-built) >= 0.9 P_max(nominal): the best yield any "
+         "share of the possible cells with P_max(as-built) >= 0.9 P_max(nominal): the best yield any "
          "alignment can reach on the delivered spec.", "",
          "## Designs", "",
          "| band (mm) | sep (mm) | laser pitch / yaw (deg) | P_max (m) | bounces | target region (deg^2) | as-built P_max: median / q10 (x nominal) | beam-check rejects |",
@@ -206,7 +206,7 @@ def report(res: Dict[str, Any]) -> str:
                  f"{dz['pmax_bounces']} | {dz['region_deg2']:.3f} | {dz['built_median_frac']:.2f} / "
                  f"{dz['built_q10_frac']:.2f} | {100 * dz['reject']:.1f} % |")
     L += ["", "## Cpk", "",
-          "| design | cells | possible | align: n | yield | Cpk_y | Cpk_n | delivered: ceiling | yield | Cpk_y | Cpk_n | mean length |",
+          "| design | cells | possible | n (possible) | align: yield | Cpk_y | Cpk_n | delivered: ceiling | yield | Cpk_y | Cpk_n | mean length |",
           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for nm, s in res["cpk"].items():
         al, dl = s["align"], s["delivered"]
